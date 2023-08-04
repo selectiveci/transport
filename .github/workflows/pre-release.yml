@@ -49,12 +49,3 @@ jobs:
         with:
           draft: true
           files: "transport-*"
-
-      # - uses: "marvinpinto/action-automatic-releases@latest"
-      #   with:
-      #     repo_token: "${{ github.token }}"
-      #     automatic_release_tag: "latest"
-      #     prerelease: true
-      #     title: "Development Build"
-      #     files: |
-      #       target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }}
