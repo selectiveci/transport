@@ -66,9 +66,12 @@ async fn read_pipe(path: String, tx: futures_channel::mpsc::UnboundedSender<Mess
             Ok(n) => n,
         };
         buf.extend(&temp_buf[..n]);
-        while let Some(i) = buf.iter().position(|&b| b == b'\n') {
+
+        // Only check for '\n' after reading all chunks
+        if let Some(i) = buf.iter().rposition(|&b| b == b'\n') {
             let line = buf.drain(..=i).collect::<Vec<_>>();
             tx.unbounded_send(Message::text(String::from_utf8(line).unwrap())).unwrap();
         }
     }
 }
+
