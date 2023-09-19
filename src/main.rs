@@ -48,7 +48,6 @@ async fn main() {
 
             let exit_fut = async {
                 exit_rx.recv().await;
-                eprintln!("Received 'exit' command. Exiting...");
                 exit(0);
             };
         
