@@ -74,16 +74,15 @@ async fn read_pipe(path: String, tx: futures_channel::mpsc::UnboundedSender<Mess
         };
         buf.extend(&temp_buf[..n]);
 
-        // Only check for '\n' after reading all chunks
-        if let Some(i) = buf.iter().rposition(|&b| b == b'\n') {
+        // Split the buffer by '\n' and process each line
+        while let Some(i) = buf.iter().position(|&b| b == b'\n') {
             let line = buf.drain(..=i).collect::<Vec<_>>();
             let line_str = String::from_utf8(line.clone()).unwrap();
             if line_str.trim() == "exit" {
                 exit_tx.send(()).await.expect("Failed to send exit signal");
                 return;
             }
-            tx.unbounded_send(Message::text(String::from_utf8(line).unwrap())).unwrap();
+            tx.unbounded_send(Message::text(line_str)).unwrap();
         }
     }
 }
-
