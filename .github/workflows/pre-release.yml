@@ -13,14 +13,14 @@ jobs:
       matrix:
         platform:
           - release_for: Linux-x86_64
-            os: ubuntu-22.04
+            os: ubuntu-20.04
             target: x86_64-unknown-linux-gnu
             bin: transport
             name: transport-Linux-x86_64.tar.gz
             command: build
 
           - release_for: Linux-aarch64
-            os: ubuntu-22.04
+            os: ubuntu-20.04
             target: aarch64-unknown-linux-gnu
             bin: transport
             name: transport-Linux-aarch64.tar.gz
