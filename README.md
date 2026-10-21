@@ -1,6 +1,6 @@
 # Selective Transport
 
-This is the websocket transport used by Selective client libaries.
+This is the websocket transport used by Selective client libraries.
 
 ## Requirements
 
@@ -41,7 +41,28 @@ To build a release version of this project:
 
 ## Usage
 
-The transport is intended to be used alongside Selective client libraries.
+The crate is the WebSocket session. Language bindings call it in-process or spawn the binary. Ruby keeps the FIFO invocation.
+
+```text
+transport <websocket-url> <runner-id>     # legacy FIFOs /tmp/<runner_id>_1 and _2
+SELECTIVE_TRANSPORT_URL=wss://... transport --stdio
+transport --snapshot [dir]
+transport --upload-fragment               # gzip on stdin
+transport --build-env
+transport conformance run [--via direct|stdio|both]
+```
+
+`--stdio` reads the URL from `SELECTIVE_TRANSPORT_URL` or, if that is unset, from the first stdin line. The API key is not an argument. Client messages are JSON lines on stdin. `exit` shuts the process down and is not forwarded. Server commands are JSON lines on stdout.
+
+In-process callers use `Session` on a Tokio runtime or `BlockingSession` from any thread, plus `snapshot_tree`, `upload_fragment`, and `detect_build_env`.
+
+| Binding | Use |
+| --- | --- |
+| Python, JavaScript | `BlockingSession` or `Session` when the wheel loads; otherwise `--stdio` |
+| Elixir, PHP, Java | `--stdio` |
+| Ruby | `<url> <runner_id>` until it moves |
+
+`transport conformance run` is the shared scenario suite. A client replaces the built-in `conformance-client` by speaking the same fixture protocol to the mock; the scenario files live in `conformance/scenarios`.
 
 ## License
 

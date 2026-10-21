@@ -1,0 +1,15 @@
+{
+  "name": "test_map_fragment",
+  "steps": [
+    {"op": "send", "message": {"command": "connected"}},
+    {"op": "send", "message": {"command": "configure_test_map", "tree": true, "record": true, "allocations": true}},
+    {"op": "send", "message": {"command": "test_manifest"}},
+    {"op": "expect_manifest", "tree": true},
+    {"op": "send", "message": {"command": "run_test_cases", "test_case_ids": ["case-pass"]}},
+    {"op": "expect_result", "id": "case-pass", "status": "passed"},
+    {"op": "send", "message": {"command": "close", "exit_status": null}},
+    {"op": "expect_report", "connection_retries": 0, "suite_hooks": 1, "group_hooks": 1},
+    {"op": "expect_fragment", "ids": ["case-pass"]},
+    {"op": "expect_exit", "code": 0}
+  ]
+}

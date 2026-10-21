@@ -1,0 +1,11 @@
+{
+  "name": "queued_before_connected",
+  "steps": [
+    {"op": "send", "message": {"command": "test_manifest"}},
+    {"op": "send", "message": {"command": "connected"}},
+    {"op": "expect_manifest", "tree": false},
+    {"op": "send", "message": {"command": "close", "exit_status": null}},
+    {"op": "expect_report", "connection_retries": 0, "suite_hooks": 1, "group_hooks": 0},
+    {"op": "expect_exit", "code": 0}
+  ]
+}

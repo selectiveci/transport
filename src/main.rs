@@ -1,130 +1,197 @@
 #![warn(clippy::perf, clippy::style, clippy::pedantic)]
 
-use futures_util::{future, pin_mut, StreamExt};
-use std::process::exit;
-use std::sync::Arc;
-use tokio::fs::OpenOptions;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use url::Url;
+use std::path::PathBuf;
 
-#[tokio::main]
-async fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} <url> <runner_id>", args[0]);
-        exit(1);
-    }
+use transport::build_env::build_env_json;
+use transport::conformance::{run_suite, scenario_names, SuiteVia};
+use transport::reference_client::{RunOpts, Via};
+use transport::upload::{upload_fragment, FragmentUpload};
 
-    let url = Url::parse(&args[1]).unwrap();
-    let runner_id: String = args[2].clone();
+const USAGE: &str = "\
+usage:
+  transport <websocket-url> <runner-id>
+  transport --stdio
+  transport --snapshot [dir]
+  transport --upload-fragment
+  transport --build-env
+  transport conformance list
+  transport conformance run [--scenario NAME] [--via direct|stdio|both]
+  transport conformance-client [--via-stdio]
+";
 
-    let input_pipe_path = format!("/tmp/{runner_id}_1");
-    let output_pipe_path = format!("/tmp/{runner_id}_2");
+fn main() {
+    let code = match dispatch() {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("{err}");
+            1
+        }
+    };
+    std::process::exit(code);
+}
 
-    let (pipe_tx, pipe_rx) = futures_channel::mpsc::unbounded();
-    let (exit_tx, mut exit_rx) = mpsc::channel(1);
-    let exit_tx_clone = exit_tx.clone(); // Clone exit_tx for use in the read_pipe function.
-    tokio::spawn(read_pipe(input_pipe_path.clone(), pipe_tx, exit_tx_clone));
-
-    let output_fifo = Arc::new(Mutex::new(
-        OpenOptions::new()
-            .write(true)
-            .open(output_pipe_path)
-            .await
-            .unwrap(),
-    ));
-    let output_fifo_clone = Arc::clone(&output_fifo);
-
-    if let Ok((ws_stream, _)) = connect_async(url).await {
-        let (write, read) = ws_stream.split();
-        let pipe_to_ws = pipe_rx.map(Ok).forward(write);
-        let ws_to_pipe = {
-            read.for_each(move |message_result| {
-                let output_fifo = Arc::clone(&output_fifo_clone);
-                let exit_tx_clone = exit_tx.clone();
-                async move {
-                    if cfg!(debug_assertions) {
-                        match &message_result {
-                            Ok(Message::Text(_)) => println!("Received Text message"),
-                            Ok(Message::Binary(_)) => println!("Received Binary message"),
-                            Ok(Message::Ping(_)) => println!("Received Ping message"),
-                            Ok(Message::Pong(_)) => println!("Received Pong message"),
-                            Ok(Message::Close(_)) => println!("Received Close message, exiting..."),
-                            Err(e) => eprintln!("Error receiving message: {}", e),
-                            _ => println!("Received an unexpected type of message"),
-                        }
-                    }
-
-                    match &message_result {
-                        Ok(Message::Close(_)) => {
-                            let _ = exit_tx_clone
-                                .send(())
-                                .await
-                                .expect("Failed to send exit signal");
-                            return;
-                        }
-                        _ => {}
-                    }
-
-                    if let Ok(message) = message_result {
-                        let data = message.into_data();
-                        let mut data_with_newline = data.clone();
-                        data_with_newline.push(b'\n');
-                        let mut output_fifo = output_fifo.lock().await;
-                        output_fifo
-                            .write_all(&data_with_newline)
-                            .await
-                            .expect("Failed to write to output pipe");
-                        output_fifo
-                            .flush()
-                            .await
-                            .expect("Failed to flush output pipe");
-                        drop(output_fifo);
-                    }
-                }
-            })
-        };
-
-        let exit_fut = async {
-            exit_rx.recv().await;
-            exit(0);
-        };
-
-        pin_mut!(pipe_to_ws, ws_to_pipe, exit_fut);
-        future::select(future::select(pipe_to_ws, ws_to_pipe), exit_fut).await;
-    } else {
-        eprintln!("Failed to connect to the WebSocket server. Exiting...");
-        exit(1);
+fn dispatch() -> Result<i32, transport::Error> {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        None => {
+            eprintln!("{USAGE}");
+            Ok(1)
+        }
+        Some("--help" | "-h") => {
+            eprintln!("{USAGE}");
+            Ok(0)
+        }
+        Some("--stdio") => Ok(block_on(transport::stdio::run())),
+        Some("--snapshot") => snapshot_main(args.next()),
+        Some("--upload-fragment") => upload_main(),
+        Some("--build-env") => {
+            println!("{}", build_env_json());
+            Ok(0)
+        }
+        Some("conformance") => conformance_main(args.collect()),
+        Some("conformance-client") => Ok(conformance_client_main(
+            args.any(|arg| arg == "--via-stdio"),
+        )),
+        Some(url) => match args.next() {
+            Some(runner_id) => Ok(block_on(transport::run_fifo(url, &runner_id))),
+            None => {
+                eprintln!("{USAGE}");
+                Ok(1)
+            }
+        },
     }
 }
 
-async fn read_pipe(
-    path: String,
-    tx: futures_channel::mpsc::UnboundedSender<Message>,
-    exit_tx: mpsc::Sender<()>,
-) {
-    let mut pipe = OpenOptions::new().read(true).open(path).await.unwrap();
-    let mut buf = Vec::new();
-    loop {
-        let mut temp_buf = vec![0; 1024];
-        let n = match pipe.read(&mut temp_buf).await {
-            Err(_) | Ok(0) => break,
-            Ok(n) => n,
-        };
-        buf.extend(&temp_buf[..n]);
-
-        // Split the buffer by '\n' and process each line
-        while let Some(i) = buf.iter().position(|&b| b == b'\n') {
-            let line = buf.drain(..=i).collect::<Vec<_>>();
-            let line_str = String::from_utf8(line.clone()).unwrap();
-            if line_str.trim() == "exit" {
-                exit_tx.send(()).await.expect("Failed to send exit signal");
-                return;
-            }
-            tx.unbounded_send(Message::text(line_str)).unwrap();
+fn snapshot_main(dir: Option<String>) -> Result<i32, transport::Error> {
+    let path = dir.map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        PathBuf::from,
+    );
+    match transport::snapshot_tree(&path)? {
+        Some(tree) => {
+            println!("{}", serde_json::to_string(&tree)?);
+            Ok(0)
+        }
+        None => {
+            eprintln!("not a git checkout");
+            Ok(1)
         }
     }
+}
+
+fn upload_main() -> Result<i32, transport::Error> {
+    let gzip_body = read_stdin()?;
+    if gzip_body.is_empty() {
+        eprintln!("--upload-fragment expected a gzip body on stdin");
+        return Ok(1);
+    }
+    let upload = FragmentUpload {
+        host: std::env::var("SELECTIVE_HOST")
+            .unwrap_or_else(|_| "wss://app.selective.ci".to_owned()),
+        api_key: env_required("SELECTIVE_TEST_MAP_UPLOAD_KEY")?,
+        run_id: env_required("SELECTIVE_RUN_ID")?,
+        run_attempt: env_required("SELECTIVE_RUN_ATTEMPT")?,
+        runner_id: env_required("SELECTIVE_RUNNER_ID")?,
+        gzip_body,
+    };
+    match block_on(upload_fragment(&upload)) {
+        Ok(()) => Ok(0),
+        Err(err) => {
+            eprintln!("Selective could not upload this runner's test map ({err}).");
+            Ok(1)
+        }
+    }
+}
+
+fn conformance_main(args: Vec<String>) -> Result<i32, transport::Error> {
+    let mut scenario = None;
+    let mut via = SuiteVia::Both;
+    let mut command = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "list" => command = Some("list"),
+            "run" => command = Some("run"),
+            "--scenario" => {
+                index += 1;
+                scenario = args.get(index).cloned();
+            }
+            "--via" => {
+                index += 1;
+                via = match args.get(index).map(String::as_str) {
+                    Some("direct") => SuiteVia::Direct,
+                    Some("stdio") => SuiteVia::Stdio,
+                    Some("both") | None => SuiteVia::Both,
+                    Some(other) => {
+                        eprintln!("unknown --via {other}");
+                        return Ok(1);
+                    }
+                };
+            }
+            other => {
+                eprintln!("unknown conformance argument {other}\n{USAGE}");
+                return Ok(1);
+            }
+        }
+        index += 1;
+    }
+    match command {
+        Some("list") => {
+            for name in scenario_names()? {
+                println!("{name}");
+            }
+            Ok(0)
+        }
+        Some("run") => {
+            let bin = std::env::current_exe()?;
+            match block_on(run_suite(&bin, scenario.as_deref(), via)) {
+                Ok(()) => Ok(0),
+                Err(err) => {
+                    eprintln!("{err}");
+                    Ok(1)
+                }
+            }
+        }
+        _ => {
+            eprintln!("{USAGE}");
+            Ok(1)
+        }
+    }
+}
+
+fn conformance_client_main(via_stdio: bool) -> i32 {
+    let url = match std::env::var("SELECTIVE_TRANSPORT_URL") {
+        Ok(url) if !url.is_empty() => url,
+        _ => {
+            eprintln!("conformance-client requires SELECTIVE_TRANSPORT_URL");
+            return 1;
+        }
+    };
+    block_on(transport::reference_client::run(RunOpts {
+        url,
+        via: if via_stdio { Via::Stdio } else { Via::Direct },
+        catch_signals: true,
+    }))
+}
+
+fn env_required(key: &str) -> Result<String, transport::Error> {
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        _ => Err(transport::Error::new(format!("missing {key}"))),
+    }
+}
+
+fn read_stdin() -> Result<Vec<u8>, transport::Error> {
+    use std::io::Read;
+    let mut body = Vec::new();
+    std::io::stdin().read_to_end(&mut body)?;
+    Ok(body)
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(future)
 }
