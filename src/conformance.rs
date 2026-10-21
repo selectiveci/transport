@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -9,6 +10,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
+use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -25,44 +27,22 @@ pub struct Scenario {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Step {
-    Send {
-        message: Value,
-    },
-    ExpectManifest {
-        tree: bool,
-    },
-    ExpectResult {
-        id: String,
-        status: String,
-    },
-    ExpectResults {
-        ids: Vec<String>,
-    },
-    ExpectType {
-        frame_type: String,
-    },
-    ExpectTerminating {
-        signal: String,
-    },
+    Send { message: Value },
+    ExpectManifest { tree: bool },
+    ExpectResult { id: String, status: String },
+    ExpectResults { ids: Vec<String> },
+    ExpectType { frame_type: String },
+    ExpectTerminating { signal: String },
     Drop,
     ExpectReconnect,
-    ExpectFragment {
-        ids: Vec<String>,
-    },
-    ExpectReport {
-        connection_retries: u64,
-        #[serde(default)]
-        suite_hooks: Option<u64>,
-        #[serde(default)]
-        group_hooks: Option<u64>,
-    },
+    ExpectFragment { ids: Vec<String> },
+    ExpectReport { connection_retries: u64 },
+    ExpectNoFrame { ms: u64 },
+    ArmHoldUpload,
+    WaitUpload,
     SignalTerm,
-    ExpectExit {
-        code: i32,
-    },
-    RejectConnections {
-        times: u32,
-    },
+    ExpectExit { code: i32 },
+    RejectConnections { times: u32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -95,6 +75,8 @@ pub fn scenarios() -> Result<Vec<Scenario>, Error> {
         include_str!("../conformance/scenarios/queued_before_connected.json"),
         include_str!("../conformance/scenarios/unknown_command.json"),
         include_str!("../conformance/scenarios/reconnect_exhausted.json"),
+        include_str!("../conformance/scenarios/overlap_buffered.json"),
+        include_str!("../conformance/scenarios/upload_stall.json"),
     ];
     RAW.iter()
         .map(|raw| serde_json::from_str(raw).map_err(Error::from))
@@ -148,8 +130,17 @@ async fn run_one(bin: &Path, scenario: &Scenario, via: Via) -> Result<(), Error>
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let url = format!(
-        "ws://{addr}/transport/websocket?api_key=conformance-key&run_id=run-1&run_attempt=1&runner_id=runner-1"
+        "ws://{addr}/transport/websocket?api_key=conformance-key&run_id=run-1&run_attempt=1&runner_id=runner-1&metadata=%7B%22ci%22%3A%22conformance%22%7D"
     );
+    let gate = Arc::new(Gate {
+        reject_budget: AtomicU32::new(match scenario.steps.first() {
+            Some(Step::RejectConnections { times }) => *times,
+            _ => 0,
+        }),
+        hold_uploads: AtomicBool::new(false),
+        upload_held: AtomicBool::new(false),
+        upload_notify: Notify::new(),
+    });
     let logs = Arc::new(Mutex::new(String::new()));
     let mut command = Command::new(bin);
     command
@@ -162,18 +153,17 @@ async fn run_one(bin: &Path, scenario: &Scenario, via: Via) -> Result<(), Error>
     if matches!(via, Via::Stdio) {
         command.arg("--via-stdio");
     }
-    let mut child = command.spawn()?;
-    drain_pipe(child.stdout.take(), Arc::clone(&logs));
-    drain_pipe(child.stderr.take(), Arc::clone(&logs));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let accept_gate = Arc::clone(&gate);
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
             let tx = tx.clone();
+            let gate = Arc::clone(&accept_gate);
             tokio::spawn(async move {
-                match classify(stream).await {
+                match classify(stream, &gate).await {
                     Ok(incoming) => {
                         let _ = tx.send(incoming);
                     }
@@ -182,12 +172,16 @@ async fn run_one(bin: &Path, scenario: &Scenario, via: Via) -> Result<(), Error>
             });
         }
     });
+    let mut child = command.spawn()?;
+    drain_pipe(child.stdout.take(), Arc::clone(&logs));
+    drain_pipe(child.stderr.take(), Arc::clone(&logs));
     let mut player = Player {
         incoming: rx,
         current: None,
         fragments: Vec::new(),
         child: Some(child),
         saw_connection: false,
+        gate,
     };
     let played = player.play(scenario).await;
     if played.is_err() {
@@ -239,6 +233,14 @@ struct CapturedHttp {
 enum Incoming {
     Socket(Live),
     Fragment(CapturedHttp),
+    Rejected,
+}
+
+struct Gate {
+    reject_budget: AtomicU32,
+    hold_uploads: AtomicBool,
+    upload_held: AtomicBool,
+    upload_notify: Notify,
 }
 
 struct Player {
@@ -247,6 +249,7 @@ struct Player {
     fragments: Vec<CapturedHttp>,
     child: Option<Child>,
     saw_connection: bool,
+    gate: Arc<Gate>,
 }
 
 impl Player {
@@ -322,14 +325,16 @@ impl Player {
             }
             Step::ExpectReconnect => self.expect_reconnect().await,
             Step::ExpectFragment { ids } => self.expect_fragment(ids).await,
-            Step::ExpectReport {
-                connection_retries,
-                suite_hooks,
-                group_hooks,
-            } => {
+            Step::ExpectReport { connection_retries } => {
                 let frame = self.next_frame().await?;
-                expect_report(&frame, *connection_retries, *suite_hooks, *group_hooks)
+                expect_report(&frame, *connection_retries)
             }
+            Step::ExpectNoFrame { ms } => self.expect_no_frame(*ms).await,
+            Step::ArmHoldUpload => {
+                self.gate.hold_uploads.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            Step::WaitUpload => self.wait_upload().await,
             Step::SignalTerm => self.signal_term(),
             Step::ExpectExit { code } => self.expect_exit(*code).await,
             Step::RejectConnections { times } => self.reject_connections(*times).await,
@@ -396,6 +401,12 @@ impl Player {
                 self.fragments.push(fragment);
                 Ok(None)
             }
+            Event::Accepted(Some(Incoming::Rejected)) => {
+                self.current = live;
+                Err(Error::new(
+                    "handshake was refused outside reject_connections",
+                ))
+            }
             Event::Accepted(None) => {
                 self.current = live;
                 Err(Error::new("connection listener stopped"))
@@ -417,6 +428,12 @@ impl Player {
     }
 
     fn install(&mut self, socket: Live) -> Result<(), Error> {
+        if !connect_metadata_is_json(&socket.uri) {
+            return Err(Error::new(format!(
+                "connect metadata is missing or not JSON: {}",
+                socket.uri
+            )));
+        }
         if !self.saw_connection {
             if socket.uri.contains("reconnect=true") {
                 return Err(Error::new(
@@ -427,6 +444,39 @@ impl Player {
         }
         self.current = Some(socket);
         Ok(())
+    }
+
+    async fn expect_no_frame(&mut self, ms: u64) -> Result<(), Error> {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        loop {
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            match self.pump(deadline).await {
+                Ok(Some(frame)) => {
+                    return Err(Error::new(format!(
+                        "expected no frame before connected, got {frame}"
+                    )));
+                }
+                Ok(None) => {}
+                Err(err) if err.to_string() == "timed out waiting for the client" => return Ok(()),
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    async fn wait_upload(&mut self) -> Result<(), Error> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if self.gate.upload_held.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::new("timed out waiting for the stalled upload"));
+            }
+            let _ = tokio::time::timeout(remaining, self.gate.upload_notify.notified()).await;
+        }
     }
 
     async fn expect_fragment(&mut self, ids: &[String]) -> Result<(), Error> {
@@ -506,8 +556,9 @@ impl Player {
             .child
             .as_ref()
             .ok_or_else(|| Error::new("no client process"))?;
+        let pid = child_term_target(child.id())?;
         let status = std::process::Command::new("kill")
-            .args(["-TERM", &child.id().unwrap_or(0).to_string()])
+            .args(["-TERM", &pid.to_string()])
             .status()?;
         if status.success() {
             Ok(())
@@ -524,11 +575,10 @@ impl Player {
         let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
             .map_err(|_| Error::new("timed out waiting for the client to exit"))??;
-        let got = status.code().unwrap_or(1);
-        if got == code {
+        if status.code() == Some(code) {
             Ok(())
         } else {
-            Err(Error::new(format!("exit {got}, expected {code}")))
+            Err(Error::new(format!("exit {status}, expected {code}")))
         }
     }
 
@@ -538,9 +588,18 @@ impl Player {
                 .await
                 .map_err(|_| Error::new("timed out accepting a rejected connection"))?
                 .ok_or_else(|| Error::new("connection listener stopped"))?;
-            drop(next);
+            if !matches!(next, Incoming::Rejected) {
+                return Err(Error::new("expected the handshake to be refused with 503"));
+            }
         }
         Ok(())
+    }
+}
+
+fn child_term_target(pid: Option<u32>) -> Result<u32, Error> {
+    match pid {
+        Some(pid) if pid != 0 => Ok(pid),
+        _ => Err(Error::new("client pid is unavailable")),
     }
 }
 
@@ -550,24 +609,52 @@ enum Event {
     Timeout,
 }
 
-async fn classify(stream: TcpStream) -> Result<Incoming, Error> {
+async fn classify(mut stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, Error> {
     let mut peeked = [0u8; 4];
     let n = stream.peek(&mut peeked).await.unwrap_or(0);
     if n >= 4 && &peeked == b"POST" {
+        if gate.hold_uploads.load(Ordering::SeqCst) {
+            let _held = read_http_request(&mut stream).await?;
+            gate.upload_held.store(true, Ordering::SeqCst);
+            gate.upload_notify.notify_waiters();
+            loop {
+                std::future::pending::<()>().await;
+            }
+        }
         return Ok(Incoming::Fragment(read_http(stream).await?));
     }
     let uri = Arc::new(Mutex::new(String::new()));
     let uri_for_cb = Arc::clone(&uri);
-    let ws = tokio_tungstenite::accept_hdr_async(
+    let budget = Arc::clone(gate);
+    let rejected = Arc::new(AtomicBool::new(false));
+    let rejected_cb = Arc::clone(&rejected);
+    let handshake = tokio_tungstenite::accept_hdr_async(
         stream,
         move |request: &Request, response: Response| {
+            if budget
+                .reject_budget
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    current.checked_sub(1)
+                })
+                .is_ok()
+            {
+                rejected_cb.store(true, Ordering::SeqCst);
+                return Err(http::Response::builder()
+                    .status(503)
+                    .body(Some("Service Unavailable".to_owned()))
+                    .expect("503 response"));
+            }
             if let Ok(mut slot) = uri_for_cb.lock() {
                 *slot = request.uri().to_string();
             }
             Ok(response)
         },
     )
-    .await?;
+    .await;
+    if rejected.load(Ordering::SeqCst) {
+        return Ok(Incoming::Rejected);
+    }
+    let ws = handshake?;
     let uri = uri.lock().map(|guard| guard.clone()).unwrap_or_default();
     Ok(Incoming::Socket(Live { uri, ws }))
 }
@@ -674,12 +761,7 @@ fn expect_result(frame: &Value, id: &str, status: &str) -> Result<(), Error> {
     }
 }
 
-fn expect_report(
-    frame: &Value,
-    connection_retries: u64,
-    suite_hooks: Option<u64>,
-    group_hooks: Option<u64>,
-) -> Result<(), Error> {
+fn expect_report(frame: &Value, connection_retries: u64) -> Result<(), Error> {
     if frame.get("type").and_then(Value::as_str) != Some("report_at_finish") {
         return Err(Error::new(format!(
             "expected report_at_finish, got {frame}"
@@ -689,30 +771,33 @@ fn expect_report(
         .pointer("/data/connection_retries")
         .and_then(Value::as_u64);
     if got != Some(connection_retries) {
-        return Err(Error::new(format!(
+        Err(Error::new(format!(
             "connection_retries {got:?}, expected {connection_retries}"
-        )));
+        )))
+    } else {
+        Ok(())
     }
-    if let Some(expected) = suite_hooks {
-        let got = frame.pointer("/data/suite_hooks").and_then(Value::as_u64);
-        if got != Some(expected) {
-            return Err(Error::new(format!(
-                "suite_hooks {got:?}, expected {expected}"
-            )));
-        }
-    }
-    if let Some(expected) = group_hooks {
-        let got = frame.pointer("/data/group_hooks").and_then(Value::as_u64);
-        if got != Some(expected) {
-            return Err(Error::new(format!(
-                "group_hooks {got:?}, expected {expected}"
-            )));
-        }
-    }
-    Ok(())
+}
+
+fn connect_metadata_is_json(uri: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(&format!("ws://conformance.invalid{uri}")) else {
+        return false;
+    };
+    parsed
+        .query_pairs()
+        .find(|(key, _)| key == "metadata")
+        .is_some_and(|(_, value)| serde_json::from_str::<Value>(&value).is_ok())
 }
 
 async fn read_http(mut stream: TcpStream) -> Result<CapturedHttp, Error> {
+    let captured = read_http_request(&mut stream).await?;
+    stream
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await?;
+    Ok(captured)
+}
+
+async fn read_http_request(stream: &mut TcpStream) -> Result<CapturedHttp, Error> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 2048];
     let header_end = loop {
@@ -749,8 +834,36 @@ async fn read_http(mut stream: TcpStream) -> Result<CapturedHttp, Error> {
         body.extend_from_slice(&tmp[..n]);
     }
     body.truncate(length);
-    stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        .await?;
     Ok(CapturedHttp { header, body })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_must_be_json_and_pid_zero_is_not_signalled() {
+        assert!(connect_metadata_is_json(
+            "/transport/websocket?metadata=%7B%22ci%22%3A%22conformance%22%7D"
+        ));
+        assert!(!connect_metadata_is_json("/transport/websocket?api_key=k"));
+        assert!(!connect_metadata_is_json(
+            "/transport/websocket?metadata=not-json"
+        ));
+        assert!(child_term_target(None).is_err());
+        assert!(child_term_target(Some(0)).is_err());
+        assert_eq!(child_term_target(Some(42)).unwrap(), 42);
+    }
+
+    #[test]
+    fn signal_death_is_not_a_normal_exit() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("kill -TERM $$")
+            .status()
+            .unwrap();
+        assert!(status.code().is_none());
+        let message = format!("exit {status}, expected 1");
+        assert!(message.contains("SIGTERM") || message.contains("signal"));
+    }
 }

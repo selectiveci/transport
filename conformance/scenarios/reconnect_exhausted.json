@@ -1,7 +1,13 @@
 {
   "name": "reconnect_exhausted",
   "steps": [
-    {"op": "reject_connections", "times": 11},
-    {"op": "expect_exit", "code": 1}
+    {
+      "op": "reject_connections",
+      "times": 11
+    },
+    {
+      "op": "expect_exit",
+      "code": 1
+    }
   ]
 }

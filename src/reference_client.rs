@@ -142,8 +142,6 @@ struct State {
     connection_retries: u32,
     attempts: HashMap<String, u32>,
     results: HashMap<String, String>,
-    group_hooks: u64,
-    suite_hooks: u64,
     files: Vec<String>,
     file_index: HashMap<String, usize>,
     traces: HashMap<String, BTreeSet<usize>>,
@@ -184,6 +182,7 @@ async fn drive(
             Action::Lost => return Drive::Lost,
             Action::Reconnect => return Drive::Reconnect,
             Action::Exit(code) => return Drive::Finished(code),
+            Action::Signal(signal) => return Drive::Signal(signal),
             Action::Pause => {}
         }
     }
@@ -234,13 +233,14 @@ enum Action {
     Lost,
     Reconnect,
     Exit(i32),
+    Signal(&'static str),
 }
 
 async fn dispatch(
     link: &mut Link,
     state: &mut State,
     base_url: &str,
-    _signals: &watch::Receiver<Option<&'static str>>,
+    signals: &watch::Receiver<Option<&'static str>>,
     command: Value,
     queued: &mut VecDeque<Value>,
 ) -> Action {
@@ -278,8 +278,7 @@ async fn dispatch(
                     result["data"]["status"].as_str().unwrap_or("passed"),
                 );
                 match drain(link, state, queued).await {
-                    Action::Continue => {}
-                    Action::Pause => break,
+                    Action::Continue | Action::Pause => {}
                     other => return other,
                 }
             }
@@ -292,7 +291,7 @@ async fn dispatch(
             Action::Continue
         }
         "reconnect" => Action::Reconnect,
-        "close" => close_session(link, state, base_url, &command).await,
+        "close" => close_session(link, state, base_url, signals, &command).await,
         "print_notice" | "print_message" => {
             if let Some(message) = command.get("message").and_then(Value::as_str) {
                 println!("{message}");
@@ -322,7 +321,7 @@ async fn drain(link: &mut Link, state: &mut State, queued: &mut VecDeque<Value>)
                     }
                     "reconnect" | "close" | "connected" | "configure_test_map"
                     | "test_manifest" | "run_test_cases" => {
-                        queued.push_front(value);
+                        queued.push_back(value);
                         return Action::Pause;
                     }
                     _ => {}
@@ -338,6 +337,7 @@ async fn close_session(
     link: &mut Link,
     state: &mut State,
     base_url: &str,
+    signals: &watch::Receiver<Option<&'static str>>,
     command: &Value,
 ) -> Action {
     if let Some(message) = command.get("message").and_then(Value::as_str) {
@@ -349,23 +349,39 @@ async fn close_session(
         .get("exit_status")
         .and_then(Value::as_i64)
         .map(|code| code as i32);
-    if override_status.is_none() {
-        state.suite_hooks = 1;
-    }
     let report = json!({
         "type": "report_at_finish",
         "data": {
-            "connection_retries": state.connection_retries,
-            "suite_hooks": state.suite_hooks,
-            "group_hooks": state.group_hooks
+            "connection_retries": state.connection_retries
         }
     });
     if send_json(link, &report).await.is_err() {
         return Action::Lost;
     }
     if state.record && !state.traces.is_empty() {
-        if let Err(err) = upload_traces(state, base_url).await {
-            eprintln!("Selective could not upload this runner's test map ({err}). Its tests will run on the next build rather than be skipped.");
+        if let Some(signal) = signal_now(signals) {
+            return Action::Signal(signal);
+        }
+        let upload = upload_traces(state, base_url);
+        tokio::pin!(upload);
+        let mut signals = signals.clone();
+        loop {
+            tokio::select! {
+                biased;
+                changed = signals.changed() => {
+                    if changed.is_ok() {
+                        if let Some(signal) = *signals.borrow() {
+                            return Action::Signal(signal);
+                        }
+                    }
+                }
+                result = &mut upload => {
+                    if let Err(err) = result {
+                        eprintln!("Selective could not upload this runner's test map ({err}). Its tests will run on the next build rather than be skipped.");
+                    }
+                    break;
+                }
+            }
         }
     }
     let _ = link.close().await;
@@ -390,7 +406,6 @@ fn framework_status(state: &State) -> i32 {
 
 fn remember(state: &mut State, id: &str, status: &str) {
     state.results.insert(id.to_owned(), status.to_owned());
-    state.group_hooks += 1;
     if state.record {
         let index = intern(state, FILE_PATH);
         state.traces.entry(id.to_owned()).or_default().insert(index);

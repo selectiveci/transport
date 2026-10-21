@@ -53,7 +53,9 @@ fn dispatch() -> Result<i32, transport::Error> {
             args.any(|arg| arg == "--via-stdio"),
         )),
         Some(url) => match args.next() {
-            Some(runner_id) => Ok(block_on(transport::run_fifo(url, &runner_id))),
+            Some(runner_id) => Ok(block_on_abandoning_blocking(transport::run_fifo(
+                url, &runner_id,
+            ))),
             None => {
                 eprintln!("{USAGE}");
                 Ok(1)
@@ -85,13 +87,13 @@ fn upload_main() -> Result<i32, transport::Error> {
         eprintln!("--upload-fragment expected a gzip body on stdin");
         return Ok(1);
     }
+    let detected = transport::detect_build_env();
     let upload = FragmentUpload {
-        host: std::env::var("SELECTIVE_HOST")
-            .unwrap_or_else(|_| "wss://app.selective.ci".to_owned()),
+        host: detected.host,
         api_key: env_required("SELECTIVE_TEST_MAP_UPLOAD_KEY")?,
-        run_id: env_required("SELECTIVE_RUN_ID")?,
-        run_attempt: env_required("SELECTIVE_RUN_ATTEMPT")?,
-        runner_id: env_required("SELECTIVE_RUNNER_ID")?,
+        run_id: detected.run_id,
+        run_attempt: detected.run_attempt,
+        runner_id: detected.runner_id,
         gzip_body,
     };
     match block_on(upload_fragment(&upload)) {
@@ -194,4 +196,14 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .build()
         .expect("runtime");
     runtime.block_on(future)
+}
+
+fn block_on_abandoning_blocking<F: std::future::Future>(future: F) -> F::Output {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let output = runtime.block_on(future);
+    runtime.shutdown_background();
+    output
 }

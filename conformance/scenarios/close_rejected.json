@@ -1,9 +1,28 @@
 {
   "name": "close_rejected",
   "steps": [
-    {"op": "send", "message": {"command": "connected"}},
-    {"op": "send", "message": {"command": "close", "exit_status": 2, "error_code": "invalid_api_key", "message": "nope"}},
-    {"op": "expect_report", "connection_retries": 0, "suite_hooks": 0, "group_hooks": 0},
-    {"op": "expect_exit", "code": 2}
+    {
+      "op": "send",
+      "message": {
+        "command": "connected"
+      }
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "close",
+        "exit_status": 2,
+        "error_code": "invalid_api_key",
+        "message": "nope"
+      }
+    },
+    {
+      "op": "expect_report",
+      "connection_retries": 0
+    },
+    {
+      "op": "expect_exit",
+      "code": 2
+    }
   ]
 }

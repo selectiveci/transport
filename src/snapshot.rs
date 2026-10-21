@@ -150,14 +150,14 @@ fn hash_objects(root: &Path, paths: &[String]) -> Option<Vec<(String, String)>> 
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    {
-        let stdin = child.stdin.as_mut()?;
+    let mut stdin = child.stdin.take()?;
+    let input: String = existing.iter().map(|path| format!("{path}\n")).collect();
+    let writer = std::thread::spawn(move || {
         use std::io::Write;
-        for path in &existing {
-            writeln!(stdin, "{path}").ok()?;
-        }
-    }
+        stdin.write_all(input.as_bytes())
+    });
     let output = child.wait_with_output().ok()?;
+    writer.join().ok()?.ok()?;
     if !output.status.success() {
         return Some(Vec::new());
     }
@@ -299,5 +299,34 @@ mod tests {
         fs::create_dir_all(&isolated).unwrap();
         assert!(snapshot_tree(&isolated).unwrap().is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_hashes_thousands_of_dirty_files() {
+        let root = init_repo();
+        let count = 3200;
+        for index in 0..count {
+            fs::write(root.join(format!("f{index:04}.txt")), b"v1\n").unwrap();
+        }
+        git_cmd(&root, &["add", "."]);
+        git_cmd(&root, &["commit", "-m", "many"]);
+        for index in 0..count {
+            fs::write(root.join(format!("f{index:04}.txt")), b"v2\n").unwrap();
+        }
+        let tree = snapshot_tree(&root).unwrap().unwrap();
+        assert_eq!(tree.files.len(), count);
+        assert_eq!(tree.dirty.len(), count);
+        let sample = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["hash-object", "f0007.txt"])
+            .output()
+            .unwrap();
+        let blob = String::from_utf8_lossy(&sample.stdout).trim().to_owned();
+        assert_eq!(
+            tree.files.get("f0007.txt").and_then(Value::as_str),
+            Some(blob.as_str())
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

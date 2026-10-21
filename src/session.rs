@@ -12,6 +12,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::error::Error;
 
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
 enum OutMsg {
     Text(String, oneshot::Sender<Result<(), Error>>),
     Close(oneshot::Sender<Result<(), Error>>),
@@ -25,7 +27,9 @@ pub struct Session {
 
 impl Session {
     pub async fn connect(url: &str) -> Result<Self, Error> {
-        let (socket, _) = connect_async(url).await?;
+        let (socket, _) = tokio::time::timeout(IO_TIMEOUT, connect_async(url))
+            .await
+            .map_err(|_| Error::new("timed out connecting"))??;
         let (sink, mut stream) = socket.split();
         let (out_tx, mut out_rx) = unbounded_channel();
         let (in_tx, in_rx) = unbounded_channel();
@@ -34,7 +38,14 @@ impl Session {
             while let Some(msg) = out_rx.recv().await {
                 match msg {
                     OutMsg::Text(text, reply) => {
-                        let result = sink.send(Message::Text(text)).await.map_err(Error::from);
+                        let result =
+                            match tokio::time::timeout(IO_TIMEOUT, sink.send(Message::Text(text)))
+                                .await
+                            {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(err)) => Err(Error::from(err)),
+                                Err(_) => Err(Error::new("timed out sending a frame")),
+                            };
                         let failed = result.is_err();
                         let _ = reply.send(result);
                         if failed {
@@ -42,14 +53,18 @@ impl Session {
                         }
                     }
                     OutMsg::Close(reply) => {
-                        let result = match sink.send(Message::Close(None)).await {
-                            Ok(()) => Ok(()),
-                            Err(tokio_tungstenite::tungstenite::Error::AlreadyClosed)
-                            | Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed) => {
-                                Ok(())
-                            }
-                            Err(err) => Err(Error::from(err)),
-                        };
+                        let result =
+                            match tokio::time::timeout(IO_TIMEOUT, sink.send(Message::Close(None)))
+                                .await
+                            {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(tokio_tungstenite::tungstenite::Error::AlreadyClosed))
+                                | Ok(Err(
+                                    tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+                                )) => Ok(()),
+                                Ok(Err(err)) => Err(Error::from(err)),
+                                Err(_) => Err(Error::new("timed out closing the session")),
+                            };
                         let _ = reply.send(result);
                         break;
                     }
@@ -228,7 +243,7 @@ impl BlockingSession {
                 }
             });
         });
-        match ready_rx.recv() {
+        match ready_rx.recv_timeout(IO_TIMEOUT + Duration::from_secs(2)) {
             Ok(Ok(())) => Ok(Self {
                 commands: cmd_tx,
                 events: std::sync::Mutex::new(evt_rx),
@@ -238,7 +253,11 @@ impl BlockingSession {
                 let _ = thread.join();
                 Err(err)
             }
-            Err(_) => {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                drop(thread);
+                Err(Error::new("timed out connecting"))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = thread.join();
                 Err(Error::new("session thread stopped before connect"))
             }
@@ -264,7 +283,7 @@ impl BlockingSession {
         self.commands
             .send(BlockingCmd::Send(frame.to_owned(), reply_tx))
             .map_err(|_| Error::new("session closed"))?;
-        reply_rx.recv().map_err(|_| Error::new("session closed"))?
+        wait_reply(reply_rx)
     }
 
     pub fn close(&self) -> Result<(), Error> {
@@ -272,15 +291,23 @@ impl BlockingSession {
         self.commands
             .send(BlockingCmd::Close(reply_tx))
             .map_err(|_| Error::new("session closed"))?;
-        reply_rx.recv().map_err(|_| Error::new("session closed"))?
+        wait_reply(reply_rx)
+    }
+}
+
+fn wait_reply(reply_rx: Receiver<Result<(), Error>>) -> Result<(), Error> {
+    match reply_rx.recv_timeout(IO_TIMEOUT + Duration::from_secs(2)) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(Error::new("timed out waiting for the session"))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(Error::new("session closed")),
     }
 }
 
 impl Drop for BlockingSession {
     fn drop(&mut self) {
         let _ = self.close();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        drop(self.thread.take());
     }
 }
