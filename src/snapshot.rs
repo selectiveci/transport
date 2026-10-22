@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn snapshot_hashes_thousands_of_dirty_files() {
         let root = init_repo();
-        let count = 3200;
+        let count = 10_000;
         for index in 0..count {
             fs::write(root.join(format!("f{index:04}.txt")), b"v1\n").unwrap();
         }

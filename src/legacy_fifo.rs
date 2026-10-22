@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::{future, pin_mut, StreamExt};
@@ -38,6 +38,7 @@ async fn run_unix(url: &str, runner_id: &str) -> i32 {
     ));
     let keepalive = crate::session::Keepalive::from_env();
     let last_pong = Arc::new(AtomicU64::new(unix_millis()));
+    let write_blocked = Arc::new(AtomicBool::new(false));
     if keepalive.ping_interval.is_zero() {
         drop(pipe_tx);
     } else {
@@ -58,12 +59,17 @@ async fn run_unix(url: &str, runner_id: &str) -> i32 {
             }
         });
         let watched = Arc::clone(&last_pong);
+        let blocked = Arc::clone(&write_blocked);
         let exit_tx_ping = exit_tx.clone();
         let budget = keepalive.ping_interval + keepalive.pong_timeout;
         tokio::spawn(async move {
             let limit = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
             loop {
                 tokio::time::sleep(keepalive.pong_timeout).await;
+                if blocked.load(Ordering::SeqCst) {
+                    watched.store(unix_millis(), Ordering::SeqCst);
+                    continue;
+                }
                 let stale = unix_millis().saturating_sub(watched.load(Ordering::SeqCst));
                 if stale >= limit {
                     eprintln!("websocket pong timeout");
@@ -88,10 +94,12 @@ async fn run_unix(url: &str, runner_id: &str) -> i32 {
         let pipe_to_ws = pipe_rx.map(Ok).forward(write);
         let ws_to_pipe = {
             let last_pong = Arc::clone(&last_pong);
+            let write_blocked = Arc::clone(&write_blocked);
             read.for_each(move |message_result| {
                 let output_fifo = Arc::clone(&output_fifo_clone);
                 let exit_tx_clone = exit_tx.clone();
                 let last_pong = Arc::clone(&last_pong);
+                let write_blocked = Arc::clone(&write_blocked);
                 async move {
                     if cfg!(debug_assertions) {
                         match &message_result {
@@ -125,6 +133,7 @@ async fn run_unix(url: &str, runner_id: &str) -> i32 {
                         let data = message.into_data();
                         let mut data_with_newline = data.clone();
                         data_with_newline.push(b'\n');
+                        write_blocked.store(true, Ordering::SeqCst);
                         let mut output_fifo = output_fifo.lock().await;
                         output_fifo
                             .write_all(&data_with_newline)
@@ -134,6 +143,8 @@ async fn run_unix(url: &str, runner_id: &str) -> i32 {
                             .flush()
                             .await
                             .expect("Failed to flush output pipe");
+                        last_pong.store(unix_millis(), Ordering::SeqCst);
+                        write_blocked.store(false, Ordering::SeqCst);
                         drop(output_fifo);
                     }
                 }
@@ -172,7 +183,10 @@ async fn read_pipe(
     loop {
         let mut temp_buf = vec![0; 1024];
         let n = match pipe.read(&mut temp_buf).await {
-            Err(_) | Ok(0) => break,
+            Err(_) | Ok(0) => {
+                tx.close_channel();
+                break;
+            }
             Ok(n) => n,
         };
         buf.extend(&temp_buf[..n]);

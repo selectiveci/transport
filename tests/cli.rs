@@ -335,6 +335,120 @@ async fn fifo_exits_when_connect_is_refused_while_the_input_pipe_stays_open() {
     let _ = std::fs::remove_file(&output);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn fifo_input_eof_sends_close_and_exits() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (id, input, output) = fifo_paths();
+    let mut child = Command::new(bin())
+        .arg(format!("ws://{addr}"))
+        .arg(&id)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let input_path = input.clone();
+    let output_path = output.clone();
+    let writer = tokio::spawn(async move {
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(input_path)
+            .await
+            .unwrap()
+    });
+    let reader = tokio::spawn(async move {
+        tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(output_path)
+            .await
+            .unwrap()
+    });
+    let (sock, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut ws = accept_async(sock).await.unwrap();
+    let input_writer = writer.await.unwrap();
+    let _held_output = reader.await.unwrap();
+    drop(input_writer);
+    let frame = timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("fifo input EOF did not close the socket")
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(frame, Message::Close(_)),
+        "expected Close, got {frame:?}"
+    );
+    let status = timeout(Duration::from_secs(2), child.wait())
+        .await
+        .expect("fifo input EOF did not exit")
+        .unwrap();
+    assert!(status.success());
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fifo_stalled_output_is_not_a_pong_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (id, input, output) = fifo_paths();
+    let mut child = Command::new(bin())
+        .arg(format!("ws://{addr}"))
+        .arg(&id)
+        .env("SELECTIVE_WS_PING_INTERVAL_MS", "200")
+        .env("SELECTIVE_WS_PONG_TIMEOUT_MS", "1000")
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let input_path = input.clone();
+    let output_path = output.clone();
+    let writer = tokio::spawn(async move {
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(input_path)
+            .await
+            .unwrap()
+    });
+    let reader = tokio::spawn(async move {
+        tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(output_path)
+            .await
+            .unwrap()
+    });
+    let (sock, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut ws = accept_async(sock).await.unwrap();
+    let _held_input = writer.await.unwrap();
+    let _stalled_output = reader.await.unwrap();
+    let payload = "x".repeat(300 * 1024);
+    let send = tokio::spawn(async move {
+        let _ = ws.send(Message::Text(payload)).await;
+        let _hold = ws;
+        std::future::pending::<()>().await;
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    if let Some(status) = child.try_wait().unwrap() {
+        let mut err = Vec::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = timeout(Duration::from_secs(1), stderr.read_to_end(&mut err)).await;
+        }
+        panic!(
+            "fifo exited {status} while _2 was stalled: {}",
+            String::from_utf8_lossy(&err)
+        );
+    }
+    send.abort();
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
+}
+
 #[test]
 fn build_env_and_snapshot_commands() {
     let dir = std::env::temp_dir().join(format!("transport-cli-{}", std::process::id()));
@@ -586,6 +700,34 @@ fn write_executable(path: &std::path::Path, body: &str) {
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn conformance_unknown_scenario_exits_nonzero() {
+    for args in [
+        vec!["conformance", "run", "--scenario", "no_such_scenario"],
+        vec![
+            "conformance",
+            "run",
+            "--scenario",
+            "no_such_scenario",
+            "--client",
+            "/bin/false",
+        ],
+    ] {
+        let output = Command::new(bin()).args(&args).output().await.unwrap();
+        assert!(
+            !output.status.success(),
+            "args {args:?} stdout {}\nstderr {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("no conformance scenarios ran") && stderr.contains("no_such_scenario"),
+            "args {args:?} stderr {stderr}"
+        );
     }
 }
 

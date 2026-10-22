@@ -118,6 +118,10 @@ The harness rewrites scenario ids before it sends or expects them. `conformance-
 
 `idle_keepalive` keeps the mock quiet for three ping intervals (65s when the interval is the 20s default, which is longer than a 60s proxy idle timeout) and requires the connection to stay up and deliver a ping. `pong_timeout` stops answering pongs and requires a clean `reconnect=true` dial. Scenario files live in `conformance/scenarios`.
 
+## Release platforms
+
+The Linux x86_64 gnu binary is built on the Ubuntu 24.04 runner in `.github/workflows/pre-release.yml`. On 2026-10-21 Nate set that binary's glibc floor at 2.39 (hard requirement `GLIBC_2.34`, weak requirement `GLIBC_2.39`). That decision supersedes `fda9533` (2023-11-03), which pinned Linux builds to Ubuntu 20.04 after a `GLIBC_2.33' not found` failure. The release workflow stays on Ubuntu 24.04. musl release binaries are static-pie. The aarch64 gnu binary is cross-built and keeps the glibc of that image.
+
 ## License
 
 The package is available as open source under the terms of the MIT License.

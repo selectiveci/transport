@@ -158,14 +158,23 @@ impl Session {
                         outstanding = None;
                         if timed_out {
                             eprintln!("websocket pong timeout");
-                            let _ = sink.send(Message::Close(None)).await;
+                            let _ = tokio::time::timeout(
+                                IO_TIMEOUT,
+                                sink.send(Message::Close(None)),
+                            )
+                            .await;
                             let _ = writer_in.send(Ok(None));
                             break;
                         }
                     }
                     _ = sleep_until(scheduled_ping), if scheduled_ping.is_some() => {
                         let stamp = pongs.load(Ordering::SeqCst);
-                        if sink.send(Message::Ping(b"selective".to_vec())).await.is_err() {
+                        let sent = tokio::time::timeout(
+                            IO_TIMEOUT,
+                            sink.send(Message::Ping(b"selective".to_vec())),
+                        )
+                        .await;
+                        if sent.ok().and_then(Result::ok).is_none() {
                             eprintln!("websocket ping failed");
                             let _ = writer_in.send(Ok(None));
                             break;

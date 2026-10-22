@@ -120,6 +120,7 @@ pub async fn run_suite(bin: &Path, filter: Option<&str>, via: SuiteVia) -> Resul
 pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), Error> {
     let pace = conformance_pace();
     let mut failures = Vec::new();
+    let mut trials = 0usize;
     for scenario in scenarios()? {
         if run.filter.is_some_and(|name| name != scenario.name) {
             continue;
@@ -145,12 +146,14 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
                 fixtures: &run.fixtures,
                 pace,
             };
+            trials += 1;
             match run_one(&trial).await {
                 Ok(()) => eprintln!("ok {} client", scenario.name),
                 Err(err) => failures.push(format!("{} client: {err}", scenario.name)),
             }
         } else {
             for via in run.via.list() {
+                trials += 1;
                 let trial = Trial {
                     bin,
                     scenario: &scenario,
@@ -168,6 +171,14 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
                 }
             }
         }
+    }
+    if trials == 0 {
+        return Err(match run.filter {
+            Some(name) => Error::new(format!(
+                "no conformance scenarios ran for --scenario {name}"
+            )),
+            None => Error::new("no conformance scenarios ran"),
+        });
     }
     if failures.is_empty() {
         Ok(())
@@ -993,6 +1004,35 @@ fn expect_manifest(frame: &Value, tree: bool, expected_ids: &[String]) -> Result
     Ok(())
 }
 
+fn repo_relative_backtrace(frame: &str) -> bool {
+    let frame = frame.trim();
+    if frame.is_empty() || frame.starts_with('/') || frame.starts_with('\\') {
+        return false;
+    }
+    let bytes = frame.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return false;
+    }
+    ![
+        "site-packages/",
+        "site-packages\\",
+        "dist-packages/",
+        "dist-packages\\",
+        "node_modules/",
+        "node_modules\\",
+        "vendor/bundle/",
+        "vendor\\bundle\\",
+        "vendor/gems/",
+        "vendor\\gems\\",
+        "/gems/",
+        "\\gems\\",
+        ".gem/",
+        ".gem\\",
+    ]
+    .iter()
+    .any(|marker| frame.contains(marker))
+}
+
 fn expect_result(frame: &Value, id: &str, status: &str) -> Result<(), Error> {
     if frame.get("type").and_then(Value::as_str) != Some("test_case_result") {
         return Err(Error::new(format!(
@@ -1016,9 +1056,9 @@ fn expect_result(frame: &Value, id: &str, status: &str) -> Result<(), Error> {
                 .and_then(|items| items.first())
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if !first.starts_with("tests/") {
+            if !repo_relative_backtrace(first) {
                 return Err(Error::new(format!(
-                    "failure backtrace must start in the repo: {first}"
+                    "failure backtrace must be a repo-relative frame: {first}"
                 )));
             }
         }
@@ -1199,5 +1239,65 @@ mod tests {
             idle_duration(Duration::from_millis(200)),
             Duration::from_millis(600)
         );
+    }
+
+    #[test]
+    fn failure_backtrace_accepts_any_repo_relative_frame() {
+        for frame in [
+            "tests/example.py:12: in case-fail",
+            "test/widget_test.rb:8",
+            "spec/models/user_spec.rb:15",
+            "src/test/java/com/example/Foo.java:10",
+            "lib/my_app.rb",
+            "./tests/foo.rb",
+            r"src\test\java\com\example\Foo.java:10",
+        ] {
+            assert!(repo_relative_backtrace(frame), "{frame}");
+            let value = serde_json::json!({
+                "type": "test_case_result",
+                "data": {
+                    "id": "case-fail",
+                    "status": "failed",
+                    "failure_formatted_backtrace": [frame]
+                }
+            });
+            expect_result(&value, "case-fail", "failed").unwrap();
+        }
+        for frame in [
+            "",
+            "   ",
+            "/home/dev/proj/tests/foo.rb",
+            r"C:\proj\src\test\Foo.java:10",
+            "C:/proj/src/test/Foo.java:10",
+            r"\\server\share\tests\foo.rb",
+            "lib/python3.11/site-packages/foo.py",
+            "usr/lib/python3/dist-packages/foo.py",
+            "node_modules/leftpad/index.js",
+            "vendor/bundle/ruby/3.2.0/gems/foo/lib/foo.rb",
+            "vendor/gems/foo/lib/foo.rb",
+            "home/.gem/ruby/3.2.0/gems/foo/lib/foo.rb",
+            r"lib\site-packages\foo.py",
+        ] {
+            assert!(!repo_relative_backtrace(frame), "{frame}");
+            let value = serde_json::json!({
+                "type": "test_case_result",
+                "data": {
+                    "id": "case-fail",
+                    "status": "failed",
+                    "failure_formatted_backtrace": [frame]
+                }
+            });
+            let err = expect_result(&value, "case-fail", "failed").unwrap_err();
+            assert!(err.to_string().contains("repo-relative"), "{frame}: {err}");
+        }
+        expect_result(
+            &serde_json::json!({
+                "type": "test_case_result",
+                "data": {"id": "case-pass", "status": "passed"}
+            }),
+            "case-pass",
+            "passed",
+        )
+        .unwrap();
     }
 }
