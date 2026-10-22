@@ -1,11 +1,13 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle as TaskHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -13,6 +15,53 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::error::Error;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(20);
+pub const DEFAULT_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Keepalive {
+    pub ping_interval: Duration,
+    pub pong_timeout: Duration,
+}
+
+impl Keepalive {
+    pub fn from_env() -> Self {
+        Self::parse(
+            std::env::var("SELECTIVE_WS_PING_INTERVAL_MS")
+                .ok()
+                .as_deref(),
+            std::env::var("SELECTIVE_WS_PONG_TIMEOUT_MS")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    pub fn parse(interval_ms: Option<&str>, pong_timeout_ms: Option<&str>) -> Self {
+        let ping_interval = parse_ms(interval_ms).unwrap_or(DEFAULT_PING_INTERVAL);
+        let mut pong_timeout = parse_ms(pong_timeout_ms).unwrap_or(DEFAULT_PONG_TIMEOUT);
+        if ping_interval.is_zero() {
+            return Self {
+                ping_interval,
+                pong_timeout: Duration::ZERO,
+            };
+        }
+        if pong_timeout.is_zero() {
+            pong_timeout = ping_interval;
+        }
+        Self {
+            ping_interval,
+            pong_timeout,
+        }
+    }
+}
+
+fn parse_ms(value: Option<&str>) -> Option<Duration> {
+    let value = value?;
+    if value.is_empty() {
+        return None;
+    }
+    value.parse::<u64>().ok().map(Duration::from_millis)
+}
 
 enum OutMsg {
     Text(String, oneshot::Sender<Result<(), Error>>),
@@ -27,46 +76,105 @@ pub struct Session {
 
 impl Session {
     pub async fn connect(url: &str) -> Result<Self, Error> {
+        Self::connect_with(url, Keepalive::from_env()).await
+    }
+
+    pub async fn connect_with(url: &str, keepalive: Keepalive) -> Result<Self, Error> {
         let (socket, _) = tokio::time::timeout(IO_TIMEOUT, connect_async(url))
             .await
             .map_err(|_| Error::new("timed out connecting"))??;
         let (sink, mut stream) = socket.split();
         let (out_tx, mut out_rx) = unbounded_channel();
         let (in_tx, in_rx) = unbounded_channel();
+        let writer_in = in_tx.clone();
+        let pongs = Arc::new(AtomicU64::new(0));
+        let pong_notify = Arc::new(Notify::new());
+        let reader_pongs = Arc::clone(&pongs);
+        let reader_notify = Arc::clone(&pong_notify);
         let writer = tokio::spawn(async move {
             let mut sink = sink;
-            while let Some(msg) = out_rx.recv().await {
-                match msg {
-                    OutMsg::Text(text, reply) => {
-                        let result =
-                            match tokio::time::timeout(IO_TIMEOUT, sink.send(Message::Text(text)))
+            let mut next_ping = tokio::time::Instant::now() + keepalive.ping_interval;
+            let mut outstanding: Option<(u64, tokio::time::Instant)> = None;
+            loop {
+                if let Some((stamp, _)) = outstanding {
+                    if pongs.load(Ordering::SeqCst) != stamp {
+                        outstanding = None;
+                    }
+                }
+                let scheduled_ping = (outstanding.is_none() && !keepalive.ping_interval.is_zero())
+                    .then_some(next_ping);
+                let pong_deadline = outstanding.map(|(_, deadline)| deadline);
+                let notified = pong_notify.notified();
+                tokio::pin!(notified);
+                tokio::select! {
+                    biased;
+                    msg = out_rx.recv() => {
+                        match msg {
+                            Some(OutMsg::Text(text, reply)) => {
+                                let result = match tokio::time::timeout(
+                                    IO_TIMEOUT,
+                                    sink.send(Message::Text(text)),
+                                )
                                 .await
-                            {
-                                Ok(Ok(())) => Ok(()),
-                                Ok(Err(err)) => Err(Error::from(err)),
-                                Err(_) => Err(Error::new("timed out sending a frame")),
-                            };
-                        let failed = result.is_err();
-                        let _ = reply.send(result);
-                        if failed {
+                                {
+                                    Ok(Ok(())) => Ok(()),
+                                    Ok(Err(err)) => Err(Error::from(err)),
+                                    Err(_) => Err(Error::new("timed out sending a frame")),
+                                };
+                                let failed = result.is_err();
+                                let _ = reply.send(result);
+                                if failed {
+                                    let _ = writer_in.send(Ok(None));
+                                    break;
+                                }
+                            }
+                            Some(OutMsg::Close(reply)) => {
+                                let result = match tokio::time::timeout(
+                                    IO_TIMEOUT,
+                                    sink.send(Message::Close(None)),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => Ok(()),
+                                    Ok(Err(
+                                        tokio_tungstenite::tungstenite::Error::AlreadyClosed
+                                        | tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+                                    )) => Ok(()),
+                                    Ok(Err(err)) => Err(Error::from(err)),
+                                    Err(_) => Err(Error::new("timed out closing the session")),
+                                };
+                                let _ = reply.send(result);
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = notified, if outstanding.is_some() => {
+                        outstanding = None;
+                    }
+                    _ = sleep_until(pong_deadline), if pong_deadline.is_some() => {
+                        let timed_out = outstanding
+                            .is_some_and(|(stamp, _)| pongs.load(Ordering::SeqCst) == stamp);
+                        outstanding = None;
+                        if timed_out {
+                            eprintln!("websocket pong timeout");
+                            let _ = sink.send(Message::Close(None)).await;
+                            let _ = writer_in.send(Ok(None));
                             break;
                         }
                     }
-                    OutMsg::Close(reply) => {
-                        let result =
-                            match tokio::time::timeout(IO_TIMEOUT, sink.send(Message::Close(None)))
-                                .await
-                            {
-                                Ok(Ok(())) => Ok(()),
-                                Ok(Err(tokio_tungstenite::tungstenite::Error::AlreadyClosed))
-                                | Ok(Err(
-                                    tokio_tungstenite::tungstenite::Error::ConnectionClosed,
-                                )) => Ok(()),
-                                Ok(Err(err)) => Err(Error::from(err)),
-                                Err(_) => Err(Error::new("timed out closing the session")),
-                            };
-                        let _ = reply.send(result);
-                        break;
+                    _ = sleep_until(scheduled_ping), if scheduled_ping.is_some() => {
+                        let stamp = pongs.load(Ordering::SeqCst);
+                        if sink.send(Message::Ping(b"selective".to_vec())).await.is_err() {
+                            eprintln!("websocket ping failed");
+                            let _ = writer_in.send(Ok(None));
+                            break;
+                        }
+                        outstanding = Some((
+                            stamp,
+                            tokio::time::Instant::now() + keepalive.pong_timeout,
+                        ));
+                        next_ping = tokio::time::Instant::now() + keepalive.ping_interval;
                     }
                 }
             }
@@ -86,7 +194,11 @@ impl Session {
                             break;
                         }
                     }
-                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+                    Some(Ok(Message::Pong(_))) => {
+                        reader_pongs.fetch_add(1, Ordering::SeqCst);
+                        reader_notify.notify_one();
+                    }
+                    Some(Ok(Message::Ping(_) | Message::Frame(_))) => {}
                     Some(Ok(Message::Close(_))) | None => {
                         let _ = in_tx.send(Ok(None));
                         break;
@@ -295,6 +407,13 @@ impl BlockingSession {
     }
 }
 
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 fn wait_reply(reply_rx: Receiver<Result<(), Error>>) -> Result<(), Error> {
     match reply_rx.recv_timeout(IO_TIMEOUT + Duration::from_secs(2)) {
         Ok(result) => result,
@@ -309,5 +428,33 @@ impl Drop for BlockingSession {
     fn drop(&mut self) {
         let _ = self.close();
         drop(self.thread.take());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keepalive_defaults_and_zero_interval_disables_pings() {
+        assert_eq!(
+            Keepalive::parse(None, None),
+            Keepalive {
+                ping_interval: DEFAULT_PING_INTERVAL,
+                pong_timeout: DEFAULT_PONG_TIMEOUT,
+            }
+        );
+        assert_eq!(DEFAULT_PING_INTERVAL, Duration::from_secs(20));
+        assert!(DEFAULT_PING_INTERVAL < Duration::from_secs(60));
+        let disabled = Keepalive::parse(Some("0"), Some("10"));
+        assert!(disabled.ping_interval.is_zero());
+        assert_eq!(
+            Keepalive::parse(Some("250"), None).pong_timeout,
+            DEFAULT_PONG_TIMEOUT
+        );
+        assert_eq!(
+            Keepalive::parse(Some("250"), Some("0")).pong_timeout,
+            Duration::from_millis(250)
+        );
     }
 }

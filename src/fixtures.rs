@@ -1,0 +1,104 @@
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use serde_json::Value;
+
+use crate::error::Error;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixtureIds {
+    roles: BTreeMap<String, String>,
+}
+
+impl Default for FixtureIds {
+    fn default() -> Self {
+        let mut roles = BTreeMap::new();
+        roles.insert("pass".to_owned(), "case-pass".to_owned());
+        roles.insert("fail".to_owned(), "case-fail".to_owned());
+        roles.insert("pending".to_owned(), "case-pend".to_owned());
+        roles.insert("flaky".to_owned(), "case-flake".to_owned());
+        Self { roles }
+    }
+}
+
+impl FixtureIds {
+    pub fn load(path: &Path) -> Result<Self, Error> {
+        let text = std::fs::read_to_string(path)?;
+        Self::parse(&text)
+    }
+
+    pub fn parse(text: &str) -> Result<Self, Error> {
+        let value: Value = serde_json::from_str(text)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| Error::new("fixture id file must be a JSON object"))?;
+        let mut ids = Self::default();
+        for (role, item) in object {
+            let id = match item {
+                Value::String(id) if !id.is_empty() => id.clone(),
+                _ => {
+                    return Err(Error::new(format!(
+                        "fixture role {role} must be a non-empty string"
+                    )));
+                }
+            };
+            ids.roles.insert(role.clone(), id);
+        }
+        Ok(ids)
+    }
+
+    pub fn id(&self, role: &str) -> String {
+        self.roles
+            .get(role)
+            .cloned()
+            .unwrap_or_else(|| role.to_owned())
+    }
+
+    pub fn manifest_ids(&self) -> Vec<String> {
+        ["pass", "fail", "pending", "flaky"]
+            .into_iter()
+            .map(|role| self.id(role))
+            .collect()
+    }
+
+    pub fn rewrite(&self, text: &str) -> Option<String> {
+        if let Some(role) = text
+            .strip_prefix("{{")
+            .and_then(|rest| rest.strip_suffix("}}"))
+        {
+            return self.roles.get(role).cloned();
+        }
+        for (role, literal) in &Self::default().roles {
+            if text == literal {
+                let mapped = self.id(role);
+                if mapped == *literal {
+                    return None;
+                }
+                return Some(mapped);
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_map_keeps_the_other_literals() {
+        let ids = FixtureIds::parse(r#"{"pass":"spec.ok","extra":"spec.other"}"#).unwrap();
+        assert_eq!(ids.id("pass"), "spec.ok");
+        assert_eq!(ids.id("fail"), "case-fail");
+        assert_eq!(ids.id("extra"), "spec.other");
+        assert_eq!(
+            ids.manifest_ids(),
+            vec!["spec.ok", "case-fail", "case-pend", "case-flake"]
+        );
+        assert_eq!(ids.rewrite("case-pass").as_deref(), Some("spec.ok"));
+        assert_eq!(ids.rewrite("case-fail"), None);
+        assert_eq!(ids.rewrite("{{extra}}").as_deref(), Some("spec.other"));
+        assert!(FixtureIds::parse(r#"{"pass":""}"#).is_err());
+        assert!(FixtureIds::parse("[]").is_err());
+    }
+}

@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -8,46 +8,52 @@ use tokio::sync::{mpsc::UnboundedReceiver, watch};
 use url::Url;
 
 use crate::error::Error;
+use crate::fixtures::FixtureIds;
 use crate::session::{PollFrame, Session};
 use crate::snapshot::snapshot_tree;
 use crate::upload::{gzip_bytes, upload_fragment, FragmentUpload};
 
 const FILE_PATH: &str = "tests/example.py";
 
-#[derive(Clone, Copy)]
 struct Fixture {
-    id: &'static str,
+    id: String,
     status: &'static str,
     line: i64,
     flake: bool,
 }
 
-const FIXTURES: &[Fixture] = &[
-    Fixture {
-        id: "case-pass",
-        status: "passed",
-        line: 1,
-        flake: false,
-    },
-    Fixture {
-        id: "case-fail",
-        status: "failed",
-        line: 2,
-        flake: false,
-    },
-    Fixture {
-        id: "case-pend",
-        status: "pending",
-        line: 3,
-        flake: false,
-    },
-    Fixture {
-        id: "case-flake",
-        status: "failed",
-        line: 4,
-        flake: true,
-    },
-];
+fn load_fixtures() -> Result<Vec<Fixture>, Error> {
+    let ids = match std::env::var("SELECTIVE_CONFORMANCE_FIXTURE_IDS") {
+        Ok(path) if !path.is_empty() => FixtureIds::load(Path::new(&path))?,
+        _ => FixtureIds::default(),
+    };
+    Ok(vec![
+        Fixture {
+            id: ids.id("pass"),
+            status: "passed",
+            line: 1,
+            flake: false,
+        },
+        Fixture {
+            id: ids.id("fail"),
+            status: "failed",
+            line: 2,
+            flake: false,
+        },
+        Fixture {
+            id: ids.id("pending"),
+            status: "pending",
+            line: 3,
+            flake: false,
+        },
+        Fixture {
+            id: ids.id("flaky"),
+            status: "failed",
+            line: 4,
+            flake: true,
+        },
+    ])
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Via {
@@ -70,7 +76,17 @@ pub async fn run(opts: RunOpts) -> i32 {
             }
         });
     }
-    let mut state = State::default();
+    let fixtures = match load_fixtures() {
+        Ok(fixtures) => fixtures,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    let mut state = State {
+        fixtures,
+        ..State::default()
+    };
     let mut failures: u32 = 0;
     let mut reconnect = false;
     loop {
@@ -135,8 +151,8 @@ fn fast_retries() -> bool {
     std::env::var("SELECTIVE_CONFORMANCE_FAST").ok().as_deref() == Some("1")
 }
 
-#[derive(Default)]
 struct State {
+    fixtures: Vec<Fixture>,
     record: bool,
     tree: bool,
     connection_retries: u32,
@@ -145,6 +161,22 @@ struct State {
     files: Vec<String>,
     file_index: HashMap<String, usize>,
     traces: HashMap<String, BTreeSet<usize>>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            fixtures: Vec::new(),
+            record: false,
+            tree: false,
+            connection_retries: 0,
+            attempts: HashMap::new(),
+            results: HashMap::new(),
+            files: Vec::new(),
+            file_index: HashMap::new(),
+            traces: HashMap::new(),
+        }
+    }
 }
 
 enum Drive {
@@ -423,7 +455,8 @@ fn intern(state: &mut State, path: &str) -> usize {
 }
 
 fn manifest(state: &State) -> Value {
-    let test_cases: Vec<Value> = FIXTURES
+    let test_cases: Vec<Value> = state
+        .fixtures
         .iter()
         .map(|case| {
             json!({
@@ -452,7 +485,7 @@ fn result_message(state: &mut State, id: &str) -> Value {
     let attempt = state.attempts.entry(id.to_owned()).or_insert(0);
     *attempt += 1;
     let attempt = *attempt;
-    let fixture = FIXTURES.iter().find(|case| case.id == id);
+    let fixture = state.fixtures.iter().find(|case| case.id == id);
     let (status, line) = match fixture {
         Some(case) => (status_for(case.status, case.flake, attempt), case.line),
         None => ("passed".to_owned(), 1),

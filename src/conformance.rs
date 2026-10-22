@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -16,15 +16,16 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::error::Error;
+use crate::fixtures::FixtureIds;
 use crate::reference_client::Via;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Scenario {
     pub name: String,
     pub steps: Vec<Step>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Step {
     Send { message: Value },
@@ -43,6 +44,8 @@ pub enum Step {
     SignalTerm,
     ExpectExit { code: i32 },
     RejectConnections { times: u32 },
+    Idle,
+    IgnorePongs,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -77,6 +80,8 @@ pub fn scenarios() -> Result<Vec<Scenario>, Error> {
         include_str!("../conformance/scenarios/reconnect_exhausted.json"),
         include_str!("../conformance/scenarios/overlap_buffered.json"),
         include_str!("../conformance/scenarios/upload_stall.json"),
+        include_str!("../conformance/scenarios/idle_keepalive.json"),
+        include_str!("../conformance/scenarios/pong_timeout.json"),
     ];
     RAW.iter()
         .map(|raw| serde_json::from_str(raw).map_err(Error::from))
@@ -90,10 +95,33 @@ pub fn scenario_names() -> Result<Vec<String>, Error> {
         .collect())
 }
 
+pub struct ConformanceRun<'a> {
+    pub filter: Option<&'a str>,
+    pub via: SuiteVia,
+    pub client: Option<&'a str>,
+    pub fixtures: FixtureIds,
+    pub fixture_file: Option<&'a Path>,
+}
+
 pub async fn run_suite(bin: &Path, filter: Option<&str>, via: SuiteVia) -> Result<(), Error> {
+    run_suite_with(
+        bin,
+        ConformanceRun {
+            filter,
+            via,
+            client: None,
+            fixtures: FixtureIds::default(),
+            fixture_file: None,
+        },
+    )
+    .await
+}
+
+pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), Error> {
+    let pace = conformance_pace();
     let mut failures = Vec::new();
     for scenario in scenarios()? {
-        if filter.is_some_and(|name| name != scenario.name) {
+        if run.filter.is_some_and(|name| name != scenario.name) {
             continue;
         }
         if scenario
@@ -105,10 +133,39 @@ pub async fn run_suite(bin: &Path, filter: Option<&str>, via: SuiteVia) -> Resul
             eprintln!("skip {} (signals are unix-only)", scenario.name);
             continue;
         }
-        for via in via.list() {
-            match run_one(bin, &scenario, via).await {
-                Ok(()) => eprintln!("ok {} {}", scenario.name, via_name(via)),
-                Err(err) => failures.push(format!("{} {}: {err}", scenario.name, via_name(via))),
+        let mut scenario = scenario;
+        apply_fixtures(&mut scenario, &run.fixtures)?;
+        if let Some(client) = run.client {
+            let trial = Trial {
+                bin,
+                scenario: &scenario,
+                via: Via::Direct,
+                client: Some(client),
+                fixture_file: run.fixture_file,
+                fixtures: &run.fixtures,
+                pace,
+            };
+            match run_one(&trial).await {
+                Ok(()) => eprintln!("ok {} client", scenario.name),
+                Err(err) => failures.push(format!("{} client: {err}", scenario.name)),
+            }
+        } else {
+            for via in run.via.list() {
+                let trial = Trial {
+                    bin,
+                    scenario: &scenario,
+                    via,
+                    client: None,
+                    fixture_file: run.fixture_file,
+                    fixtures: &run.fixtures,
+                    pace,
+                };
+                match run_one(&trial).await {
+                    Ok(()) => eprintln!("ok {} {}", scenario.name, via_name(via)),
+                    Err(err) => {
+                        failures.push(format!("{} {}: {err}", scenario.name, via_name(via)));
+                    }
+                }
             }
         }
     }
@@ -119,6 +176,146 @@ pub async fn run_suite(bin: &Path, filter: Option<&str>, via: SuiteVia) -> Resul
     }
 }
 
+#[derive(Clone, Copy)]
+struct Pace {
+    ping: Duration,
+    pong: Duration,
+}
+
+struct Trial<'a> {
+    bin: &'a Path,
+    scenario: &'a Scenario,
+    via: Via,
+    client: Option<&'a str>,
+    fixture_file: Option<&'a Path>,
+    fixtures: &'a FixtureIds,
+    pace: Pace,
+}
+
+fn conformance_pace() -> Pace {
+    Pace {
+        ping: Duration::from_millis(env_u64("SELECTIVE_CONFORMANCE_PING_INTERVAL_MS", 200)),
+        pong: Duration::from_millis(env_u64("SELECTIVE_CONFORMANCE_PONG_TIMEOUT_MS", 1_000)),
+    }
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+pub fn idle_duration(ping_interval: Duration) -> Duration {
+    let scaled = ping_interval.saturating_mul(3);
+    if ping_interval >= Duration::from_secs(20) {
+        Duration::from_secs(65).max(scaled)
+    } else if scaled.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        scaled
+    }
+}
+
+fn apply_fixtures(scenario: &mut Scenario, fixtures: &FixtureIds) -> Result<(), Error> {
+    for step in &mut scenario.steps {
+        let mut value = serde_json::to_value(&*step)?;
+        rewrite_value(&mut value, fixtures);
+        *step = serde_json::from_value(value)?;
+    }
+    Ok(())
+}
+
+fn rewrite_value(value: &mut Value, fixtures: &FixtureIds) {
+    match value {
+        Value::String(text) => {
+            if let Some(mapped) = fixtures.rewrite(text) {
+                *text = mapped;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                rewrite_value(item, fixtures);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                rewrite_value(item, fixtures);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn client_command(trial: &Trial<'_>) -> Result<Command, Error> {
+    if let Some(line) = trial.client {
+        let words = shell_words(line)?;
+        let mut command = Command::new(&words[0]);
+        command.args(&words[1..]);
+        return Ok(command);
+    }
+    let mut command = Command::new(trial.bin);
+    command.arg("conformance-client");
+    if matches!(trial.via, Via::Stdio) {
+        command.arg("--via-stdio");
+    }
+    Ok(command)
+}
+
+fn shell_words(input: &str) -> Result<Vec<String>, Error> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut in_word = false;
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(mark) if ch == mark => quote = None,
+            Some(_) if ch == '\\' => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+                in_word = true;
+            }
+            Some(_) => {
+                current.push(ch);
+                in_word = true;
+            }
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+                in_word = true;
+            }
+            None if ch == '\\' => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+                in_word = true;
+            }
+            None if ch.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            None => {
+                current.push(ch);
+                in_word = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return Err(Error::new("unclosed quote in --client command"));
+    }
+    if in_word {
+        words.push(current);
+    }
+    if words.is_empty() {
+        return Err(Error::new("--client command is empty"));
+    }
+    Ok(words)
+}
+
 fn via_name(via: Via) -> &'static str {
     match via {
         Via::Direct => "direct",
@@ -126,14 +323,14 @@ fn via_name(via: Via) -> &'static str {
     }
 }
 
-async fn run_one(bin: &Path, scenario: &Scenario, via: Via) -> Result<(), Error> {
+async fn run_one(trial: &Trial<'_>) -> Result<(), Error> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let url = format!(
         "ws://{addr}/transport/websocket?api_key=conformance-key&run_id=run-1&run_attempt=1&runner_id=runner-1&metadata=%7B%22ci%22%3A%22conformance%22%7D"
     );
     let gate = Arc::new(Gate {
-        reject_budget: AtomicU32::new(match scenario.steps.first() {
+        reject_budget: AtomicU32::new(match trial.scenario.steps.first() {
             Some(Step::RejectConnections { times }) => *times,
             _ => 0,
         }),
@@ -142,16 +339,29 @@ async fn run_one(bin: &Path, scenario: &Scenario, via: Via) -> Result<(), Error>
         upload_notify: Notify::new(),
     });
     let logs = Arc::new(Mutex::new(String::new()));
-    let mut command = Command::new(bin);
+    let mut command = client_command(trial)?;
     command
-        .arg("conformance-client")
         .env("SELECTIVE_TRANSPORT_URL", &url)
+        .env("SELECTIVE_API_KEY", "conformance-key")
+        .env("SELECTIVE_HOST", format!("ws://{addr}"))
+        .env("SELECTIVE_RUN_ID", "run-1")
+        .env("SELECTIVE_RUN_ATTEMPT", "1")
+        .env("SELECTIVE_RUNNER_ID", "runner-1")
+        .env("SELECTIVE_TEST_MAP_UPLOAD_KEY", "conformance-key")
         .env("SELECTIVE_CONFORMANCE_FAST", "1")
+        .env(
+            "SELECTIVE_WS_PING_INTERVAL_MS",
+            trial.pace.ping.as_millis().to_string(),
+        )
+        .env(
+            "SELECTIVE_WS_PONG_TIMEOUT_MS",
+            trial.pace.pong.as_millis().to_string(),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if matches!(via, Via::Stdio) {
-        command.arg("--via-stdio");
+    if let Some(path) = trial.fixture_file {
+        command.env("SELECTIVE_CONFORMANCE_FIXTURE_IDS", path);
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let accept_gate = Arc::clone(&gate);
@@ -182,8 +392,12 @@ async fn run_one(bin: &Path, scenario: &Scenario, via: Via) -> Result<(), Error>
         child: Some(child),
         saw_connection: false,
         gate,
+        fixtures: trial.fixtures.clone(),
+        ping_interval: trial.pace.ping,
+        ignore_pongs: false,
+        pings: 0,
     };
-    let played = player.play(scenario).await;
+    let played = player.play(trial.scenario).await;
     if played.is_err() {
         if let Some(mut child) = player.child.take() {
             let _ = child.start_kill();
@@ -250,6 +464,10 @@ struct Player {
     child: Option<Child>,
     saw_connection: bool,
     gate: Arc<Gate>,
+    fixtures: FixtureIds,
+    ping_interval: Duration,
+    ignore_pongs: bool,
+    pings: u32,
 }
 
 impl Player {
@@ -276,7 +494,8 @@ impl Player {
             }
             Step::ExpectManifest { tree } => {
                 let frame = self.next_frame().await?;
-                expect_manifest(&frame, *tree)
+                let expected = self.fixtures.manifest_ids();
+                expect_manifest(&frame, *tree, &expected)
             }
             Step::ExpectResult { id, status } => {
                 let frame = self.next_frame().await?;
@@ -338,7 +557,48 @@ impl Player {
             Step::SignalTerm => self.signal_term(),
             Step::ExpectExit { code } => self.expect_exit(*code).await,
             Step::RejectConnections { times } => self.reject_connections(*times).await,
+            Step::Idle => self.idle().await,
+            Step::IgnorePongs => {
+                self.ignore_pongs = true;
+                Ok(())
+            }
         }
+    }
+
+    async fn idle(&mut self) -> Result<(), Error> {
+        let before = self.pings;
+        let deadline = Instant::now() + idle_duration(self.ping_interval);
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match self.pump(deadline).await {
+                Ok(Some(frame)) => {
+                    return Err(Error::new(format!(
+                        "application frame during idle: {frame}"
+                    )));
+                }
+                Ok(None) => {}
+                Err(err) if err.to_string().contains("timed out") => break,
+                Err(err) => return Err(err),
+            }
+        }
+        if self.pings <= before {
+            return Err(Error::new("idle connection received no websocket ping"));
+        }
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|live| live.uri.contains("reconnect=true"))
+        {
+            return Err(Error::new(
+                "idle connection reconnects when pongs are answered",
+            ));
+        }
+        if self.current.is_none() {
+            return Err(Error::new("idle connection dropped"));
+        }
+        Ok(())
     }
 
     async fn ensure_connection(&mut self) -> Result<(), Error> {
@@ -383,11 +643,12 @@ impl Player {
             return Err(Error::new("timed out"));
         }
         let mut live = self.current.take();
+        let read_allowed = live.is_some() && !self.ignore_pongs;
         let event = {
             let incoming = &mut self.incoming;
             tokio::select! {
                 next = incoming.recv() => Event::Accepted(next),
-                message = recv_live(live.as_mut()), if live.is_some() => Event::Socket(message),
+                message = recv_live(live.as_mut()), if read_allowed => Event::Socket(message),
                 _ = tokio::time::sleep(remaining) => Event::Timeout,
             }
         };
@@ -419,6 +680,11 @@ impl Player {
                 self.current = live;
                 Ok(None)
             }
+            Event::Socket(Pump::Ping) => {
+                self.current = live;
+                self.pings = self.pings.saturating_add(1);
+                Ok(None)
+            }
             Event::Socket(Pump::Closed) => Ok(None),
             Event::Timeout => {
                 self.current = live;
@@ -441,6 +707,8 @@ impl Player {
                 ));
             }
             self.saw_connection = true;
+        } else {
+            self.ignore_pongs = false;
         }
         self.current = Some(socket);
         Ok(())
@@ -661,6 +929,7 @@ async fn classify(mut stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, E
 
 enum Pump {
     Continue,
+    Ping,
     Frame(Value),
     Closed,
 }
@@ -682,7 +951,7 @@ async fn recv_live(live: Option<&mut Live>) -> Pump {
         }
         Some(Ok(Message::Ping(payload))) => {
             let _ = live.ws.send(Message::Pong(payload)).await;
-            Pump::Continue
+            Pump::Ping
         }
         Some(Ok(Message::Close(_))) | None => Pump::Closed,
         Some(Ok(_)) => Pump::Continue,
@@ -690,7 +959,7 @@ async fn recv_live(live: Option<&mut Live>) -> Pump {
     }
 }
 
-fn expect_manifest(frame: &Value, tree: bool) -> Result<(), Error> {
+fn expect_manifest(frame: &Value, tree: bool, expected_ids: &[String]) -> Result<(), Error> {
     if frame.get("type").and_then(Value::as_str) != Some("test_manifest") {
         return Err(Error::new(format!("expected test_manifest, got {frame}")));
     }
@@ -701,7 +970,7 @@ fn expect_manifest(frame: &Value, tree: bool) -> Result<(), Error> {
         .iter()
         .filter_map(|case| case.get("id").and_then(Value::as_str))
         .collect();
-    let expected = ["case-pass", "case-fail", "case-pend", "case-flake"];
+    let expected: Vec<&str> = expected_ids.iter().map(String::as_str).collect();
     if ids != expected {
         return Err(Error::new(format!("manifest ids {ids:?}")));
     }
@@ -865,5 +1134,70 @@ mod tests {
         assert!(status.code().is_none());
         let message = format!("exit {status}, expected 1");
         assert!(message.contains("SIGTERM") || message.contains("signal"));
+    }
+
+    #[test]
+    fn fixture_map_rewrites_scenario_ids_and_the_manifest() {
+        let fixtures = FixtureIds::parse(
+            r#"{"pass":"spec.ok","fail":"spec.bad","pending":"spec.skip","flaky":"spec.flake"}"#,
+        )
+        .unwrap();
+        let mut scenario: Scenario = serde_json::from_str(include_str!(
+            "../conformance/scenarios/happy_two_batches.json"
+        ))
+        .unwrap();
+        apply_fixtures(&mut scenario, &fixtures).unwrap();
+        let encoded = serde_json::to_string(&scenario).unwrap();
+        assert!(encoded.contains("spec.ok"));
+        assert!(encoded.contains("spec.skip"));
+        assert!(!encoded.contains("case-pass"));
+        assert!(!encoded.contains("case-pend"));
+        let frame = serde_json::json!({
+            "type": "test_manifest",
+            "data": {
+                "test_cases": [
+                    {"id": "spec.ok"},
+                    {"id": "spec.bad"},
+                    {"id": "spec.skip"},
+                    {"id": "spec.flake"}
+                ]
+            }
+        });
+        expect_manifest(&frame, false, &fixtures.manifest_ids()).unwrap();
+        let defaults = FixtureIds::default();
+        expect_manifest(
+            &serde_json::json!({
+                "type": "test_manifest",
+                "data": {
+                    "test_cases": [
+                        {"id": "case-pass"},
+                        {"id": "case-fail"},
+                        {"id": "case-pend"},
+                        {"id": "case-flake"}
+                    ]
+                }
+            }),
+            false,
+            &defaults.manifest_ids(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn client_command_is_split_without_adding_via_args() {
+        assert_eq!(
+            shell_words(r"/opt/bin/transport conformance-client").unwrap(),
+            vec!["/opt/bin/transport", "conformance-client"]
+        );
+        assert_eq!(
+            shell_words(r#"say "two words" 'and more'"#).unwrap(),
+            vec!["say", "two words", "and more"]
+        );
+        assert!(shell_words("  ").is_err());
+        assert!(idle_duration(Duration::from_secs(20)) > Duration::from_secs(60));
+        assert_eq!(
+            idle_duration(Duration::from_millis(200)),
+            Duration::from_millis(600)
+        );
     }
 }

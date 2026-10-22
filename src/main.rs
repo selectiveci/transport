@@ -3,19 +3,23 @@
 use std::path::PathBuf;
 
 use transport::build_env::build_env_json;
-use transport::conformance::{run_suite, scenario_names, SuiteVia};
+use transport::conformance::{run_suite_with, scenario_names, ConformanceRun, SuiteVia};
 use transport::reference_client::{RunOpts, Via};
-use transport::upload::{upload_fragment, FragmentUpload};
+use transport::upload::{
+    resolve_run_identity, split_fragment_stdin, upload_fragment, FragmentUpload,
+};
+use transport::FixtureIds;
 
 const USAGE: &str = "\
 usage:
   transport <websocket-url> <runner-id>
   transport --stdio
   transport --snapshot [dir]
-  transport --upload-fragment
+  transport --upload-fragment [--run-id ID] [--run-attempt N] [--runner-id ID]
   transport --build-env
   transport conformance list
   transport conformance run [--scenario NAME] [--via direct|stdio|both]
+                            [--client COMMAND] [--fixture-ids FILE]
   transport conformance-client [--via-stdio]
 ";
 
@@ -43,7 +47,7 @@ fn dispatch() -> Result<i32, transport::Error> {
         }
         Some("--stdio") => Ok(block_on(transport::stdio::run())),
         Some("--snapshot") => snapshot_main(args.next()),
-        Some("--upload-fragment") => upload_main(),
+        Some("--upload-fragment") => upload_main(args.collect()),
         Some("--build-env") => {
             println!("{}", build_env_json());
             Ok(0)
@@ -81,19 +85,54 @@ fn snapshot_main(dir: Option<String>) -> Result<i32, transport::Error> {
     }
 }
 
-fn upload_main() -> Result<i32, transport::Error> {
-    let gzip_body = read_stdin()?;
+fn upload_main(args: Vec<String>) -> Result<i32, transport::Error> {
+    let mut flag_run_id = String::new();
+    let mut flag_run_attempt = String::new();
+    let mut flag_runner_id = String::new();
+    let mut index = 0;
+    while index < args.len() {
+        let value = match args.get(index + 1) {
+            Some(value) if !value.is_empty() => value.clone(),
+            _ => {
+                eprintln!("missing value for {}", args[index]);
+                return Ok(1);
+            }
+        };
+        match args[index].as_str() {
+            "--run-id" => flag_run_id = value,
+            "--run-attempt" => flag_run_attempt = value,
+            "--runner-id" => flag_runner_id = value,
+            other => {
+                eprintln!("unknown --upload-fragment argument {other}\n{USAGE}");
+                return Ok(1);
+            }
+        }
+        index += 2;
+    }
+    let raw = read_stdin()?;
+    if raw.is_empty() {
+        eprintln!("--upload-fragment expected a gzip body on stdin");
+        return Ok(1);
+    }
+    let (payload, gzip_body) = split_fragment_stdin(&raw)?;
     if gzip_body.is_empty() {
         eprintln!("--upload-fragment expected a gzip body on stdin");
         return Ok(1);
     }
     let detected = transport::detect_build_env();
+    let (run_id, run_attempt, runner_id) = resolve_run_identity(
+        &flag_run_id,
+        &flag_run_attempt,
+        &flag_runner_id,
+        payload.as_ref(),
+        &detected,
+    );
     let upload = FragmentUpload {
         host: detected.host,
         api_key: env_required("SELECTIVE_TEST_MAP_UPLOAD_KEY")?,
-        run_id: detected.run_id,
-        run_attempt: detected.run_attempt,
-        runner_id: detected.runner_id,
+        run_id,
+        run_attempt,
+        runner_id,
         gzip_body,
     };
     match block_on(upload_fragment(&upload)) {
@@ -109,6 +148,12 @@ fn conformance_main(args: Vec<String>) -> Result<i32, transport::Error> {
     let mut scenario = None;
     let mut via = SuiteVia::Both;
     let mut command = None;
+    let mut client = std::env::var("SELECTIVE_CONFORMANCE_CLIENT")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let mut fixture_file = std::env::var("SELECTIVE_CONFORMANCE_FIXTURE_IDS")
+        .ok()
+        .filter(|value| !value.is_empty());
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -130,6 +175,26 @@ fn conformance_main(args: Vec<String>) -> Result<i32, transport::Error> {
                     }
                 };
             }
+            "--client" => {
+                index += 1;
+                match args.get(index).filter(|value| !value.is_empty()) {
+                    Some(value) => client = Some(value.clone()),
+                    None => {
+                        eprintln!("missing value for --client");
+                        return Ok(1);
+                    }
+                }
+            }
+            "--fixture-ids" => {
+                index += 1;
+                match args.get(index).filter(|value| !value.is_empty()) {
+                    Some(value) => fixture_file = Some(value.clone()),
+                    None => {
+                        eprintln!("missing value for --fixture-ids");
+                        return Ok(1);
+                    }
+                }
+            }
             other => {
                 eprintln!("unknown conformance argument {other}\n{USAGE}");
                 return Ok(1);
@@ -146,7 +211,19 @@ fn conformance_main(args: Vec<String>) -> Result<i32, transport::Error> {
         }
         Some("run") => {
             let bin = std::env::current_exe()?;
-            match block_on(run_suite(&bin, scenario.as_deref(), via)) {
+            let fixture_path = fixture_file.as_deref().map(PathBuf::from);
+            let fixtures = match fixture_path.as_deref() {
+                Some(path) => FixtureIds::load(path)?,
+                None => FixtureIds::default(),
+            };
+            let run = ConformanceRun {
+                filter: scenario.as_deref(),
+                via,
+                client: client.as_deref(),
+                fixtures,
+                fixture_file: fixture_path.as_deref(),
+            };
+            match block_on(run_suite_with(&bin, run)) {
                 Ok(()) => Ok(0),
                 Err(err) => {
                     eprintln!("{err}");

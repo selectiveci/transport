@@ -5,6 +5,9 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use url::Url;
 
+use serde_json::Value;
+
+use crate::build_env::BuildEnv;
 use crate::error::Error;
 
 #[derive(Debug, Clone)]
@@ -111,6 +114,74 @@ async fn post_once(
     }
 }
 
+pub fn resolve_run_identity(
+    flag_run_id: &str,
+    flag_run_attempt: &str,
+    flag_runner_id: &str,
+    payload: Option<&Value>,
+    detected: &BuildEnv,
+) -> (String, String, String) {
+    (
+        pick(flag_run_id, payload, "run_id", &detected.run_id),
+        pick(
+            flag_run_attempt,
+            payload,
+            "run_attempt",
+            &detected.run_attempt,
+        ),
+        pick(flag_runner_id, payload, "runner_id", &detected.runner_id),
+    )
+}
+
+pub fn split_fragment_stdin(raw: &[u8]) -> Result<(Option<Value>, Vec<u8>), Error> {
+    if raw.first() != Some(&b'{') {
+        return Ok((None, raw.to_vec()));
+    }
+    let newline = raw.iter().position(|byte| *byte == b'\n');
+    let (line, rest) = match newline {
+        Some(index) => (&raw[..index], &raw[index + 1..]),
+        None => (raw, &[][..]),
+    };
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let payload: Value = serde_json::from_slice(line)
+        .map_err(|err| Error::new(format!("upload command payload is not JSON: {err}")))?;
+    if !payload.is_object() {
+        return Err(Error::new("upload command payload must be a JSON object"));
+    }
+    if rest.is_empty() {
+        return Err(Error::new(
+            "--upload-fragment expected a gzip body after the command payload",
+        ));
+    }
+    Ok((Some(payload), rest.to_vec()))
+}
+
+fn pick(flag: &str, payload: Option<&Value>, key: &str, detected: &str) -> String {
+    if !flag.is_empty() {
+        return flag.to_owned();
+    }
+    if let Some(value) = payload_string(payload, key) {
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    detected.to_owned()
+}
+
+fn payload_string(payload: Option<&Value>, key: &str) -> Option<String> {
+    let payload = payload?;
+    json_text(payload.get(key))
+        .or_else(|| json_text(payload.get("data").and_then(|data| data.get(key))))
+}
+
+fn json_text(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
 fn ws_to_http(value: &str) -> String {
     if let Some(rest) = value.strip_prefix("wss://") {
         format!("https://{rest}")
@@ -190,5 +261,62 @@ mod tests {
             .await
             .unwrap();
         server.await.unwrap();
+    }
+
+    fn detected() -> BuildEnv {
+        BuildEnv {
+            api_key: String::new(),
+            host: "ws://detected".to_owned(),
+            platform: String::new(),
+            branch: String::new(),
+            pr_title: String::new(),
+            target_branch: String::new(),
+            actor: String::new(),
+            sha: String::new(),
+            base_sha: String::new(),
+            run_id: "detected-run".to_owned(),
+            run_attempt: "9".to_owned(),
+            runner_id: "detected-runner".to_owned(),
+            commit_message: String::new(),
+            committer_name: String::new(),
+            committer_email: String::new(),
+            git_repo_full_name: String::new(),
+            git_provider: String::new(),
+        }
+    }
+
+    #[test]
+    fn explicit_ids_beat_the_payload_and_detection_fills_the_gaps() {
+        let payload = serde_json::json!({
+            "type": "upload_fragment",
+            "run_id": "payload-run",
+            "data": {"run_attempt": 4, "runner_id": "payload-runner"}
+        });
+        let (run_id, run_attempt, runner_id) =
+            resolve_run_identity("session-run", "", "", Some(&payload), &detected());
+        assert_eq!(run_id, "session-run");
+        assert_eq!(run_attempt, "4");
+        assert_eq!(runner_id, "payload-runner");
+
+        let (run_id, run_attempt, runner_id) = resolve_run_identity("", "", "", None, &detected());
+        assert_eq!(run_id, "detected-run");
+        assert_eq!(run_attempt, "9");
+        assert_eq!(runner_id, "detected-runner");
+    }
+
+    #[test]
+    fn stdin_json_line_is_the_command_payload_and_the_rest_is_gzip() {
+        let gzip = gzip_bytes(br#"{"version":1}"#).unwrap();
+        let mut raw =
+            br#"{"run_id":"payload-run","run_attempt":"4","runner_id":"payload-runner"}"#.to_vec();
+        raw.push(b'\n');
+        raw.extend_from_slice(&gzip);
+        let (payload, body) = split_fragment_stdin(&raw).unwrap();
+        assert_eq!(payload.unwrap()["run_id"], "payload-run");
+        assert_eq!(body, gzip);
+        let (payload, body) = split_fragment_stdin(&gzip).unwrap();
+        assert!(payload.is_none());
+        assert_eq!(body, gzip);
+        assert!(split_fragment_stdin(br#"{"run_id":"only"}"#).is_err());
     }
 }

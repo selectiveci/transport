@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::{future, pin_mut, StreamExt};
@@ -30,7 +31,48 @@ async fn run_unix(url: &str, runner_id: &str) -> i32 {
     let (pipe_tx, pipe_rx) = futures_channel::mpsc::unbounded();
     let (exit_tx, mut exit_rx) = mpsc::channel(1);
     let exit_tx_clone = exit_tx.clone();
-    tokio::spawn(read_pipe(input_pipe_path.clone(), pipe_tx, exit_tx_clone));
+    tokio::spawn(read_pipe(
+        input_pipe_path.clone(),
+        pipe_tx.clone(),
+        exit_tx_clone,
+    ));
+    let keepalive = crate::session::Keepalive::from_env();
+    let last_pong = Arc::new(AtomicU64::new(unix_millis()));
+    if keepalive.ping_interval.is_zero() {
+        drop(pipe_tx);
+    } else {
+        let ping_tx = pipe_tx;
+        let interval = keepalive.ping_interval;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if ping_tx
+                    .unbounded_send(Message::Ping(b"selective".to_vec()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let watched = Arc::clone(&last_pong);
+        let exit_tx_ping = exit_tx.clone();
+        let budget = keepalive.ping_interval + keepalive.pong_timeout;
+        tokio::spawn(async move {
+            let limit = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+            loop {
+                tokio::time::sleep(keepalive.pong_timeout).await;
+                let stale = unix_millis().saturating_sub(watched.load(Ordering::SeqCst));
+                if stale >= limit {
+                    eprintln!("websocket pong timeout");
+                    let _ = exit_tx_ping.send(()).await;
+                    break;
+                }
+            }
+        });
+    }
 
     let output_fifo = Arc::new(Mutex::new(
         OpenOptions::new()
@@ -45,9 +87,11 @@ async fn run_unix(url: &str, runner_id: &str) -> i32 {
         let (write, read) = ws_stream.split();
         let pipe_to_ws = pipe_rx.map(Ok).forward(write);
         let ws_to_pipe = {
+            let last_pong = Arc::clone(&last_pong);
             read.for_each(move |message_result| {
                 let output_fifo = Arc::clone(&output_fifo_clone);
                 let exit_tx_clone = exit_tx.clone();
+                let last_pong = Arc::clone(&last_pong);
                 async move {
                     if cfg!(debug_assertions) {
                         match &message_result {
@@ -69,6 +113,11 @@ async fn run_unix(url: &str, runner_id: &str) -> i32 {
                                 .expect("Failed to send exit signal");
                             return;
                         }
+                        Ok(Message::Pong(_)) => {
+                            last_pong.store(unix_millis(), Ordering::SeqCst);
+                            return;
+                        }
+                        Ok(Message::Ping(_) | Message::Frame(_)) => return,
                         _ => {}
                     }
 
@@ -102,6 +151,14 @@ async fn run_unix(url: &str, runner_id: &str) -> i32 {
         eprintln!("Failed to connect to the WebSocket server. Exiting...");
         1
     }
+}
+
+#[cfg(unix)]
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 #[cfg(unix)]
