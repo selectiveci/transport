@@ -108,7 +108,7 @@ Pass the ids the WebSocket URL was opened with. A flag wins over the payload, an
 transport conformance run --client '/path/to/client --suite' --fixture-ids ids.json
 ```
 
-`--fixture-ids FILE` (or `SELECTIVE_CONFORMANCE_FIXTURE_IDS`) maps roles to the client's test ids. Missing roles keep the built-in literals. The manifest order is `pass`, `fail`, `pending`, `flaky`. Other keys are extra roles, substituted where a scenario contains `{{role}}`.
+`--fixture-ids FILE` (or `SELECTIVE_CONFORMANCE_FIXTURE_IDS`) maps roles to the client's test ids. Missing roles keep the built-in literals. The manifest order is `pass`, `fail`, `pending`, `flaky`.
 
 ```json
 {"pass":"spec.ok","fail":"spec.bad","pending":"spec.skip","flaky":"spec.flake"}

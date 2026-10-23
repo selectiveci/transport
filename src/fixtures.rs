@@ -5,6 +5,13 @@ use serde_json::Value;
 
 use crate::error::Error;
 
+const ROLES: &[(&str, &str)] = &[
+    ("pass", "case-pass"),
+    ("fail", "case-fail"),
+    ("pending", "case-pend"),
+    ("flaky", "case-flake"),
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FixtureIds {
     roles: BTreeMap<String, String>,
@@ -12,12 +19,12 @@ pub struct FixtureIds {
 
 impl Default for FixtureIds {
     fn default() -> Self {
-        let mut roles = BTreeMap::new();
-        roles.insert("pass".to_owned(), "case-pass".to_owned());
-        roles.insert("fail".to_owned(), "case-fail".to_owned());
-        roles.insert("pending".to_owned(), "case-pend".to_owned());
-        roles.insert("flaky".to_owned(), "case-flake".to_owned());
-        Self { roles }
+        Self {
+            roles: ROLES
+                .iter()
+                .map(|(role, id)| ((*role).to_owned(), (*id).to_owned()))
+                .collect(),
+        }
     }
 }
 
@@ -55,21 +62,12 @@ impl FixtureIds {
     }
 
     pub fn manifest_ids(&self) -> Vec<String> {
-        ["pass", "fail", "pending", "flaky"]
-            .into_iter()
-            .map(|role| self.id(role))
-            .collect()
+        ROLES.iter().map(|(role, _)| self.id(role)).collect()
     }
 
     pub fn rewrite(&self, text: &str) -> Option<String> {
-        if let Some(role) = text
-            .strip_prefix("{{")
-            .and_then(|rest| rest.strip_suffix("}}"))
-        {
-            return self.roles.get(role).cloned();
-        }
-        for (role, literal) in &Self::default().roles {
-            if text == literal {
+        for (role, literal) in ROLES {
+            if text == *literal {
                 let mapped = self.id(role);
                 if mapped == *literal {
                     return None;
@@ -97,7 +95,7 @@ mod tests {
         );
         assert_eq!(ids.rewrite("case-pass").as_deref(), Some("spec.ok"));
         assert_eq!(ids.rewrite("case-fail"), None);
-        assert_eq!(ids.rewrite("{{extra}}").as_deref(), Some("spec.other"));
+        assert_eq!(ids.rewrite("{{extra}}"), None);
         assert!(FixtureIds::parse(r#"{"pass":""}"#).is_err());
         assert!(FixtureIds::parse("[]").is_err());
     }
