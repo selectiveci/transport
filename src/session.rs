@@ -200,20 +200,11 @@ impl Session {
     }
 
     pub async fn recv(&mut self) -> Result<Option<String>, Error> {
-        match self.incoming.recv().await {
-            Some(result) => result,
-            None => Ok(None),
-        }
+        recv_incoming(&mut self.incoming).await
     }
 
     pub fn poll(&mut self) -> Result<PollFrame, Error> {
-        match self.incoming.try_recv() {
-            Ok(Ok(Some(frame))) => Ok(PollFrame::Frame(frame)),
-            Ok(Ok(None)) => Ok(PollFrame::Closed),
-            Ok(Err(err)) => Err(err),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(PollFrame::Empty),
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => Ok(PollFrame::Closed),
-        }
+        poll_frames(&mut self.incoming)
     }
 
     pub async fn send(&self, frame: &str) -> Result<(), Error> {
@@ -246,6 +237,24 @@ pub enum PollFrame {
     Empty,
     Frame(String),
     Closed,
+}
+
+pub(crate) async fn recv_incoming(
+    incoming: &mut UnboundedReceiver<Result<Option<String>, Error>>,
+) -> Result<Option<String>, Error> {
+    incoming.recv().await.unwrap_or(Ok(None))
+}
+
+pub(crate) fn poll_frames(
+    incoming: &mut UnboundedReceiver<Result<Option<String>, Error>>,
+) -> Result<PollFrame, Error> {
+    match incoming.try_recv() {
+        Ok(Ok(Some(frame))) => Ok(PollFrame::Frame(frame)),
+        Ok(Ok(None)) => Ok(PollFrame::Closed),
+        Ok(Err(err)) => Err(err),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(PollFrame::Empty),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => Ok(PollFrame::Closed),
+    }
 }
 
 enum BlockingCmd {

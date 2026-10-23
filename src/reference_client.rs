@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::error::Error;
 use crate::fixtures::FixtureIds;
-use crate::session::{PollFrame, Session};
+use crate::session::{poll_frames, recv_incoming, PollFrame, Session};
 use crate::snapshot::snapshot_tree;
 use crate::upload::{gzip_bytes, upload_fragment, FragmentUpload};
 
@@ -522,9 +522,7 @@ async fn recv_frame(link: &mut Link, signals: &watch::Receiver<Option<&'static s
     }
 }
 
-async fn next_signal(
-    signals: &mut watch::Receiver<Option<&'static str>>,
-) -> Option<&'static str> {
+async fn next_signal(signals: &mut watch::Receiver<Option<&'static str>>) -> Option<&'static str> {
     signals
         .wait_for(Option::is_some)
         .await
@@ -675,20 +673,11 @@ impl StdioLink {
     }
 
     async fn recv(&mut self) -> Result<Option<String>, Error> {
-        match self.incoming.recv().await {
-            Some(result) => result,
-            None => Ok(None),
-        }
+        recv_incoming(&mut self.incoming).await
     }
 
     fn poll(&mut self) -> Result<PollFrame, Error> {
-        match self.incoming.try_recv() {
-            Ok(Ok(Some(frame))) => Ok(PollFrame::Frame(frame)),
-            Ok(Ok(None)) => Ok(PollFrame::Closed),
-            Ok(Err(err)) => Err(err),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(PollFrame::Empty),
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => Ok(PollFrame::Closed),
-        }
+        poll_frames(&mut self.incoming)
     }
 
     async fn close(&mut self) -> Result<(), Error> {
