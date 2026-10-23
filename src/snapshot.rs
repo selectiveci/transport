@@ -3,8 +3,6 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Map, Value};
 
-use crate::error::Error;
-
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TestMapTree {
     pub sha: Option<String>,
@@ -13,20 +11,16 @@ pub struct TestMapTree {
     pub dirty: Vec<String>,
 }
 
-pub fn snapshot_tree(cwd: &Path) -> Result<Option<TestMapTree>, Error> {
-    let Some(root) = repo_root(cwd) else {
-        return Ok(None);
-    };
-    let Some(mut files) = committed_files(&root) else {
-        return Ok(None);
-    };
+pub fn snapshot_tree(cwd: &Path) -> Option<TestMapTree> {
+    let root = repo_root(cwd)?;
+    let mut files = committed_files(&root)?;
     let dirty = apply_working_tree(&root, &mut files);
-    Ok(Some(TestMapTree {
+    Some(TestMapTree {
         sha: head_sha(&root),
         prefix: prefix_for(&root, cwd),
         files,
         dirty,
-    }))
+    })
 }
 
 fn repo_root(cwd: &Path) -> Option<PathBuf> {
@@ -50,22 +44,17 @@ fn head_sha(root: &Path) -> Option<String> {
 }
 
 fn prefix_for(root: &Path, cwd: &Path) -> String {
-    let Ok(root) = root.canonicalize() else {
-        return String::new();
-    };
-    let Ok(cwd) = cwd.canonicalize() else {
-        return String::new();
-    };
-    if cwd == root {
-        return String::new();
-    }
-    let Ok(rest) = cwd.strip_prefix(&root) else {
+    let Ok(rest) = cwd.strip_prefix(root) else {
         return String::new();
     };
     if rest.as_os_str().is_empty() {
         return String::new();
     }
-    let mut prefix = rest.to_string_lossy().replace('\\', "/");
+    let mut prefix = rest.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        prefix = prefix.replace('\\', "/");
+    }
     if !prefix.ends_with('/') {
         prefix.push('/');
     }
@@ -82,10 +71,7 @@ fn committed_files(root: &Path) -> Option<Map<String, Value>> {
         let Some((meta, path)) = entry.split_once('\t') else {
             continue;
         };
-        let mut parts = meta.split(' ');
-        let _mode = parts.next();
-        let _kind = parts.next();
-        let Some(blob) = parts.next() else {
+        let Some(blob) = meta.split(' ').nth(2) else {
             continue;
         };
         files.insert(path.to_owned(), Value::String(blob.to_owned()));
@@ -106,9 +92,6 @@ fn apply_working_tree(root: &Path, files: &mut Map<String, Value>) -> Vec<String
     ) else {
         return Vec::new();
     };
-    if out.is_empty() {
-        return Vec::new();
-    }
     let mut changed = Vec::new();
     let mut deleted = Vec::new();
     for entry in out.split('\0') {
@@ -175,7 +158,7 @@ fn hash_objects(root: &Path, paths: &[String]) -> Option<Vec<(String, String)>> 
     )
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -229,7 +212,7 @@ mod tests {
         git_cmd(&root, &["commit", "-m", "add keep"]);
         fs::write(root.join("noise.log"), b"ignore me\n").unwrap();
 
-        let tree = snapshot_tree(&root).unwrap().unwrap();
+        let tree = snapshot_tree(&root).unwrap();
         let expected = Command::new("git")
             .arg("-C")
             .arg(&root)
@@ -258,7 +241,7 @@ mod tests {
         fs::write(root.join("keep.txt"), b"changed\n").unwrap();
         fs::remove_file(root.join("gone.txt")).unwrap();
 
-        let tree = snapshot_tree(&root).unwrap().unwrap();
+        let tree = snapshot_tree(&root).unwrap();
         let expected = Command::new("git")
             .arg("-C")
             .arg(&root)
@@ -284,8 +267,22 @@ mod tests {
         fs::write(root.join("README"), b"root\n").unwrap();
         git_cmd(&root, &["add", "README"]);
         git_cmd(&root, &["commit", "-m", "readme"]);
-        let tree = snapshot_tree(&nested).unwrap().unwrap();
+        let tree = snapshot_tree(&nested).unwrap();
         assert_eq!(tree.prefix, "services/api/");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_prefix_keeps_a_backslash_in_the_directory_name() {
+        let root = init_repo();
+        let nested = root.join("a\\b");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("README"), b"root\n").unwrap();
+        git_cmd(&root, &["add", "README"]);
+        git_cmd(&root, &["commit", "-m", "readme"]);
+        let tree = snapshot_tree(&nested).unwrap();
+        assert_eq!(tree.prefix, "a\\b/");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -297,7 +294,7 @@ mod tests {
         fs::write(&marker, b"x").unwrap();
         let isolated = dir.join("empty");
         fs::create_dir_all(&isolated).unwrap();
-        assert!(snapshot_tree(&isolated).unwrap().is_none());
+        assert!(snapshot_tree(&isolated).is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -313,7 +310,7 @@ mod tests {
         for index in 0..count {
             fs::write(root.join(format!("f{index:04}.txt")), b"v2\n").unwrap();
         }
-        let tree = snapshot_tree(&root).unwrap().unwrap();
+        let tree = snapshot_tree(&root).unwrap();
         assert_eq!(tree.files.len(), count);
         assert_eq!(tree.dirty.len(), count);
         let sample = Command::new("git")

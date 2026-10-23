@@ -69,11 +69,8 @@ fn dispatch() -> Result<i32, transport::Error> {
 }
 
 fn snapshot_main(dir: Option<String>) -> Result<i32, transport::Error> {
-    let path = dir.map_or_else(
-        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        PathBuf::from,
-    );
-    match transport::snapshot_tree(&path)? {
+    let path = dir.map_or_else(|| PathBuf::from("."), PathBuf::from);
+    match transport::snapshot_tree(&path) {
         Some(tree) => {
             println!("{}", serde_json::to_string(&tree)?);
             Ok(0)

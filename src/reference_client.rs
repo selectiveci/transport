@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -417,8 +417,7 @@ fn manifest(state: &State) -> Value {
         .collect();
     let mut data = json!({ "test_cases": test_cases });
     if state.tree {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        if let Ok(Some(tree)) = snapshot_tree(&cwd) {
+        if let Some(tree) = snapshot_tree(Path::new(".")) {
             if let Ok(value) = serde_json::to_value(tree) {
                 data["test_map_tree"] = value;
             }
