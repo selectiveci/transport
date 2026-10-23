@@ -828,15 +828,25 @@ impl FifoLink {
             pipes,
             incoming,
         };
-        let opened = tokio::time::timeout(
-            PIPE_OPEN_TIMEOUT,
-            tokio::task::spawn_blocking(move || {
-                std::fs::OpenOptions::new().write(true).open(input)
-            }),
-        )
-        .await;
-        match opened {
-            Ok(Ok(Ok(file))) => {
+        let opener = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new().write(true).open(input)
+        });
+        let deadline = tokio::time::Instant::now() + PIPE_OPEN_TIMEOUT;
+        while !opener.is_finished() {
+            let exited = link.child.try_wait().is_ok_and(|status| status.is_some());
+            if exited || tokio::time::Instant::now() >= deadline {
+                let _ = std::fs::File::open(&link.pipes[0]);
+                let _ = opener.await;
+                return Err(Error::new(if exited {
+                    "the FIFO transport exited before opening its input pipe"
+                } else {
+                    "the FIFO transport never opened its input pipe"
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        match opener.await {
+            Ok(Ok(file)) => {
                 link.input = Some(file);
                 Ok(link)
             }
@@ -956,6 +966,20 @@ mod tests {
         assert_eq!(state.results["case-fail"], "failed");
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0]["test_case_id"], "case-fail");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_transport_that_exits_early_fails_the_link_fast() {
+        let started = std::time::Instant::now();
+        let link = FifoLink::spawn("ws://127.0.0.1:9/transport", Path::new("false")).await;
+        let err = link.err().expect("the link must fail");
+        assert!(err.to_string().contains("exited before"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
