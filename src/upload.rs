@@ -28,24 +28,17 @@ pub fn gzip_bytes(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(encoder.finish()?)
 }
 
-pub(crate) fn http_origin(websocket_url: &str) -> Result<String, Error> {
-    Ok(Url::parse(&ws_to_http(websocket_url))?
-        .origin()
-        .ascii_serialization())
-}
-
 pub(crate) fn fragment_endpoint(
     host: &str,
     run_id: &str,
     run_attempt: &str,
     runner_id: &str,
 ) -> Result<String, Error> {
-    let base = if host.starts_with("ws://") || host.starts_with("wss://") {
-        http_origin(host)?
-    } else {
-        host.trim_end_matches('/').to_owned()
-    };
-    let mut url = Url::parse(&format!("{base}/test_maps/fragments"))?;
+    let mut url = Url::parse(&ws_to_http(host))?;
+    let path = format!("{}/test_maps/fragments", url.path().trim_end_matches('/'));
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
     url.query_pairs_mut()
         .append_pair("run_id", run_id)
         .append_pair("run_attempt", run_attempt)
@@ -71,7 +64,7 @@ pub(crate) async fn upload_fragment_retry(
     )?;
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120))
+        .read_timeout(Duration::from_secs(120))
         .build()?;
     let mut last = Error::new("test map upload failed");
     for attempt in 1..=3 {
@@ -196,14 +189,31 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
-    fn origin_and_endpoint_follow_the_websocket_host() {
-        let origin = http_origin("wss://app.selective.ci/transport/websocket?api_key=k").unwrap();
-        assert_eq!(origin, "https://app.selective.ci");
-        let endpoint = fragment_endpoint("ws://127.0.0.1:9", "run", "2", "shard").unwrap();
-        assert!(endpoint.starts_with("http://127.0.0.1:9/test_maps/fragments?"));
-        assert!(endpoint.contains("run_id=run"));
-        assert!(endpoint.contains("run_attempt=2"));
-        assert!(endpoint.contains("runner_id=shard"));
+    fn endpoint_keeps_the_host_path() {
+        for (host, want) in [
+            (
+                "ws://127.0.0.1:9",
+                "http://127.0.0.1:9/test_maps/fragments?",
+            ),
+            (
+                "wss://app.selective.ci",
+                "https://app.selective.ci/test_maps/fragments?",
+            ),
+            (
+                "wss://app.selective.ci/",
+                "https://app.selective.ci/test_maps/fragments?",
+            ),
+            ("ws://h:9/prefix", "http://h:9/prefix/test_maps/fragments?"),
+            ("wss://h/prefix/", "https://h/prefix/test_maps/fragments?"),
+            ("https://h/a/b?x=1", "https://h/a/b/test_maps/fragments?"),
+        ] {
+            let endpoint = fragment_endpoint(host, "run", "2", "shard").unwrap();
+            assert!(endpoint.starts_with(want), "{host}: {endpoint}");
+            assert!(endpoint.contains("run_id=run"), "{endpoint}");
+            assert!(endpoint.contains("run_attempt=2"), "{endpoint}");
+            assert!(endpoint.contains("runner_id=shard"), "{endpoint}");
+            assert!(!endpoint.contains("x=1"), "{endpoint}");
+        }
     }
 
     #[tokio::test]

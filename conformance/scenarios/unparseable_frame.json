@@ -1,0 +1,29 @@
+{
+  "name": "unparseable_frame",
+  "steps": [
+    {
+      "op": "send",
+      "message": {
+        "command": "connected"
+      }
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "test_manifest"
+      }
+    },
+    {
+      "op": "expect_manifest",
+      "tree": false
+    },
+    {
+      "op": "send_raw",
+      "text": "{this is not json"
+    },
+    {
+      "op": "expect_exit",
+      "code": 1
+    }
+  ]
+}

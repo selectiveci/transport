@@ -41,6 +41,9 @@ pub enum Step {
     Send {
         message: Value,
     },
+    SendRaw {
+        text: String,
+    },
     ExpectManifest {
         tree: bool,
     },
@@ -137,6 +140,7 @@ fn scenarios() -> Result<Vec<Scenario>, Error> {
         include_str!("../../../conformance/scenarios/reconnect_then_going_away.json"),
         include_str!("../../../conformance/scenarios/retries_across_reconnects.json"),
         include_str!("../../../conformance/scenarios/group_hook_time.json"),
+        include_str!("../../../conformance/scenarios/unparseable_frame.json"),
     ];
     RAW.iter()
         .map(|raw| serde_json::from_str(raw).map_err(Error::from))
@@ -622,6 +626,15 @@ impl Player {
                 live.ws.send(Message::Text(text)).await?;
                 Ok(())
             }
+            Step::SendRaw { text } => {
+                self.ensure_connection().await?;
+                let live = self
+                    .current
+                    .as_mut()
+                    .ok_or_else(|| Error::new("no websocket"))?;
+                live.ws.send(Message::Text(text.clone())).await?;
+                Ok(())
+            }
             Step::ExpectManifest { tree } => {
                 let frame = self.next_frame().await?;
                 let expected = self.fixtures.manifest_ids();
@@ -936,7 +949,7 @@ impl Player {
             return Err(Error::new("fragment content-type is not application/gzip"));
         }
         let request_line = captured.header.lines().next().unwrap_or("");
-        if !request_line.contains("/test_maps/fragments")
+        if !request_line.starts_with("POST /test_maps/fragments?")
             || query_param(request_line, "run_id") != Some("run-1")
             || query_param(request_line, "run_attempt") != Some("1")
             || query_param(request_line, "runner_id") != Some("runner-1")

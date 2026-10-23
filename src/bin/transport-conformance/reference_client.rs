@@ -186,6 +186,7 @@ async fn drive(
         Err(WaitFail::Lost) => return Drive::Lost,
         Err(WaitFail::Timeout) => return Drive::Finished(1),
         Err(WaitFail::Signal(signal)) => return Drive::Signal(signal, None),
+        Err(WaitFail::Unparseable(frame)) => return Drive::Finished(unparseable(&frame)),
     }
     loop {
         let command = if let Some(command) = queued.pop_front() {
@@ -195,6 +196,7 @@ async fn drive(
                 FrameIn::Value(value) => value,
                 FrameIn::Lost => return Drive::Lost,
                 FrameIn::Signal(signal) => return Drive::Signal(signal, None),
+                FrameIn::Unparseable(frame) => return Drive::Finished(unparseable(&frame)),
             }
         };
         match dispatch(link, state, base_url, signals, command, &mut queued).await {
@@ -211,6 +213,12 @@ enum WaitFail {
     Lost,
     Timeout,
     Signal(&'static str),
+    Unparseable(String),
+}
+
+fn unparseable(frame: &str) -> i32 {
+    eprintln!("Selective sent a message this runner could not parse: {frame}");
+    1
 }
 
 async fn wait_connected(
@@ -237,6 +245,7 @@ async fn wait_connected(
             }
             Ok(FrameIn::Lost) => return Err(WaitFail::Lost),
             Ok(FrameIn::Signal(signal)) => return Err(WaitFail::Signal(signal)),
+            Ok(FrameIn::Unparseable(frame)) => return Err(WaitFail::Unparseable(frame)),
             Err(_) => {
                 eprintln!("timed out waiting for connected");
                 return Err(WaitFail::Timeout);
@@ -331,11 +340,10 @@ fn drain_polled(
         match poll() {
             Ok(PollFrame::Empty) => return Action::Continue,
             Ok(PollFrame::Closed) | Err(_) => return Action::Lost,
-            Ok(PollFrame::Frame(frame)) => {
-                if let Some(value) = parse_frame(&frame) {
-                    queued.push_back(value);
-                }
-            }
+            Ok(PollFrame::Frame(frame)) => match parse_frame(&frame) {
+                Some(value) => queued.push_back(value),
+                None => return Action::Exit(unparseable(&frame)),
+            },
         }
     }
 }
@@ -494,7 +502,7 @@ async fn upload_traces(state: &State, base_url: &str) -> Result<(), Error> {
     });
     let gzip_body = gzip_bytes(serde_json::to_vec(&fragment)?.as_slice())?;
     upload_fragment(&FragmentUpload {
-        host: base_url.to_owned(),
+        host: upload_host(base_url),
         api_key: query_param(base_url, "api_key"),
         run_id: query_param(base_url, "run_id"),
         run_attempt: query_param(base_url, "run_attempt"),
@@ -502,6 +510,15 @@ async fn upload_traces(state: &State, base_url: &str) -> Result<(), Error> {
         gzip_body,
     })
     .await
+}
+
+fn upload_host(base_url: &str) -> String {
+    match std::env::var("SELECTIVE_HOST") {
+        Ok(host) if !host.is_empty() => host,
+        _ => Url::parse(base_url)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_default(),
+    }
 }
 
 fn command_name(value: &Value) -> &str {
@@ -521,6 +538,7 @@ enum FrameIn {
     Value(Value),
     Lost,
     Signal(&'static str),
+    Unparseable(String),
 }
 
 async fn recv_frame(link: &mut Link, signals: &watch::Receiver<Option<&'static str>>) -> FrameIn {
@@ -532,7 +550,10 @@ async fn recv_frame(link: &mut Link, signals: &watch::Receiver<Option<&'static s
         biased;
         Some(signal) = next_signal(&mut signals) => FrameIn::Signal(signal),
         incoming = link.recv() => match incoming {
-            Ok(Some(frame)) => parse_frame(&frame).map_or(FrameIn::Lost, FrameIn::Value),
+            Ok(Some(frame)) => match parse_frame(&frame) {
+                Some(value) => FrameIn::Value(value),
+                None => FrameIn::Unparseable(frame),
+            },
             Ok(None) | Err(_) => FrameIn::Lost,
         },
     }
@@ -935,5 +956,18 @@ mod tests {
         assert_eq!(state.results["case-fail"], "failed");
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0]["test_case_id"], "case-fail");
+    }
+
+    #[test]
+    fn an_unparseable_frame_mid_batch_exits_1() {
+        let mut frames = VecDeque::from([
+            Ok(PollFrame::Frame(r#"{"command":"print_notice"}"#.to_owned())),
+            Ok(PollFrame::Frame("{not json".to_owned())),
+            Ok(PollFrame::Empty),
+        ]);
+        let mut queued = VecDeque::new();
+        let action = drain_polled(|| frames.pop_front().unwrap(), &mut queued);
+        assert!(matches!(action, Action::Exit(1)));
+        assert_eq!(queued.len(), 1);
     }
 }
