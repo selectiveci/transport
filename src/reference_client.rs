@@ -493,9 +493,13 @@ fn result_message(state: &mut State, id: &str) -> Value {
     *attempt += 1;
     let attempt = *attempt;
     let fixture = state.fixtures.iter().find(|case| case.id == id);
-    let (status, line) = match fixture {
-        Some(case) => (status_for(case.status, case.flake, attempt), case.line),
-        None => ("passed".to_owned(), 1),
+    let (status, line, failure_message) = match fixture {
+        Some(case) => (
+            status_for(case.status, case.flake, attempt),
+            case.line,
+            "assertion failed",
+        ),
+        None => ("failed".to_owned(), 1, "not collected"),
     };
     let mut data = json!({
         "id": clean(id),
@@ -508,7 +512,7 @@ fn result_message(state: &mut State, id: &str) -> Value {
         "pending_message": if status == "pending" { json!("skipped") } else { Value::Null }
     });
     if status == "failed" {
-        data["failure_message_lines"] = json!([clean("assertion failed")]);
+        data["failure_message_lines"] = json!([clean(failure_message)]);
         data["failure_formatted_backtrace"] = json!([format!("{FILE_PATH}:{line}: in {id}")]);
     }
     json!({"type": "test_case_result", "data": data})
@@ -821,5 +825,12 @@ mod tests {
         assert_eq!(status_for("failed", true, 2), "passed");
         assert_eq!(status_for("failed", false, 2), "failed");
         assert_eq!(clean("a\0b"), "ab");
+        let mut state = State::default();
+        let message = result_message(&mut state, "missing-case");
+        assert_eq!(message["data"]["status"], "failed");
+        assert_eq!(
+            message["data"]["failure_message_lines"][0],
+            "not collected"
+        );
     }
 }
