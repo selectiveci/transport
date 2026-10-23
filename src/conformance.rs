@@ -374,12 +374,7 @@ async fn run_one(trial: &Trial<'_>) -> Result<(), Error> {
             let tx = tx.clone();
             let gate = Arc::clone(&accept_gate);
             tokio::spawn(async move {
-                match classify(stream, &gate).await {
-                    Ok(incoming) => {
-                        let _ = tx.send(incoming);
-                    }
-                    Err(_) => {}
-                }
+                forward_connection(stream, gate, tx).await;
             });
         }
     });
@@ -449,6 +444,7 @@ enum Incoming {
     Socket(Live),
     Fragment(CapturedHttp),
     Rejected,
+    Failed(Error),
 }
 
 struct Gate {
@@ -641,6 +637,7 @@ impl Player {
             Event::Accepted(Some(Incoming::Rejected)) => Err(Error::new(
                 "handshake was refused outside reject_connections",
             )),
+            Event::Accepted(Some(Incoming::Failed(err))) => Err(err),
             Event::Accepted(None) => Err(Error::new("connection listener stopped")),
             Event::Socket(Pump::Frame(value)) => Ok(Some(value)),
             Event::Socket(Pump::Ping) => {
@@ -840,6 +837,21 @@ enum Event {
     Accepted(Option<Incoming>),
     Socket(Pump),
     Timeout,
+}
+
+async fn forward_connection(
+    stream: TcpStream,
+    gate: Arc<Gate>,
+    tx: tokio::sync::mpsc::UnboundedSender<Incoming>,
+) {
+    match classify(stream, &gate).await {
+        Ok(incoming) => {
+            let _ = tx.send(incoming);
+        }
+        Err(err) => {
+            let _ = tx.send(Incoming::Failed(err));
+        }
+    }
 }
 
 async fn classify(mut stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, Error> {
@@ -1081,6 +1093,34 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<CapturedHttp, Error
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_broken_handshake_is_reported() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let gate = Arc::new(Gate {
+            reject_budget: AtomicU32::new(0),
+            hold_uploads: AtomicBool::new(false),
+            upload_held: AtomicBool::new(false),
+            upload_notify: Notify::new(),
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET /not-a-websocket\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = stream.shutdown().await;
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        forward_connection(stream, gate, tx).await;
+        client.await.unwrap();
+        match rx.recv().await {
+            Some(Incoming::Failed(err)) => assert!(!err.to_string().is_empty()),
+            _ => panic!("expected a handshake error"),
+        }
+    }
 
     #[test]
     fn metadata_must_be_json_and_pid_zero_is_not_signalled() {
