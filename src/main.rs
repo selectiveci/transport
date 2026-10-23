@@ -36,10 +36,7 @@ fn main() {
 fn dispatch() -> Result<i32, transport::Error> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        None => {
-            eprintln!("{USAGE}");
-            Ok(1)
-        }
+        None => Err(transport::Error::new(USAGE)),
         Some("--help" | "-h") => {
             eprintln!("{USAGE}");
             Ok(0)
@@ -52,17 +49,12 @@ fn dispatch() -> Result<i32, transport::Error> {
             Ok(0)
         }
         Some("conformance") => conformance_main(args.collect()),
-        Some("conformance-client") => Ok(conformance_client_main(
-            args.any(|arg| arg == "--via-stdio"),
-        )),
+        Some("conformance-client") => conformance_client_main(args.any(|arg| arg == "--via-stdio")),
         Some(url) => match args.next() {
             Some(runner_id) => Ok(block_on_abandoning_blocking(transport::run_fifo(
                 url, &runner_id,
             ))),
-            None => {
-                eprintln!("{USAGE}");
-                Ok(1)
-            }
+            None => Err(transport::Error::new(USAGE)),
         },
     }
 }
@@ -74,10 +66,7 @@ fn snapshot_main(dir: Option<String>) -> Result<i32, transport::Error> {
             println!("{}", serde_json::to_string(&tree)?);
             Ok(0)
         }
-        None => {
-            eprintln!("not a git checkout");
-            Ok(1)
-        }
+        None => Err(transport::Error::new("not a git checkout")),
     }
 }
 
@@ -87,33 +76,25 @@ fn upload_main(args: Vec<String>) -> Result<i32, transport::Error> {
     let mut flag_runner_id = String::new();
     let mut index = 0;
     while index < args.len() {
-        let value = match args.get(index + 1) {
-            Some(value) if !value.is_empty() => value.clone(),
-            _ => {
-                eprintln!("missing value for {}", args[index]);
-                return Ok(1);
-            }
-        };
+        let value = required(&args, index + 1, &args[index])?.to_owned();
         match args[index].as_str() {
             "--run-id" => flag_run_id = value,
             "--run-attempt" => flag_run_attempt = value,
             "--runner-id" => flag_runner_id = value,
             other => {
-                eprintln!("unknown --upload-fragment argument {other}\n{USAGE}");
-                return Ok(1);
+                return Err(transport::Error::new(format!(
+                    "unknown --upload-fragment argument {other}\n{USAGE}"
+                )));
             }
         }
         index += 2;
     }
     let raw = read_stdin()?;
-    if raw.is_empty() {
-        eprintln!("--upload-fragment expected a gzip body on stdin");
-        return Ok(1);
-    }
     let (payload, gzip_body) = split_fragment_stdin(&raw)?;
     if gzip_body.is_empty() {
-        eprintln!("--upload-fragment expected a gzip body on stdin");
-        return Ok(1);
+        return Err(transport::Error::new(
+            "--upload-fragment expected a gzip body on stdin",
+        ));
     }
     let detected = transport::detect_build_env();
     let (run_id, run_attempt, runner_id) = resolve_run_identity(
@@ -131,13 +112,12 @@ fn upload_main(args: Vec<String>) -> Result<i32, transport::Error> {
         runner_id,
         gzip_body,
     };
-    match block_on(upload_fragment(&upload)) {
-        Ok(()) => Ok(0),
-        Err(err) => {
-            eprintln!("Selective could not upload this runner's test map ({err}).");
-            Ok(1)
-        }
-    }
+    block_on(upload_fragment(&upload)).map_err(|err| {
+        transport::Error::new(format!(
+            "Selective could not upload this runner's test map ({err})."
+        ))
+    })?;
+    Ok(0)
 }
 
 fn conformance_main(args: Vec<String>) -> Result<i32, transport::Error> {
@@ -157,43 +137,31 @@ fn conformance_main(args: Vec<String>) -> Result<i32, transport::Error> {
             "run" => command = Some("run"),
             "--scenario" => {
                 index += 1;
-                scenario = args.get(index).cloned();
+                scenario = Some(required(&args, index, "--scenario")?.to_owned());
             }
             "--via" => {
                 index += 1;
-                via = match args.get(index).map(String::as_str) {
-                    Some("direct") => SuiteVia::Direct,
-                    Some("stdio") => SuiteVia::Stdio,
-                    Some("both") | None => SuiteVia::Both,
-                    Some(other) => {
-                        eprintln!("unknown --via {other}");
-                        return Ok(1);
+                via = match required(&args, index, "--via")? {
+                    "direct" => SuiteVia::Direct,
+                    "stdio" => SuiteVia::Stdio,
+                    "both" => SuiteVia::Both,
+                    other => {
+                        return Err(transport::Error::new(format!("unknown --via {other}")));
                     }
                 };
             }
             "--client" => {
                 index += 1;
-                match args.get(index).filter(|value| !value.is_empty()) {
-                    Some(value) => client = Some(value.clone()),
-                    None => {
-                        eprintln!("missing value for --client");
-                        return Ok(1);
-                    }
-                }
+                client = Some(required(&args, index, "--client")?.to_owned());
             }
             "--fixture-ids" => {
                 index += 1;
-                match args.get(index).filter(|value| !value.is_empty()) {
-                    Some(value) => fixture_file = Some(value.clone()),
-                    None => {
-                        eprintln!("missing value for --fixture-ids");
-                        return Ok(1);
-                    }
-                }
+                fixture_file = Some(required(&args, index, "--fixture-ids")?.to_owned());
             }
             other => {
-                eprintln!("unknown conformance argument {other}\n{USAGE}");
-                return Ok(1);
+                return Err(transport::Error::new(format!(
+                    "unknown conformance argument {other}\n{USAGE}"
+                )));
             }
         }
         index += 1;
@@ -219,34 +187,32 @@ fn conformance_main(args: Vec<String>) -> Result<i32, transport::Error> {
                 fixtures,
                 fixture_file: fixture_path.as_deref(),
             };
-            match block_on(run_suite_with(&bin, run)) {
-                Ok(()) => Ok(0),
-                Err(err) => {
-                    eprintln!("{err}");
-                    Ok(1)
-                }
-            }
+            block_on(run_suite_with(&bin, run))?;
+            Ok(0)
         }
-        _ => {
-            eprintln!("{USAGE}");
-            Ok(1)
-        }
+        _ => Err(transport::Error::new(USAGE)),
     }
 }
 
-fn conformance_client_main(via_stdio: bool) -> i32 {
-    let url = match std::env::var("SELECTIVE_TRANSPORT_URL") {
-        Ok(url) if !url.is_empty() => url,
-        _ => {
-            eprintln!("conformance-client requires SELECTIVE_TRANSPORT_URL");
-            return 1;
-        }
-    };
-    block_on(transport::reference_client::run(RunOpts {
+fn conformance_client_main(via_stdio: bool) -> Result<i32, transport::Error> {
+    let url = std::env::var("SELECTIVE_TRANSPORT_URL")
+        .ok()
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| {
+            transport::Error::new("conformance-client requires SELECTIVE_TRANSPORT_URL")
+        })?;
+    Ok(block_on(transport::reference_client::run(RunOpts {
         url,
         via: if via_stdio { Via::Stdio } else { Via::Direct },
         catch_signals: true,
-    }))
+    })))
+}
+
+fn required<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str, transport::Error> {
+    match args.get(index).filter(|value| !value.is_empty()) {
+        Some(value) => Ok(value.as_str()),
+        None => Err(transport::Error::new(format!("missing value for {flag}"))),
+    }
 }
 
 fn env_required(key: &str) -> Result<String, transport::Error> {

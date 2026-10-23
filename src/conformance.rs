@@ -265,8 +265,8 @@ fn client_command(trial: &Trial<'_>) -> Result<Command, Error> {
 }
 
 fn shell_words(input: &str) -> Result<Vec<String>, Error> {
-    let words = shell_words::split(input)
-        .map_err(|_| Error::new("unclosed quote in --client command"))?;
+    let words =
+        shell_words::split(input).map_err(|_| Error::new("unclosed quote in --client command"))?;
     if words.is_empty() {
         return Err(Error::new("--client command is empty"));
     }
@@ -824,9 +824,8 @@ async fn classify(mut stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, E
     }
     let mut uri = String::new();
     let mut rejected = false;
-    let handshake = tokio_tungstenite::accept_hdr_async(
-        stream,
-        |request: &Request, response: Response| {
+    let handshake =
+        tokio_tungstenite::accept_hdr_async(stream, |request: &Request, response: Response| {
             if gate
                 .reject_budget
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
@@ -842,9 +841,8 @@ async fn classify(mut stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, E
             }
             uri = request.uri().to_string();
             Ok(response)
-        },
-    )
-    .await;
+        })
+        .await;
     if rejected {
         return Ok(Incoming::Rejected);
     }

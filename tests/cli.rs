@@ -987,3 +987,51 @@ async fn an_early_pong_does_not_stretch_the_dead_peer_timeout() {
     );
     server.abort();
 }
+
+#[test]
+fn scenario_and_via_require_a_value() {
+    let help = std::process::Command::new(bin())
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert_eq!(help.status.code(), Some(0));
+    let bare = std::process::Command::new(bin()).output().unwrap();
+    assert_eq!(bare.status.code(), Some(1));
+    assert_eq!(bare.stderr, help.stderr);
+
+    let cases = [
+        (
+            vec!["conformance", "run", "--scenario"],
+            "missing value for --scenario\n",
+        ),
+        (
+            vec!["conformance", "run", "--via"],
+            "missing value for --via\n",
+        ),
+        (
+            vec!["conformance", "run", "--client"],
+            "missing value for --client\n",
+        ),
+        (
+            vec!["conformance", "run", "--fixture-ids"],
+            "missing value for --fixture-ids\n",
+        ),
+        (
+            vec!["conformance", "run", "--via", "sideways"],
+            "unknown --via sideways\n",
+        ),
+        (
+            vec!["conformance-client"],
+            "conformance-client requires SELECTIVE_TRANSPORT_URL\n",
+        ),
+    ];
+    for (args, stderr) in cases {
+        let output = std::process::Command::new(bin())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), stderr, "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+}

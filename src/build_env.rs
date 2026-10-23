@@ -73,8 +73,7 @@ pub fn detect_build_env_at(cwd: &Path, var: impl Fn(&str) -> Option<String>) -> 
         }
     } else if present(&var, "SEMAPHORE") {
         env.platform = "semaphore".to_owned();
-        env.branch =
-            first_non_empty(&var, &["SEMAPHORE_GIT_PR_BRANCH", "SEMAPHORE_GIT_BRANCH"]);
+        env.branch = first_non_empty(&var, &["SEMAPHORE_GIT_PR_BRANCH", "SEMAPHORE_GIT_BRANCH"]);
         if !value(&var, "SEMAPHORE_GIT_PR_BRANCH").is_empty() {
             env.target_branch = value(&var, "SEMAPHORE_GIT_BRANCH");
         }
