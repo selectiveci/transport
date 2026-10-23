@@ -1,4 +1,5 @@
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -7,16 +8,16 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle as TaskHandle;
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::error::Error;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
-pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(20);
-pub const DEFAULT_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_PONG_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Keepalive {
@@ -25,7 +26,8 @@ pub struct Keepalive {
 }
 
 impl Keepalive {
-    pub(crate) fn from_env() -> Self {
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
         Self::parse(
             std::env::var("SELECTIVE_WS_PING_INTERVAL_MS")
                 .ok()
@@ -36,17 +38,17 @@ impl Keepalive {
         )
     }
 
-    pub(crate) fn parse(interval_ms: Option<&str>, pong_timeout_ms: Option<&str>) -> Self {
-        let ping_interval = parse_ms(interval_ms).unwrap_or(DEFAULT_PING_INTERVAL);
-        let pong_timeout = match parse_ms(pong_timeout_ms) {
-            Some(Duration::ZERO) => ping_interval,
-            Some(timeout) => timeout,
-            None => DEFAULT_PONG_TIMEOUT,
-        };
-        Self {
+    pub(crate) fn parse(interval_ms: Option<&str>, pong_timeout_ms: Option<&str>) -> Option<Self> {
+        let ping_interval = parse_ms(interval_ms).filter(|interval| !interval.is_zero())?;
+        Some(Self {
             ping_interval,
-            pong_timeout,
-        }
+            pong_timeout: parse_ms(pong_timeout_ms).unwrap_or(DEFAULT_PONG_TIMEOUT),
+        })
+    }
+
+    #[must_use]
+    pub fn budget(&self) -> Duration {
+        self.ping_interval + self.pong_timeout
     }
 }
 
@@ -74,16 +76,22 @@ impl Session {
 
     /// # Errors
     /// Fails when the handshake fails or takes longer than 10 s.
-    pub async fn connect_with(url: &str, keepalive: Keepalive) -> Result<Self, Error> {
+    pub async fn connect_with(url: &str, keepalive: Option<Keepalive>) -> Result<Self, Error> {
         let (socket, _) = tokio::time::timeout(IO_TIMEOUT, connect_async(url))
             .await
             .map_err(|_| Error::new("timed out connecting"))??;
         let (sink, stream) = socket.split();
         let (out_tx, out_rx) = unbounded_channel();
         let (in_tx, in_rx) = unbounded_channel();
-        let (pong_tx, pong_rx) = watch::channel(());
-        let writer = tokio::spawn(write_loop(sink, out_rx, in_tx.clone(), pong_rx, keepalive));
-        let reader = tokio::spawn(read_loop(stream, in_tx, pong_tx));
+        let heard = Arc::new(Mutex::new(Instant::now()));
+        let writer = tokio::spawn(write_loop(
+            sink,
+            out_rx,
+            in_tx.clone(),
+            Arc::clone(&heard),
+            keepalive,
+        ));
+        let reader = tokio::spawn(read_loop(stream, in_tx, heard));
 
         Ok(Self {
             outgoing: out_tx,
@@ -138,29 +146,18 @@ async fn write_loop(
     mut sink: SplitSink<Socket, Message>,
     mut out_rx: UnboundedReceiver<OutMsg>,
     writer_in: Frames,
-    mut pong_rx: watch::Receiver<()>,
-    keepalive: Keepalive,
+    heard: Arc<Mutex<Instant>>,
+    keepalive: Option<Keepalive>,
 ) {
-    let mut next_ping = tokio::time::Instant::now() + keepalive.ping_interval;
-    let mut pong_deadline: Option<tokio::time::Instant> = None;
+    let mut next_ping = keepalive.map(|keepalive| Instant::now() + keepalive.ping_interval);
     loop {
-        let scheduled_ping =
-            (pong_deadline.is_none() && !keepalive.ping_interval.is_zero()).then_some(next_ping);
+        let deadline = keepalive.map(|keepalive| *heard.lock().unwrap() + keepalive.budget());
         tokio::select! {
             biased;
             msg = out_rx.recv() => {
                 match msg {
                     Some(OutMsg::Text(text, reply)) => {
-                        let result = match tokio::time::timeout(
-                            IO_TIMEOUT,
-                            sink.send(Message::Text(text)),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => Ok(()),
-                            Ok(Err(err)) => Err(Error::from(err)),
-                            Err(_) => Err(Error::new("timed out sending a frame")),
-                        };
+                        let result = send_while_alive(&mut sink, Message::Text(text), &heard, keepalive).await;
                         let failed = result.is_err();
                         let _ = reply.send(result);
                         if failed {
@@ -186,42 +183,67 @@ async fn write_loop(
                     None => break,
                 }
             }
-            Ok(()) = pong_rx.changed(), if pong_deadline.is_some() => {
-                pong_deadline = None;
-            }
-            () = sleep_until(pong_deadline), if pong_deadline.is_some() => {
-                eprintln!("websocket pong timeout");
-                let _ = tokio::time::timeout(
-                    IO_TIMEOUT,
-                    sink.send(Message::Close(None)),
-                )
-                .await;
-                let _ = writer_in.send(Ok(None));
-                break;
-            }
-            () = sleep_until(scheduled_ping), if scheduled_ping.is_some() => {
-                pong_rx.borrow_and_update();
-                let sent = tokio::time::timeout(
-                    IO_TIMEOUT,
-                    sink.send(Message::Ping(b"selective".to_vec())),
-                )
-                .await;
-                if !matches!(sent, Ok(Ok(()))) {
-                    eprintln!("websocket ping failed");
+            () = sleep_until(deadline) => {
+                if let Some(keepalive) = keepalive.filter(|keepalive| silent_for(&heard, keepalive.budget())) {
+                    eprintln!("{}", keepalive_timeout(keepalive));
                     let _ = writer_in.send(Ok(None));
                     break;
                 }
-                pong_deadline =
-                    Some(tokio::time::Instant::now() + keepalive.pong_timeout);
-                next_ping = tokio::time::Instant::now() + keepalive.ping_interval;
+            }
+            () = sleep_until(next_ping) => {
+                next_ping = keepalive.map(|keepalive| Instant::now() + keepalive.ping_interval);
+                if let Err(err) = send_while_alive(&mut sink, Message::Ping(b"selective".to_vec()), &heard, keepalive).await {
+                    eprintln!("{err}");
+                    let _ = writer_in.send(Ok(None));
+                    break;
+                }
             }
         }
     }
 }
 
-async fn read_loop(mut stream: SplitStream<Socket>, in_tx: Frames, reader_pong: watch::Sender<()>) {
+async fn send_while_alive(
+    sink: &mut SplitSink<Socket, Message>,
+    message: Message,
+    heard: &Mutex<Instant>,
+    keepalive: Option<Keepalive>,
+) -> Result<(), Error> {
+    let sending = sink.send(message);
+    let Some(keepalive) = keepalive else {
+        return sending.await.map_err(Error::from);
+    };
+    tokio::pin!(sending);
     loop {
-        match stream.next().await {
+        let deadline = *heard.lock().unwrap() + keepalive.budget();
+        tokio::select! {
+            sent = &mut sending => return sent.map_err(Error::from),
+            () = tokio::time::sleep_until(deadline) => {
+                if silent_for(heard, keepalive.budget()) {
+                    return Err(Error::new(keepalive_timeout(keepalive)));
+                }
+            }
+        }
+    }
+}
+
+fn silent_for(heard: &Mutex<Instant>, budget: Duration) -> bool {
+    heard.lock().unwrap().elapsed() >= budget
+}
+
+fn keepalive_timeout(keepalive: Keepalive) -> String {
+    format!(
+        "websocket keepalive timeout: no frame from the server for {}s",
+        keepalive.budget().as_secs_f64()
+    )
+}
+
+async fn read_loop(mut stream: SplitStream<Socket>, in_tx: Frames, heard: Arc<Mutex<Instant>>) {
+    loop {
+        let next = stream.next().await;
+        if let Some(Ok(_)) = next {
+            *heard.lock().unwrap() = Instant::now();
+        }
+        match next {
             Some(Ok(Message::Text(text))) => {
                 if in_tx.send(Ok(Some(text))).is_err() {
                     break;
@@ -233,10 +255,7 @@ async fn read_loop(mut stream: SplitStream<Socket>, in_tx: Frames, reader_pong: 
                     break;
                 }
             }
-            Some(Ok(Message::Pong(_))) => {
-                reader_pong.send_replace(());
-            }
-            Some(Ok(Message::Ping(_) | Message::Frame(_))) => {}
+            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
             Some(Ok(Message::Close(_))) | None => {
                 let _ = in_tx.send(Ok(None));
                 break;
@@ -430,25 +449,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keepalive_defaults_and_zero_interval_disables_pings() {
+    fn keepalive_is_off_unless_the_client_sets_an_interval() {
+        assert_eq!(Keepalive::parse(None, Some("1000")), None);
+        assert_eq!(Keepalive::parse(Some("0"), None), None);
         assert_eq!(
-            Keepalive::parse(None, None),
-            Keepalive {
-                ping_interval: DEFAULT_PING_INTERVAL,
+            Keepalive::parse(Some("250"), None),
+            Some(Keepalive {
+                ping_interval: Duration::from_millis(250),
                 pong_timeout: DEFAULT_PONG_TIMEOUT,
-            }
-        );
-        assert_eq!(DEFAULT_PING_INTERVAL, Duration::from_secs(20));
-        assert!(DEFAULT_PING_INTERVAL < Duration::from_secs(60));
-        let disabled = Keepalive::parse(Some("0"), Some("10"));
-        assert!(disabled.ping_interval.is_zero());
-        assert_eq!(
-            Keepalive::parse(Some("250"), None).pong_timeout,
-            DEFAULT_PONG_TIMEOUT
+            })
         );
         assert_eq!(
-            Keepalive::parse(Some("250"), Some("0")).pong_timeout,
-            Duration::from_millis(250)
+            Keepalive::parse(Some("250"), Some("0")).map(|keepalive| keepalive.pong_timeout),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            Keepalive::parse(Some("20000"), None).map(|keepalive| keepalive.budget()),
+            Some(Duration::from_secs(65))
         );
     }
 }

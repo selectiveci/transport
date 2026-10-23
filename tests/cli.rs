@@ -44,7 +44,7 @@ async fn stdio_uses_the_env_url_and_does_not_forward_exit() {
     stdin.flush().await.unwrap();
     let frame = within(ws.next()).await.unwrap().unwrap();
     match frame {
-        Message::Text(text) => assert_eq!(text, "{\"type\":\"test_case_result\"}"),
+        Message::Text(text) => assert_eq!(text, "{\"type\":\"test_case_result\"}\n"),
         other => panic!("unexpected {other:?}"),
     }
     ws.send(Message::Text("{\"command\":\"connected\"}".into()))
@@ -85,12 +85,111 @@ async fn stdio_reads_the_url_from_stdin_when_env_is_absent() {
     let mut ws = accept_async(sock).await.unwrap();
     let frame = within(ws.next()).await.unwrap().unwrap();
     match frame {
-        Message::Text(text) => assert_eq!(text, "{\"type\":\"hello\"}"),
+        Message::Text(text) => assert_eq!(text, "{\"type\":\"hello\"}\n"),
         other => panic!("unexpected {other:?}"),
     }
     stdin.write_all(b"exit\n").await.unwrap();
     let status = within(child.wait()).await.unwrap();
     assert!(status.success());
+}
+
+async fn stdio_ending(
+    env: &[(&str, &str)],
+    server: impl FnOnce(
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> tokio::task::JoinHandle<()>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut command = Command::new(bin());
+    command
+        .arg("--stdio")
+        .env("SELECTIVE_TRANSPORT_URL", format!("ws://{addr}"))
+        .env_remove("SELECTIVE_WS_PING_INTERVAL_MS")
+        .env_remove("SELECTIVE_WS_PONG_TIMEOUT_MS")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().unwrap();
+    let _stdin = child.stdin.take();
+    let (sock, _) = within(listener.accept()).await.unwrap();
+    let handle = server(accept_async(sock).await.unwrap());
+    let status = timeout(Duration::from_secs(3), child.wait())
+        .await
+        .expect("the transport did not exit")
+        .unwrap();
+    handle.abort();
+    assert_eq!(status.code(), Some(0));
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .await
+        .unwrap();
+    stderr
+}
+
+#[tokio::test]
+async fn stdio_reports_each_way_a_connection_ends() {
+    let closed = stdio_ending(&[], |mut ws| {
+        tokio::spawn(async move {
+            ws.send(Message::Close(None)).await.unwrap();
+            let _ = ws.next().await;
+        })
+    })
+    .await;
+    assert!(
+        closed.contains("websocket closed by the server"),
+        "{closed}"
+    );
+
+    let dropped = stdio_ending(&[], |ws| tokio::spawn(async move { drop(ws) })).await;
+    assert!(
+        dropped.contains("websocket connection dropped"),
+        "{dropped}"
+    );
+
+    let silent = stdio_ending(
+        &[
+            ("SELECTIVE_WS_PING_INTERVAL_MS", "100"),
+            ("SELECTIVE_WS_PONG_TIMEOUT_MS", "100"),
+        ],
+        |ws| {
+            tokio::spawn(async move {
+                let _held = ws;
+                std::future::pending::<()>().await;
+            })
+        },
+    )
+    .await;
+    assert!(silent.contains("websocket keepalive timeout"), "{silent}");
+}
+
+#[tokio::test]
+async fn stdio_sends_no_ping_unless_the_client_asks() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut child = Command::new(bin())
+        .arg("--stdio")
+        .env("SELECTIVE_TRANSPORT_URL", format!("ws://{addr}"))
+        .env_remove("SELECTIVE_WS_PING_INTERVAL_MS")
+        .env_remove("SELECTIVE_WS_PONG_TIMEOUT_MS")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let (sock, _) = within(listener.accept()).await.unwrap();
+    let mut ws = accept_async(sock).await.unwrap();
+    let early = timeout(Duration::from_secs(1), ws.next()).await;
+    assert!(early.is_err(), "expected nothing, got {early:?}");
+    assert!(child.try_wait().unwrap().is_none());
 }
 
 #[tokio::test]
@@ -741,10 +840,10 @@ async fn session_pings_while_idle_and_closes_without_a_pong() {
     });
     let mut session = transport::Session::connect_with(
         &format!("ws://{addr}"),
-        transport::Keepalive {
+        Some(transport::Keepalive {
             ping_interval: Duration::from_millis(150),
             pong_timeout: Duration::from_millis(500),
-        },
+        }),
     )
     .await
     .unwrap();
@@ -767,10 +866,10 @@ async fn session_pings_while_idle_and_closes_without_a_pong() {
     let started = Instant::now();
     let mut session = transport::Session::connect_with(
         &format!("ws://{addr}"),
-        transport::Keepalive {
+        Some(transport::Keepalive {
             ping_interval: Duration::from_millis(80),
             pong_timeout: Duration::from_millis(200),
-        },
+        }),
     )
     .await
     .unwrap();
@@ -780,6 +879,39 @@ async fn session_pings_while_idle_and_closes_without_a_pong() {
         .unwrap();
     assert!(frame.is_none());
     assert!(started.elapsed() < Duration::from_secs(2));
+    server.abort();
+}
+
+#[tokio::test]
+async fn session_stays_open_while_the_server_sends_without_ponging() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(sock).await.unwrap();
+        for index in 0..10 {
+            ws.send(Message::Text(format!("frame-{index}")))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        std::future::pending::<()>().await;
+    });
+    let mut session = transport::Session::connect_with(
+        &format!("ws://{addr}"),
+        Some(transport::Keepalive {
+            ping_interval: Duration::from_millis(80),
+            pong_timeout: Duration::from_millis(200),
+        }),
+    )
+    .await
+    .unwrap();
+    for index in 0..10 {
+        let frame = within(session.recv()).await.unwrap();
+        assert_eq!(frame, Some(format!("frame-{index}")));
+    }
+    let ended = within(session.recv()).await.unwrap();
+    assert_eq!(ended, None);
     server.abort();
 }
 
@@ -807,10 +939,10 @@ async fn an_early_pong_does_not_stretch_the_dead_peer_timeout() {
     let started = Instant::now();
     let mut session = transport::Session::connect_with(
         &format!("ws://{addr}"),
-        transport::Keepalive {
+        Some(transport::Keepalive {
             ping_interval: Duration::from_millis(500),
             pong_timeout: Duration::from_millis(200),
-        },
+        }),
     )
     .await
     .unwrap();

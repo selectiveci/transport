@@ -1,6 +1,6 @@
 #![warn(clippy::perf, clippy::style, clippy::pedantic)]
 
-mod legacy_fifo;
+mod engine;
 
 use std::path::PathBuf;
 
@@ -43,7 +43,9 @@ fn dispatch() -> Result<i32, transport::Error> {
             eprintln!("{USAGE}");
             Ok(0)
         }
-        Some("--stdio") => Ok(block_on(transport::stdio::run())),
+        Some("--stdio") => Ok(block_on(
+            engine::run_stdio(transport::Keepalive::from_env()),
+        )),
         Some("--snapshot") => snapshot_main(args.next()),
         Some("--upload-fragment") => upload_main(&args.collect::<Vec<_>>()),
         Some("--build-env") => {
@@ -53,7 +55,7 @@ fn dispatch() -> Result<i32, transport::Error> {
         Some("conformance") => conformance_main(&args.collect::<Vec<_>>()),
         Some("conformance-client") => conformance_client_main(args.any(|arg| arg == "--via-stdio")),
         Some(url) => match args.next() {
-            Some(runner_id) => Ok(block_on(legacy_fifo::run(url, &runner_id))),
+            Some(runner_id) => Ok(block_on(engine::run_fifo(url, &runner_id))),
             None => Err(transport::Error::new(USAGE)),
         },
     }
