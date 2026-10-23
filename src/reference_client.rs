@@ -75,6 +75,13 @@ pub async fn run(opts: RunOpts) -> i32 {
         fixtures,
         ..State::default()
     };
+    let base = match with_default_param(&opts.url, "test_map", "record") {
+        Ok(url) => url,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
     let mut failures: u32 = 0;
     let mut reconnect = false;
     loop {
@@ -82,7 +89,7 @@ pub async fn run(opts: RunOpts) -> i32 {
             return finish_signal(&mut Link::Closed, &state, signal, None).await;
         }
         let url = if reconnect {
-            match with_reconnect(&opts.url) {
+            match with_reconnect(&base) {
                 Ok(url) => url,
                 Err(err) => {
                     eprintln!("{err}");
@@ -90,7 +97,7 @@ pub async fn run(opts: RunOpts) -> i32 {
                 }
             }
         } else {
-            opts.url.clone()
+            base.clone()
         };
         let mut link = match Link::open(&url, opts.via).await {
             Ok(link) => link,
@@ -426,6 +433,7 @@ fn result_message(state: &mut State, id: &str) -> Value {
     *attempt += 1;
     let attempt = *attempt;
     let fixture = state.fixtures.iter().find(|case| case.id == id);
+    let collected = fixture.is_some();
     let (status, line, failure_message) = match fixture {
         Some(case) => (
             status_for(case.status, case.flake, attempt),
@@ -446,7 +454,11 @@ fn result_message(state: &mut State, id: &str) -> Value {
     });
     if status == "failed" {
         data["failure_message_lines"] = json!([clean(failure_message)]);
-        data["failure_formatted_backtrace"] = json!([format!("{FILE_PATH}:{line}: in {id}")]);
+        data["failure_formatted_backtrace"] = if collected {
+            json!([format!("{FILE_PATH}:{line}: in {id}")])
+        } else {
+            json!([])
+        };
     }
     json!({"type": "test_case_result", "data": data})
 }
@@ -538,6 +550,14 @@ fn with_reconnect(url: &str) -> Result<String, Error> {
         .chain(std::iter::once(("reconnect".to_owned(), "true".to_owned())))
         .collect();
     parsed.query_pairs_mut().clear().extend_pairs(&pairs);
+    Ok(parsed.into())
+}
+
+fn with_default_param(url: &str, key: &str, value: &str) -> Result<String, Error> {
+    let mut parsed = Url::parse(url)?;
+    if !parsed.query_pairs().any(|(name, _)| name == key) {
+        parsed.query_pairs_mut().append_pair(key, value);
+    }
     Ok(parsed.into())
 }
 

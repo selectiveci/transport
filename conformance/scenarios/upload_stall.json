@@ -1,5 +1,6 @@
 {
   "name": "upload_stall",
+  "requires_record": true,
   "steps": [
     {
       "op": "send",

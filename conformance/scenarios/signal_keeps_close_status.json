@@ -1,5 +1,6 @@
 {
   "name": "signal_keeps_close_status",
+  "requires_record": true,
   "steps": [
     {
       "op": "send",

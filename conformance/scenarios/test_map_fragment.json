@@ -1,5 +1,6 @@
 {
   "name": "test_map_fragment",
+  "requires_record": true,
   "steps": [
     {
       "op": "send",

@@ -22,6 +22,8 @@ use crate::reference_client::Via;
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Scenario {
     pub name: String,
+    #[serde(default)]
+    pub requires_record: bool,
     pub steps: Vec<Step>,
 }
 
@@ -31,6 +33,7 @@ pub enum Step {
     Send { message: Value },
     ExpectManifest { tree: bool },
     ExpectResult { id: String, status: String },
+    ExpectUncollected { id: String },
     ExpectTerminating { signal: String },
     Drop,
     ExpectReconnect,
@@ -165,7 +168,8 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
                 via_name(via)
             };
             match run_one(&trial).await {
-                Ok(()) => eprintln!("ok {} {label}", scenario.name),
+                Ok(Played::Passed) => eprintln!("ok {} {label}", scenario.name),
+                Ok(Played::NotApplicable(why)) => eprintln!("n/a {} {label}: {why}", scenario.name),
                 Err(err) => failures.push(format!("{} {label}: {err}", scenario.name)),
             }
         }
@@ -286,7 +290,7 @@ fn via_name(via: Via) -> &'static str {
     }
 }
 
-async fn run_one(trial: &Trial<'_>) -> Result<(), Error> {
+async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let url = format!(
@@ -349,6 +353,7 @@ async fn run_one(trial: &Trial<'_>) -> Result<(), Error> {
         fragments: Vec::new(),
         child: Some(child),
         saw_connection: false,
+        test_map: None,
         gate,
         fixtures: trial.fixtures.clone(),
         ping_interval: trial.pace.ping,
@@ -356,7 +361,7 @@ async fn run_one(trial: &Trial<'_>) -> Result<(), Error> {
         pings: 0,
     };
     let outcome = player.play(trial.scenario).await;
-    if outcome.is_err() {
+    if !matches!(outcome, Ok(Played::Passed)) {
         if let Some(mut child) = player.child.take() {
             let _ = child.start_kill();
             let _ = child.wait().await;
@@ -416,12 +421,18 @@ struct Gate {
     upload_notify: Notify,
 }
 
+enum Played {
+    Passed,
+    NotApplicable(String),
+}
+
 struct Player {
     incoming: tokio::sync::mpsc::UnboundedReceiver<Incoming>,
     current: Option<Live>,
     fragments: Vec<CapturedHttp>,
     child: Option<Child>,
     saw_connection: bool,
+    test_map: Option<String>,
     gate: Arc<Gate>,
     fixtures: FixtureIds,
     ping_interval: Duration,
@@ -430,13 +441,22 @@ struct Player {
 }
 
 impl Player {
-    async fn play(&mut self, scenario: &Scenario) -> Result<(), Error> {
+    async fn play(&mut self, scenario: &Scenario) -> Result<Played, Error> {
+        if scenario.requires_record {
+            self.ensure_connection().await?;
+            let advertised = self.test_map.as_deref().unwrap_or("");
+            if advertised != "record" {
+                return Ok(Played::NotApplicable(format!(
+                    "client advertises test_map={advertised}"
+                )));
+            }
+        }
         for step in &scenario.steps {
             self.step(step)
                 .await
                 .map_err(|err| Error::new(format!("{}: {err}", scenario.name)))?;
         }
-        Ok(())
+        Ok(Played::Passed)
     }
 
     async fn step(&mut self, step: &Step) -> Result<(), Error> {
@@ -459,6 +479,10 @@ impl Player {
             Step::ExpectResult { id, status } => {
                 let frame = self.next_frame().await?;
                 expect_result(&frame, id, status)
+            }
+            Step::ExpectUncollected { id } => {
+                let frame = self.next_frame().await?;
+                expect_uncollected(&frame, id)
             }
             Step::ExpectTerminating { signal } => {
                 let frame = self.next_frame().await?;
@@ -630,6 +654,7 @@ impl Player {
                 ));
             }
             self.saw_connection = true;
+            self.test_map = query_value(&socket.uri, "test_map");
         }
         self.current = Some(socket);
         Ok(())
@@ -937,6 +962,35 @@ fn repo_relative_backtrace(frame: &str) -> bool {
 }
 
 fn expect_result(frame: &Value, id: &str, status: &str) -> Result<(), Error> {
+    expect_status(frame, id, status)?;
+    if status == "failed" {
+        let first = frame
+            .pointer("/data/failure_formatted_backtrace")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !repo_relative_backtrace(first) {
+            return Err(Error::new(format!(
+                "failure backtrace must be a repo-relative frame: {first}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn expect_uncollected(frame: &Value, id: &str) -> Result<(), Error> {
+    expect_status(frame, id, "failed")?;
+    match frame.pointer("/data/failure_formatted_backtrace") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Array(items)) if items.is_empty() => Ok(()),
+        Some(other) => Err(Error::new(format!(
+            "an uncollected id has no frame to report, got {other}"
+        ))),
+    }
+}
+
+fn expect_status(frame: &Value, id: &str, status: &str) -> Result<(), Error> {
     if frame.get("type").and_then(Value::as_str) != Some("test_case_result") {
         return Err(Error::new(format!(
             "expected test_case_result, got {frame}"
@@ -951,20 +1005,6 @@ fn expect_result(frame: &Value, id: &str, status: &str) -> Result<(), Error> {
         .and_then(Value::as_str)
         .unwrap_or("");
     if got_id == id && got_status == status {
-        if got_status == "failed" {
-            let backtrace = frame
-                .pointer("/data/failure_formatted_backtrace")
-                .and_then(Value::as_array);
-            let first = backtrace
-                .and_then(|items| items.first())
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if !repo_relative_backtrace(first) {
-                return Err(Error::new(format!(
-                    "failure backtrace must be a repo-relative frame: {first}"
-                )));
-            }
-        }
         Ok(())
     } else {
         Err(Error::new(format!(
@@ -992,13 +1032,15 @@ fn expect_report(frame: &Value, connection_retries: u64) -> Result<(), Error> {
 }
 
 fn connect_metadata_is_json(uri: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(&format!("ws://conformance.invalid{uri}")) else {
-        return false;
-    };
-    parsed
+    query_value(uri, "metadata").is_some_and(|value| serde_json::from_str::<Value>(&value).is_ok())
+}
+
+fn query_value(uri: &str, key: &str) -> Option<String> {
+    url::Url::parse(&format!("ws://conformance.invalid{uri}"))
+        .ok()?
         .query_pairs()
-        .find(|(key, _)| key == "metadata")
-        .is_some_and(|(_, value)| serde_json::from_str::<Value>(&value).is_ok())
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned())
 }
 
 async fn read_http(mut stream: TcpStream) -> Result<CapturedHttp, Error> {
@@ -1232,5 +1274,26 @@ mod tests {
             "passed",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn an_uncollected_id_reports_no_frame() {
+        let result = |frames: Option<Value>| {
+            let mut data = serde_json::json!({"id": "not-a-case", "status": "failed"});
+            if let Some(frames) = frames {
+                data["failure_formatted_backtrace"] = frames;
+            }
+            serde_json::json!({"type": "test_case_result", "data": data})
+        };
+        expect_uncollected(&result(None), "not-a-case").unwrap();
+        expect_uncollected(&result(Some(serde_json::json!([]))), "not-a-case").unwrap();
+        for frames in [
+            serde_json::json!(["tests/uncollected.py:1"]),
+            serde_json::json!(["/home/dev/proj/tests/foo.py:1"]),
+            serde_json::json!("tests/uncollected.py:1"),
+        ] {
+            let err = expect_uncollected(&result(Some(frames.clone())), "not-a-case").unwrap_err();
+            assert!(err.to_string().contains("no frame"), "{frames}: {err}");
+        }
     }
 }

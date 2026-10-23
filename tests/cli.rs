@@ -586,6 +586,36 @@ async fn conformance_run_client_drives_an_external_command() {
 }
 
 #[tokio::test]
+async fn conformance_marks_record_scenarios_not_applicable_for_a_select_client() {
+    let dir = temp_dir("select-client");
+    let script = dir.join("client.sh");
+    write_executable(
+        &script,
+        "#!/bin/sh\nSELECTIVE_TRANSPORT_URL=\"$SELECTIVE_TRANSPORT_URL&test_map=select\" exec \"$1\" conformance-client\n",
+    );
+    let command = format!("{} {}", script.display(), bin());
+    let output = Command::new(bin())
+        .args([
+            "conformance",
+            "run",
+            "--scenario",
+            "test_map_fragment",
+            "--client",
+            &command,
+        ])
+        .output()
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("n/a test_map_fragment client: client advertises test_map=select"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn conformance_fixture_ids_round_trip_through_the_builtin_client() {
     let dir = temp_dir("fixture-ids");
     let map = dir.join("ids.json");

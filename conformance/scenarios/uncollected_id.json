@@ -27,9 +27,8 @@
       }
     },
     {
-      "op": "expect_result",
-      "id": "not-a-case",
-      "status": "failed"
+      "op": "expect_uncollected",
+      "id": "not-a-case"
     },
     {
       "op": "send",
