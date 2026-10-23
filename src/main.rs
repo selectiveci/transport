@@ -3,7 +3,7 @@
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::process::exit;
 use std::time::Duration;
 use tokio::fs::{File, OpenOptions};
@@ -22,6 +22,14 @@ use url::Url;
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = SplitSink<Socket, Message>;
 type ServerEvent = (u64, Option<Message>);
+type Headers = Vec<(String, String)>;
+
+// A new connection the server has confirmed, and the headers of any further
+// move it asked for before confirming.
+struct Resumed {
+    socket: Socket,
+    again: Option<Headers>,
+}
 
 // Tells the server this transport can move its own connection when asked to.
 const FEATURES_PARAM: (&str, &str) = ("transport_features", "resume");
@@ -31,6 +39,9 @@ const FEATURES_PARAM: (&str, &str) = ("transport_features", "resume");
 const RESUME_COMMAND: &str = "transport_reconnect";
 // Sent on the new connection once the server has moved the runner onto it.
 const RESUMED_COMMAND: &str = "transport_resumed";
+// Sent on the old connection when the transport starts holding: nothing more
+// will follow it there.
+const MOVING_MESSAGE: &str = r#"{"type":"transport_moving"}"#;
 
 const RESUME_DEADLINE: Duration = Duration::from_mins(1);
 const RESUME_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -72,15 +83,16 @@ async fn main() {
     };
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ServerEvent>();
-    let (resume_tx, mut resume_rx) = mpsc::unbounded_channel::<Option<Socket>>();
+    let (resume_tx, mut resume_rx) = mpsc::unbounded_channel::<Option<Resumed>>();
 
     let mut transport = Transport {
         out: Some(out_tx),
         writer: Some(writer),
         resume_url: with_params(&url, &[("reconnect", "true"), ("resume", "true")]),
         current: None,
-        retired: HashSet::new(),
+        retired: HashMap::new(),
         resuming: false,
+        exit_requested: false,
         held: VecDeque::new(),
         next_id: 0,
         events_tx,
@@ -91,8 +103,17 @@ async fn main() {
     loop {
         tokio::select! {
             Some((id, message)) = events_rx.recv() => transport.on_server_event(id, message).await,
-            Some(socket) = resume_rx.recv() => transport.on_resume_finished(socket).await,
-            item = pipe_rx.recv() => transport.on_pipe_item(item).await,
+            Some(resumed) = resume_rx.recv() => transport.on_resume_finished(resumed).await,
+            item = pipe_rx.recv() => {
+                // A confirmed move that's already waiting decides which
+                // connection an exit closes.
+                if matches!(item, Some(PipeItem::Exit) | None) {
+                    if let Ok(resumed) = resume_rx.try_recv() {
+                        transport.on_resume_finished(resumed).await;
+                    }
+                }
+                transport.on_pipe_item(item).await;
+            }
         }
     }
 }
@@ -114,13 +135,15 @@ struct Transport {
     current: Option<(u64, Sink)>,
     // Connections being replaced. Each is read until it ends, since the
     // server may have sent on it before switching over.
-    retired: HashSet<u64>,
+    retired: HashMap<u64, Sink>,
     // While a resume is in flight, pipe messages wait for the new connection.
     resuming: bool,
+    // The client asked to stop while a resume had no connection to send on.
+    exit_requested: bool,
     held: VecDeque<Message>,
     next_id: u64,
     events_tx: mpsc::UnboundedSender<ServerEvent>,
-    resume_tx: mpsc::UnboundedSender<Option<Socket>>,
+    resume_tx: mpsc::UnboundedSender<Option<Resumed>>,
 }
 
 impl Transport {
@@ -139,13 +162,13 @@ impl Transport {
     }
 
     async fn on_server_event(&mut self, id: u64, message: Option<Message>) {
-        let live = Some(id) == self.current_id() || self.retired.contains(&id);
+        let live = Some(id) == self.current_id() || self.retired.contains_key(&id);
 
         match message {
             Some(Message::Text(text)) if live => {
                 if let Some(headers) = resume_headers(&text) {
                     if Some(id) == self.current_id() {
-                        self.start_resume(headers);
+                        self.start_resume(headers).await;
                     }
                     return;
                 }
@@ -159,7 +182,8 @@ impl Transport {
     }
 
     async fn on_connection_ended(&mut self, id: u64) {
-        if self.retired.remove(&id) {
+        if let Some(sink) = self.retired.remove(&id) {
+            close_in_background(sink);
             return;
         }
 
@@ -171,16 +195,21 @@ impl Transport {
 
             // Asked to move and the old connection went first: wait for the
             // new one rather than exiting.
-            self.current = None;
+            if let Some((_, sink)) = self.current.take() {
+                close_in_background(sink);
+            }
         }
     }
 
-    fn start_resume(&mut self, headers: Vec<(String, String)>) {
+    async fn start_resume(&mut self, headers: Headers) {
         if self.resuming {
             return;
         }
 
         self.resuming = true;
+        if let Some((_, sink)) = self.current.as_mut() {
+            let _ = sink.send(Message::text(MOVING_MESSAGE)).await;
+        }
         let url = self.resume_url.clone();
         let resume_tx = self.resume_tx.clone();
         tokio::spawn(async move {
@@ -188,7 +217,7 @@ impl Transport {
         });
     }
 
-    async fn on_resume_finished(&mut self, socket: Option<Socket>) {
+    async fn on_resume_finished(&mut self, resumed: Option<Resumed>) {
         if !self.resuming {
             return;
         }
@@ -196,22 +225,35 @@ impl Transport {
 
         // The server may already have moved the runner, so carrying on with the
         // old connection could lose results. The client reconnects in full.
-        let Some(socket) = socket else {
+        let Some(Resumed { socket, again }) = resumed else {
             eprintln!("Failed to move to a new connection. Exiting...");
             self.send_held().await;
             self.close_current().await;
+            if !self.exit_requested {
+                self.finish_output().await;
+            }
             exit(1);
         };
 
-        if let Some((old_id, mut old_sink)) = self.adopt(socket) {
-            self.retired.insert(old_id);
+        if let Some((old_id, old_sink)) = self.adopt(socket) {
+            self.retired.insert(old_id, old_sink);
+            let events_tx = self.events_tx.clone();
             tokio::spawn(async move {
                 sleep(RETIRED_TIMEOUT).await;
-                let _ = timeout(CLOSE_TIMEOUT, old_sink.close()).await;
+                let _ = events_tx.send((old_id, None));
             });
         }
 
         self.send_held().await;
+
+        if self.exit_requested {
+            self.close_current().await;
+            exit(0);
+        }
+
+        if let Some(headers) = again {
+            self.start_resume(headers).await;
+        }
     }
 
     async fn on_pipe_item(&mut self, item: Option<PipeItem>) {
@@ -221,6 +263,9 @@ impl Transport {
             // The client stops the transport a few seconds after asking, so an
             // exit doesn't wait for a resume: what's held goes out on the
             // connection still open.
+            Some(PipeItem::Exit) | None if self.resuming && self.current.is_none() => {
+                self.exit_requested = true;
+            }
             Some(PipeItem::Exit) | None => {
                 self.send_held().await;
                 self.close_current().await;
@@ -229,9 +274,15 @@ impl Transport {
         }
     }
 
+    // Best effort: a connection that has gone is reported by its reader.
     async fn send_held(&mut self) {
         while let Some(message) = self.held.pop_front() {
-            self.send(message).await;
+            let Some((_, sink)) = self.current.as_mut() else {
+                return;
+            };
+            if sink.send(message).await.is_err() {
+                return;
+            }
         }
     }
 
@@ -268,13 +319,25 @@ impl Transport {
     }
 }
 
+// Answers or sends the close frame, so the server sees a clean close.
+fn close_in_background(mut sink: Sink) {
+    tokio::spawn(async move {
+        let _ = timeout(CLOSE_TIMEOUT, sink.close()).await;
+    });
+}
+
 async fn write_pipe(mut out: File, mut lines: mpsc::UnboundedReceiver<Vec<u8>>) {
     while let Some(line) = lines.recv().await {
-        out.write_all(&line)
-            .await
-            .expect("Failed to write to output pipe");
-        out.flush().await.expect("Failed to flush output pipe");
+        if let Err(e) = write_all(&mut out, &line).await {
+            eprintln!("Failed to write to output pipe: {e}");
+            exit(1);
+        }
     }
+}
+
+async fn write_all(out: &mut File, line: &[u8]) -> std::io::Result<()> {
+    out.write_all(line).await?;
+    out.flush().await
 }
 
 fn spawn_reader(id: u64, mut stream: SplitStream<Socket>, tx: mpsc::UnboundedSender<ServerEvent>) {
@@ -318,17 +381,19 @@ fn log_message(message: &Message) {
 // Retries until the server takes the new connection or the deadline passes. A
 // server that answers with anything other than the resumed command has
 // declined, and is not asked again.
-async fn connect_with_retry(url: &Url, headers: &[(String, String)]) -> Option<Socket> {
+async fn connect_with_retry(url: &Url, headers: &[(String, String)]) -> Option<Resumed> {
     let deadline = Instant::now() + RESUME_DEADLINE;
     let mut backoff = RESUME_INITIAL_BACKOFF;
 
     loop {
         let request = build_request(url, headers)?;
-        match timeout(RESUME_ATTEMPT_TIMEOUT, connect_async(request)).await {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(RESUME_ATTEMPT_TIMEOUT.min(left), connect_async(request)).await {
             Ok(Ok((mut socket, _))) => {
-                return match timeout(RESUMED_TIMEOUT, await_resumed(&mut socket)).await {
-                    Ok(true) => Some(socket),
-                    Ok(false) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                return match timeout(RESUMED_TIMEOUT.min(left), await_resumed(&mut socket)).await {
+                    Ok(Some(again)) => Some(Resumed { socket, again }),
+                    Ok(None) => {
                         eprintln!("The server declined the new connection");
                         None
                     }
@@ -350,18 +415,24 @@ async fn connect_with_retry(url: &Url, headers: &[(String, String)]) -> Option<S
     }
 }
 
-// True once the server confirms it moved the runner onto `socket`. The client
-// already has its greeting, so the new connection's isn't passed on.
-async fn await_resumed(socket: &mut Socket) -> bool {
+// Waits for the server to confirm it moved the runner onto `socket`; `None` if
+// it declines. The client already has its greeting, so the new connection's
+// isn't passed on. A request to move again before the confirmation is kept.
+async fn await_resumed(socket: &mut Socket) -> Option<Option<Headers>> {
+    let mut again = None;
     while let Some(Ok(message)) = socket.next().await {
         match message {
             Message::Text(text) if is_command(&text, "connected") => {}
-            Message::Text(text) => return is_command(&text, RESUMED_COMMAND),
+            Message::Text(text) if is_command(&text, RESUMED_COMMAND) => return Some(again),
+            Message::Text(text) => match resume_headers(&text) {
+                Some(headers) => again = Some(headers),
+                None => return None,
+            },
             Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
-            Message::Binary(_) | Message::Close(_) => return false,
+            Message::Binary(_) | Message::Close(_) => return None,
         }
     }
-    false
+    None
 }
 
 fn build_request(url: &Url, headers: &[(String, String)]) -> Option<Request<()>> {
@@ -426,7 +497,7 @@ fn is_command(text: &str, command: &str) -> bool {
 }
 
 // The headers to send with the new connection, when `text` asks for a resume.
-fn resume_headers(text: &str) -> Option<Vec<(String, String)>> {
+fn resume_headers(text: &str) -> Option<Headers> {
     if !is_command(text, RESUME_COMMAND) {
         return None;
     }

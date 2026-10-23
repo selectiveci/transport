@@ -14,6 +14,7 @@ const CONNECTED: &str = r#"{"command":"connected"}"#;
 const RUN_TEST_CASES: &str = r#"{"command":"run_test_cases"}"#;
 const RESUME: &str = r#"{"command":"transport_reconnect","headers":{"x-test":"1"}}"#;
 const RESUMED: &str = r#"{"command":"transport_resumed"}"#;
+const MOVING: &str = r#"{"type":"transport_moving"}"#;
 
 // The two named pipes the transport talks to the client library over.
 struct Pipes {
@@ -223,6 +224,7 @@ async fn connected(
 // Asks the transport to move, and takes the new connection as a server would.
 async fn resume_onto(listener: &TcpListener, old: &mut Accepted) -> Accepted {
     send(&mut old.socket, RESUME).await;
+    assert_eq!(next_text(&mut old.socket).await, MOVING);
     let mut new = accept(listener).await;
     send(&mut new.socket, CONNECTED).await;
     send(&mut new.socket, RESUMED).await;
@@ -366,6 +368,7 @@ async fn holds_pipe_messages_until_the_server_confirms_the_move() {
     let (_pipes, mut child, mut output, mut input, mut first) = connected("hold", &listener).await;
 
     send(&mut first.socket, RESUME).await;
+    assert_eq!(next_text(&mut first.socket).await, MOVING);
     let mut second = accept(&listener).await;
     send(&mut second.socket, CONNECTED).await;
 
@@ -399,7 +402,10 @@ async fn exit_during_a_move_sends_what_is_held_and_stops() {
     let started = std::time::Instant::now();
     write_line(&mut input, "terminating\nexit").await;
 
-    assert_eq!(drain_texts(&mut first.socket).await, vec!["terminating"]);
+    assert_eq!(
+        drain_texts(&mut first.socket).await,
+        vec![MOVING, "terminating"]
+    );
     expect_exit(&mut child, 0).await;
     assert!(
         started.elapsed() < Duration::from_secs(2),
@@ -417,12 +423,14 @@ async fn exits_when_the_server_declines_the_new_connection() {
     send(&mut first.socket, RESUME).await;
     let mut second = accept(&listener).await;
     write_line(&mut input, "held").await;
+    // Let the transport read the line before the server declines.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     send(&mut second.socket, CONNECTED).await;
     send(&mut second.socket, r#"{"command":"close","exit_status":1}"#).await;
 
     // The client reconnects in full; what was held goes out first, and the
     // refusal itself isn't passed on.
-    assert_eq!(drain_texts(&mut first.socket).await, vec!["held"]);
+    assert_eq!(drain_texts(&mut first.socket).await, vec![MOVING, "held"]);
     expect_exit(&mut child, 1).await;
     let mut rest = String::new();
     let _ = timeout(
@@ -464,4 +472,109 @@ async fn reads_every_retired_connection_until_it_ends() {
 async fn expect_quiet_listener(listener: &TcpListener) {
     let early = timeout(Duration::from_millis(300), listener.accept()).await;
     assert!(early.is_err(), "unexpected new connection");
+}
+
+#[tokio::test]
+async fn moves_again_when_asked_before_the_first_move_is_confirmed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_pipes, mut child, _output, mut input, mut first) = connected("again", &listener).await;
+
+    send(&mut first.socket, RESUME).await;
+    assert_eq!(next_text(&mut first.socket).await, MOVING);
+    let mut second = accept(&listener).await;
+    send(&mut second.socket, CONNECTED).await;
+    // The node the new connection landed on is itself being drained.
+    send(&mut second.socket, RESUME).await;
+    send(&mut second.socket, RESUMED).await;
+
+    assert_eq!(next_text(&mut second.socket).await, MOVING);
+    let mut third = accept(&listener).await;
+    send(&mut third.socket, CONNECTED).await;
+    send(&mut third.socket, RESUMED).await;
+
+    write_line(&mut input, "result").await;
+    assert_eq!(next_text(&mut third.socket).await.trim_end(), "result");
+
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn exits_with_failure_when_declined_after_the_old_connection_closed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_pipes, mut child, _output, mut input, mut first) =
+        connected("declined-closed", &listener).await;
+
+    send(&mut first.socket, RESUME).await;
+    assert_eq!(next_text(&mut first.socket).await, MOVING);
+    let mut second = accept(&listener).await;
+    write_line(&mut input, "held").await;
+    first.socket.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    send(&mut second.socket, r#"{"command":"close","exit_status":1}"#).await;
+    expect_exit(&mut child, 1).await;
+}
+
+#[tokio::test]
+async fn a_declined_move_delivers_everything_for_the_client_before_exiting() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_pipes, mut child, mut output, _input, mut first) =
+        connected("declined-output", &listener).await;
+
+    // More than a pipe holds, sent while the client is busy and not reading.
+    let big = format!(
+        r#"{{"command":"bulk","data":"{}"}}"#,
+        "z".repeat(300 * 1024)
+    );
+    send(&mut first.socket, &big).await;
+    send(&mut first.socket, RUN_TEST_CASES).await;
+    send(&mut first.socket, RESUME).await;
+    let mut second = accept(&listener).await;
+    send(&mut second.socket, r#"{"command":"close","exit_status":1}"#).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(read_line(&mut output).await.len(), big.len());
+    assert_eq!(read_line(&mut output).await, RUN_TEST_CASES);
+    expect_exit(&mut child, 1).await;
+}
+
+#[tokio::test]
+async fn exit_with_no_open_connection_waits_for_the_move() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_pipes, mut child, _output, mut input, mut first) =
+        connected("exit-orphaned", &listener).await;
+
+    send(&mut first.socket, RESUME).await;
+    assert_eq!(next_text(&mut first.socket).await, MOVING);
+    let mut second = accept(&listener).await;
+    first.socket.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    write_line(&mut input, "final\nexit").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send(&mut second.socket, CONNECTED).await;
+    send(&mut second.socket, RESUMED).await;
+
+    assert_eq!(drain_texts(&mut second.socket).await, vec!["final"]);
+    expect_exit(&mut child, 0).await;
+}
+
+#[tokio::test]
+async fn answers_the_server_closing_a_replaced_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_pipes, mut child, _output, _input, mut first) =
+        connected("retire-close", &listener).await;
+
+    let _second = resume_onto(&listener, &mut first).await;
+    first.socket.close(None).await.unwrap();
+
+    let reply = timeout(Duration::from_secs(2), first.socket.next())
+        .await
+        .expect("the transport never answered the close");
+    assert!(
+        matches!(reply, Some(Ok(Message::Close(_))) | None),
+        "got {reply:?}"
+    );
+
+    child.kill().await.unwrap();
 }
