@@ -1,5 +1,5 @@
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -256,7 +256,6 @@ enum BlockingCmd {
 pub struct BlockingSession {
     commands: UnboundedSender<BlockingCmd>,
     events: std::sync::Mutex<Receiver<Result<Option<String>, Error>>>,
-    thread: Option<JoinHandle<()>>,
 }
 
 impl BlockingSession {
@@ -281,55 +280,36 @@ impl BlockingSession {
                         return;
                     }
                 };
-                let outgoing = session.outgoing.clone();
                 if ready_tx.send(Ok(())).is_err() {
                     return;
                 }
                 loop {
                     tokio::select! {
-                        incoming = session.incoming.recv() => {
-                            match incoming {
-                                Some(Ok(frame)) => {
-                                    if evt_tx.send(Ok(frame)).is_err() {
-                                        break;
-                                    }
-                                }
-                                Some(Err(err)) => {
-                                    let _ = evt_tx.send(Err(err));
-                                    break;
-                                }
-                                None => {
-                                    let _ = evt_tx.send(Ok(None));
-                                    break;
-                                }
-                            }
-                        }
+                        biased;
                         command = cmd_rx.recv() => {
                             match command {
                                 Some(BlockingCmd::Send(frame, reply)) => {
-                                    let (done_tx, done_rx) = oneshot::channel();
-                                    let queued = outgoing
-                                        .send(OutMsg::Text(frame, done_tx))
-                                        .map_err(|_| Error::new("session closed"));
-                                    let result = match queued {
-                                        Ok(()) => done_rx.await.unwrap_or_else(|_| Err(Error::new("session closed"))),
-                                        Err(err) => Err(err),
-                                    };
-                                    let _ = reply.send(result);
+                                    let _ = reply.send(session.send(&frame).await);
                                 }
                                 Some(BlockingCmd::Close(reply)) => {
-                                    let (done_tx, done_rx) = oneshot::channel();
-                                    let queued = outgoing
-                                        .send(OutMsg::Close(done_tx))
-                                        .map_err(|_| Error::new("session closed"));
-                                    let result = match queued {
-                                        Ok(()) => done_rx.await.unwrap_or_else(|_| Err(Error::new("session closed"))),
-                                        Err(err) => Err(err),
-                                    };
-                                    let _ = reply.send(result);
+                                    let _ = reply.send(session.close().await);
                                     break;
                                 }
                                 None => break,
+                            }
+                        }
+                        incoming = session.recv() => {
+                            match incoming {
+                                Ok(frame) => {
+                                    let closed = frame.is_none();
+                                    if evt_tx.send(Ok(frame)).is_err() || closed {
+                                        break;
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ = evt_tx.send(Err(err));
+                                    break;
+                                }
                             }
                         }
                     }
@@ -340,7 +320,6 @@ impl BlockingSession {
             Ok(Ok(())) => Ok(Self {
                 commands: cmd_tx,
                 events: std::sync::Mutex::new(evt_rx),
-                thread: Some(thread),
             }),
             Ok(Err(err)) => {
                 let _ = thread.join();
@@ -408,7 +387,6 @@ fn wait_reply(reply_rx: Receiver<Result<(), Error>>) -> Result<(), Error> {
 impl Drop for BlockingSession {
     fn drop(&mut self) {
         let _ = self.close();
-        drop(self.thread.take());
     }
 }
 
