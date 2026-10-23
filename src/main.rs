@@ -1,5 +1,7 @@
 #![warn(clippy::perf, clippy::style, clippy::pedantic)]
 
+mod legacy_fifo;
+
 use std::path::PathBuf;
 
 use transport::conformance::{run_suite_with, scenario_names, ConformanceRun, SuiteVia};
@@ -51,9 +53,7 @@ fn dispatch() -> Result<i32, transport::Error> {
         Some("conformance") => conformance_main(args.collect()),
         Some("conformance-client") => conformance_client_main(args.any(|arg| arg == "--via-stdio")),
         Some(url) => match args.next() {
-            Some(runner_id) => Ok(block_on_abandoning_blocking(transport::run_fifo(
-                url, &runner_id,
-            ))),
+            Some(runner_id) => Ok(block_on(legacy_fifo::run(url, &runner_id))),
             None => Err(transport::Error::new(USAGE)),
         },
     }
@@ -238,11 +238,4 @@ fn runtime() -> tokio::runtime::Runtime {
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     runtime().block_on(future)
-}
-
-fn block_on_abandoning_blocking<F: std::future::Future>(future: F) -> F::Output {
-    let runtime = runtime();
-    let output = runtime.block_on(future);
-    runtime.shutdown_background();
-    output
 }

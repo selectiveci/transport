@@ -828,7 +828,7 @@ async fn classify(mut stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, E
         tokio_tungstenite::accept_hdr_async(stream, |request: &Request, response: Response| {
             if gate
                 .reject_budget
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                     current.checked_sub(1)
                 })
                 .is_ok()
