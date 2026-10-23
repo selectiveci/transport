@@ -263,19 +263,19 @@ fn read_stdin() -> Result<Vec<u8>, transport::Error> {
     Ok(body)
 }
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("runtime");
-    runtime.block_on(future)
+        .expect("runtime")
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    runtime().block_on(future)
 }
 
 fn block_on_abandoning_blocking<F: std::future::Future>(future: F) -> F::Output {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
+    let runtime = runtime();
     let output = runtime.block_on(future);
     runtime.shutdown_background();
     output
