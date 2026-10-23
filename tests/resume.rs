@@ -289,6 +289,7 @@ async fn exits_when_the_server_closes_the_connection() {
         read_line(&mut output).await,
         r#"{"command":"close","exit_status":0}"#
     );
+    expect_close_reply(&mut first.socket).await;
     expect_exit(&mut child, 0).await;
 }
 
@@ -568,13 +569,65 @@ async fn answers_the_server_closing_a_replaced_connection() {
     let _second = resume_onto(&listener, &mut first).await;
     first.socket.close(None).await.unwrap();
 
-    let reply = timeout(Duration::from_secs(2), first.socket.next())
+    expect_close_reply(&mut first.socket).await;
+
+    child.kill().await.unwrap();
+}
+
+// After the server sent its close, the transport's reply arrives.
+async fn expect_close_reply(socket: &mut WebSocketStream<TcpStream>) {
+    let reply = timeout(Duration::from_secs(2), socket.next())
         .await
         .expect("the transport never answered the close");
     assert!(
-        matches!(reply, Some(Ok(Message::Close(_))) | None),
+        matches!(reply, Some(Ok(Message::Close(_)))),
         "got {reply:?}"
     );
+}
 
-    child.kill().await.unwrap();
+#[tokio::test]
+async fn a_declined_move_passes_on_what_the_old_connection_already_sent() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_pipes, mut child, mut output, _input, mut first) =
+        connected("declined-queued", &listener).await;
+
+    send(&mut first.socket, RESUME).await;
+    let mut second = accept(&listener).await;
+    // Sent after the move began, racing the decline below.
+    for i in 0..2000 {
+        send(
+            &mut first.socket,
+            &format!(r#"{{"command":"line","n":{i}}}"#),
+        )
+        .await;
+    }
+    send(&mut second.socket, r#"{"command":"close","exit_status":1}"#).await;
+    // The old connection answers the transport's close, as a server would.
+    let _ = drain_texts(&mut first.socket).await;
+
+    for i in 0..2000 {
+        assert_eq!(
+            read_line(&mut output).await,
+            format!(r#"{{"command":"line","n":{i}}}"#)
+        );
+    }
+    expect_exit(&mut child, 1).await;
+}
+
+#[tokio::test]
+async fn exits_promptly_when_the_connection_drops_without_a_close() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_pipes, mut child, mut output, _input, mut first) = connected("dropped", &listener).await;
+
+    send(&mut first.socket, RUN_TEST_CASES).await;
+    drop(first);
+
+    assert_eq!(read_line(&mut output).await, RUN_TEST_CASES);
+    let started = std::time::Instant::now();
+    expect_exit(&mut child, 0).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "took {:?}",
+        started.elapsed()
+    );
 }

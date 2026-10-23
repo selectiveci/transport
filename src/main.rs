@@ -3,7 +3,7 @@
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::exit;
 use std::time::Duration;
 use tokio::fs::{File, OpenOptions};
@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{sleep, timeout, timeout_at, Instant};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Request};
 use tokio_tungstenite::{
@@ -93,6 +93,7 @@ async fn main() {
         retired: HashMap::new(),
         resuming: false,
         exit_requested: false,
+        ended: HashSet::new(),
         held: VecDeque::new(),
         next_id: 0,
         events_tx,
@@ -101,19 +102,27 @@ async fn main() {
     transport.adopt(socket);
 
     loop {
-        tokio::select! {
+        let stop = tokio::select! {
             Some((id, message)) = events_rx.recv() => transport.on_server_event(id, message).await,
             Some(resumed) = resume_rx.recv() => transport.on_resume_finished(resumed).await,
-            item = pipe_rx.recv() => {
+            item = pipe_rx.recv(), if !transport.exit_requested => {
                 // A confirmed move that's already waiting decides which
                 // connection an exit closes.
+                let mut stop = None;
                 if matches!(item, Some(PipeItem::Exit) | None) {
                     if let Ok(resumed) = resume_rx.try_recv() {
-                        transport.on_resume_finished(resumed).await;
+                        stop = transport.on_resume_finished(resumed).await;
                     }
                 }
-                transport.on_pipe_item(item).await;
+                match stop {
+                    Some(code) => Some(code),
+                    None => transport.on_pipe_item(item).await,
+                }
             }
+        };
+
+        if let Some(code) = stop {
+            transport.wind_down(&mut events_rx, code).await;
         }
     }
 }
@@ -140,6 +149,8 @@ struct Transport {
     resuming: bool,
     // The client asked to stop while a resume had no connection to send on.
     exit_requested: bool,
+    // Connections whose reader has reported their end.
+    ended: HashSet<u64>,
     held: VecDeque<Message>,
     next_id: u64,
     events_tx: mpsc::UnboundedSender<ServerEvent>,
@@ -161,7 +172,8 @@ impl Transport {
         self.current.replace((id, sink))
     }
 
-    async fn on_server_event(&mut self, id: u64, message: Option<Message>) {
+    // Handlers return an exit code when the transport should wind down.
+    async fn on_server_event(&mut self, id: u64, message: Option<Message>) -> Option<i32> {
         let live = Some(id) == self.current_id() || self.retired.contains_key(&id);
 
         match message {
@@ -170,35 +182,44 @@ impl Transport {
                     if Some(id) == self.current_id() {
                         self.start_resume(headers).await;
                     }
-                    return;
+                    return None;
                 }
 
                 self.write_line(text.into_bytes());
+                None
             }
-            Some(Message::Binary(data)) if live => self.write_line(data),
-            Some(Message::Close(_)) | None => self.on_connection_ended(id).await,
-            _ => {}
+            Some(Message::Binary(data)) if live => {
+                self.write_line(data);
+                None
+            }
+            Some(Message::Close(_)) | None => {
+                self.ended.insert(id);
+                self.on_connection_ended(id)
+            }
+            _ => None,
         }
     }
 
-    async fn on_connection_ended(&mut self, id: u64) {
+    fn on_connection_ended(&mut self, id: u64) -> Option<i32> {
         if let Some(sink) = self.retired.remove(&id) {
             close_in_background(sink);
-            return;
+            return None;
         }
 
-        if Some(id) == self.current_id() {
-            if !self.resuming {
-                self.finish_output().await;
-                exit(0);
-            }
-
-            // Asked to move and the old connection went first: wait for the
-            // new one rather than exiting.
-            if let Some((_, sink)) = self.current.take() {
-                close_in_background(sink);
-            }
+        if Some(id) != self.current_id() {
+            return None;
         }
+
+        if !self.resuming {
+            return Some(0);
+        }
+
+        // Asked to move and the old connection went first: wait for the
+        // new one rather than exiting.
+        if let Some((_, sink)) = self.current.take() {
+            close_in_background(sink);
+        }
+        None
     }
 
     async fn start_resume(&mut self, headers: Headers) {
@@ -217,9 +238,9 @@ impl Transport {
         });
     }
 
-    async fn on_resume_finished(&mut self, resumed: Option<Resumed>) {
+    async fn on_resume_finished(&mut self, resumed: Option<Resumed>) -> Option<i32> {
         if !self.resuming {
-            return;
+            return None;
         }
         self.resuming = false;
 
@@ -228,11 +249,11 @@ impl Transport {
         let Some(Resumed { socket, again }) = resumed else {
             eprintln!("Failed to move to a new connection. Exiting...");
             self.send_held().await;
-            self.close_current().await;
-            if !self.exit_requested {
-                self.finish_output().await;
+            if self.exit_requested {
+                self.close_current().await;
+                exit(1);
             }
-            exit(1);
+            return Some(1);
         };
 
         if let Some((old_id, old_sink)) = self.adopt(socket) {
@@ -254,17 +275,22 @@ impl Transport {
         if let Some(headers) = again {
             self.start_resume(headers).await;
         }
+        None
     }
 
-    async fn on_pipe_item(&mut self, item: Option<PipeItem>) {
+    async fn on_pipe_item(&mut self, item: Option<PipeItem>) -> Option<i32> {
         match item {
-            Some(PipeItem::Line(message)) if self.resuming => self.held.push_back(message),
+            Some(PipeItem::Line(message)) if self.resuming => {
+                self.held.push_back(message);
+                None
+            }
             Some(PipeItem::Line(message)) => self.send(message).await,
             // The client stops the transport a few seconds after asking, so an
             // exit doesn't wait for a resume: what's held goes out on the
             // connection still open.
             Some(PipeItem::Exit) | None if self.resuming && self.current.is_none() => {
                 self.exit_requested = true;
+                None
             }
             Some(PipeItem::Exit) | None => {
                 self.send_held().await;
@@ -286,15 +312,48 @@ impl Transport {
         }
     }
 
-    async fn send(&mut self, message: Message) {
-        let Some((_, sink)) = self.current.as_mut() else {
-            return;
-        };
+    async fn send(&mut self, message: Message) -> Option<i32> {
+        let (_, sink) = self.current.as_mut()?;
+        (sink.send(message).await.is_err() && !self.resuming).then_some(0)
+    }
 
-        if sink.send(message).await.is_err() && !self.resuming {
-            self.finish_output().await;
-            exit(0);
+    // Closes every connection, passes on what they still deliver (bounded by
+    // the close timeout), writes everything out to the client, then exits.
+    async fn wind_down(
+        &mut self,
+        events: &mut mpsc::UnboundedReceiver<ServerEvent>,
+        code: i32,
+    ) -> ! {
+        let mut open: HashSet<u64> = self.retired.keys().copied().collect();
+        open.extend(self.current_id());
+        open.retain(|id| !self.ended.contains(id));
+
+        self.close_current().await;
+        for sink in self.retired.values_mut() {
+            let _ = timeout(CLOSE_TIMEOUT, sink.close()).await;
         }
+
+        let deadline = Instant::now() + CLOSE_TIMEOUT;
+        while !open.is_empty() {
+            match timeout_at(deadline, events.recv()).await {
+                Ok(Some((id, Some(Message::Text(text))))) if open.contains(&id) => {
+                    if resume_headers(&text).is_none() {
+                        self.write_line(text.into_bytes());
+                    }
+                }
+                Ok(Some((id, Some(Message::Binary(data))))) if open.contains(&id) => {
+                    self.write_line(data);
+                }
+                Ok(Some((id, Some(Message::Close(_)) | None))) => {
+                    open.remove(&id);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        self.finish_output().await;
+        exit(code);
     }
 
     async fn close_current(&mut self) {
