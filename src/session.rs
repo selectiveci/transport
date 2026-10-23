@@ -36,16 +36,11 @@ impl Keepalive {
 
     pub fn parse(interval_ms: Option<&str>, pong_timeout_ms: Option<&str>) -> Self {
         let ping_interval = parse_ms(interval_ms).unwrap_or(DEFAULT_PING_INTERVAL);
-        let mut pong_timeout = parse_ms(pong_timeout_ms).unwrap_or(DEFAULT_PONG_TIMEOUT);
-        if ping_interval.is_zero() {
-            return Self {
-                ping_interval,
-                pong_timeout: Duration::ZERO,
-            };
-        }
-        if pong_timeout.is_zero() {
-            pong_timeout = ping_interval;
-        }
+        let pong_timeout = match parse_ms(pong_timeout_ms) {
+            Some(Duration::ZERO) => ping_interval,
+            Some(timeout) => timeout,
+            None => DEFAULT_PONG_TIMEOUT,
+        };
         Self {
             ping_interval,
             pong_timeout,
@@ -54,11 +49,7 @@ impl Keepalive {
 }
 
 fn parse_ms(value: Option<&str>) -> Option<Duration> {
-    let value = value?;
-    if value.is_empty() {
-        return None;
-    }
-    value.parse::<u64>().ok().map(Duration::from_millis)
+    value?.parse::<u64>().ok().map(Duration::from_millis)
 }
 
 enum OutMsg {
