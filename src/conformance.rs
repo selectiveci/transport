@@ -854,39 +854,33 @@ async fn classify(mut stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, E
         }
         return Ok(Incoming::Fragment(read_http(stream).await?));
     }
-    let uri = Arc::new(Mutex::new(String::new()));
-    let uri_for_cb = Arc::clone(&uri);
-    let budget = Arc::clone(gate);
-    let rejected = Arc::new(AtomicBool::new(false));
-    let rejected_cb = Arc::clone(&rejected);
+    let mut uri = String::new();
+    let mut rejected = false;
     let handshake = tokio_tungstenite::accept_hdr_async(
         stream,
-        move |request: &Request, response: Response| {
-            if budget
+        |request: &Request, response: Response| {
+            if gate
                 .reject_budget
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                     current.checked_sub(1)
                 })
                 .is_ok()
             {
-                rejected_cb.store(true, Ordering::SeqCst);
+                rejected = true;
                 return Err(http::Response::builder()
                     .status(503)
                     .body(Some("Service Unavailable".to_owned()))
                     .expect("503 response"));
             }
-            if let Ok(mut slot) = uri_for_cb.lock() {
-                *slot = request.uri().to_string();
-            }
+            uri = request.uri().to_string();
             Ok(response)
         },
     )
     .await;
-    if rejected.load(Ordering::SeqCst) {
+    if rejected {
         return Ok(Incoming::Rejected);
     }
     let ws = handshake?;
-    let uri = uri.lock().map(|guard| guard.clone()).unwrap_or_default();
     Ok(Incoming::Socket(Live { uri, ws }))
 }
 
