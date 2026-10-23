@@ -764,9 +764,9 @@ impl Player {
         }
         let request_line = captured.header.lines().next().unwrap_or("");
         if !request_line.contains("/test_maps/fragments")
-            || !request_line.contains("run_id=run-1")
-            || !request_line.contains("run_attempt=1")
-            || !request_line.contains("runner_id=runner-1")
+            || query_param(request_line, "run_id") != Some("run-1")
+            || query_param(request_line, "run_attempt") != Some("1")
+            || query_param(request_line, "runner_id") != Some("runner-1")
         {
             return Err(Error::new(format!(
                 "unexpected fragment request line: {request_line}"
@@ -854,6 +854,14 @@ impl Player {
         }
         Ok(())
     }
+}
+
+fn query_param<'a>(request_line: &'a str, key: &str) -> Option<&'a str> {
+    let query = request_line.split_once('?')?.1.split_once(' ')?.0;
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == key).then_some(value)
+    })
 }
 
 fn child_term_target(pid: Option<u32>) -> Result<u32, Error> {
@@ -1143,6 +1151,17 @@ mod tests {
         assert!(child_term_target(None).is_err());
         assert!(child_term_target(Some(0)).is_err());
         assert_eq!(child_term_target(Some(42)).unwrap(), 42);
+        assert_eq!(
+            query_param(
+                "POST /test_maps/fragments?run_id=run-1&run_attempt=1 HTTP/1.1",
+                "run_id"
+            ),
+            Some("run-1")
+        );
+        assert_eq!(
+            query_param("POST /test_maps/fragments?run_id=run-10 HTTP/1.1", "run_id"),
+            Some("run-10")
+        );
     }
 
     #[test]
