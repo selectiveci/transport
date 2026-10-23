@@ -26,13 +26,13 @@ pub fn gzip_bytes(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(encoder.finish()?)
 }
 
-pub fn http_origin(websocket_url: &str) -> Result<String, Error> {
+pub(crate) fn http_origin(websocket_url: &str) -> Result<String, Error> {
     Ok(Url::parse(&ws_to_http(websocket_url))?
         .origin()
         .ascii_serialization())
 }
 
-pub fn fragment_endpoint(
+pub(crate) fn fragment_endpoint(
     host: &str,
     run_id: &str,
     run_attempt: &str,
@@ -55,7 +55,7 @@ pub async fn upload_fragment(upload: &FragmentUpload) -> Result<(), Error> {
     upload_fragment_retry(upload, Duration::from_secs(1)).await
 }
 
-pub async fn upload_fragment_retry(
+pub(crate) async fn upload_fragment_retry(
     upload: &FragmentUpload,
     base_delay: Duration,
 ) -> Result<(), Error> {

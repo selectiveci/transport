@@ -63,7 +63,7 @@ impl SuiteVia {
     }
 }
 
-pub fn scenarios() -> Result<Vec<Scenario>, Error> {
+fn scenarios() -> Result<Vec<Scenario>, Error> {
     const RAW: &[&str] = &[
         include_str!("../conformance/scenarios/happy_two_batches.json"),
         include_str!("../conformance/scenarios/remove_failed.json"),
@@ -210,7 +210,7 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-pub fn idle_duration(ping_interval: Duration) -> Duration {
+fn idle_duration(ping_interval: Duration) -> Duration {
     let scaled = ping_interval.saturating_mul(3);
     if ping_interval >= Duration::from_secs(20) {
         Duration::from_secs(65).max(scaled)

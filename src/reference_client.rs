@@ -127,7 +127,7 @@ pub async fn run(opts: RunOpts) -> i32 {
     }
 }
 
-pub fn retry_delay(failures: u32, fast: bool) -> Duration {
+pub(crate) fn retry_delay(failures: u32, fast: bool) -> Duration {
     if fast {
         Duration::from_millis(0)
     } else {
@@ -135,7 +135,7 @@ pub fn retry_delay(failures: u32, fast: bool) -> Duration {
     }
 }
 
-pub const TERMINATION_GRACE: Duration = Duration::from_millis(250);
+pub(crate) const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 
 fn fast_retries() -> bool {
     std::env::var("SELECTIVE_CONFORMANCE_FAST").ok().as_deref() == Some("1")
@@ -456,7 +456,7 @@ fn result_message(state: &mut State, id: &str) -> Value {
     json!({"type": "test_case_result", "data": data})
 }
 
-pub fn status_for(base: &str, flake: bool, attempt: u32) -> String {
+pub(crate) fn status_for(base: &str, flake: bool, attempt: u32) -> String {
     if flake && attempt >= 2 {
         "passed".to_owned()
     } else {

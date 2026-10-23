@@ -28,7 +28,7 @@ pub fn detect_build_env() -> BuildEnv {
     detect_build_env_at(Path::new("."), |key| std::env::var(key).ok())
 }
 
-pub fn detect_build_env_at(cwd: &Path, var: impl Fn(&str) -> Option<String>) -> BuildEnv {
+pub(crate) fn detect_build_env_at(cwd: &Path, var: impl Fn(&str) -> Option<String>) -> BuildEnv {
     let mut env = BuildEnv {
         api_key: value(&var, "SELECTIVE_API_KEY"),
         host: "wss://app.selective.ci".to_owned(),
@@ -228,7 +228,7 @@ fn provider_from_url(url: &str) -> Option<String> {
     }
 }
 
-pub fn parse_github_slug(url: &str) -> Option<String> {
+pub(crate) fn parse_github_slug(url: &str) -> Option<String> {
     let rest = [
         "git@github.com:",
         "ssh://git@github.com/",
