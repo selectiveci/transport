@@ -77,6 +77,9 @@ pub async fn run(opts: RunOpts) -> i32 {
     };
     let mut state = State {
         fixtures,
+        before_all_seconds: std::env::var("SELECTIVE_CONFORMANCE_BEFORE_ALL_SECONDS")
+            .ok()
+            .and_then(|seconds| seconds.parse().ok()),
         ..State::default()
     };
     let base = match with_default_param(&opts.url, "test_map", "record") {
@@ -155,6 +158,7 @@ fn fast_retries() -> bool {
 #[derive(Default)]
 struct State {
     fixtures: Vec<Fixture>,
+    before_all_seconds: Option<f64>,
     record: bool,
     tree: bool,
     connection_retries: u32,
@@ -352,12 +356,15 @@ async fn close_session(
         .get("exit_status")
         .and_then(Value::as_i64)
         .and_then(|code| i32::try_from(code).ok());
-    let report = json!({
+    let mut report = json!({
         "type": "report_at_finish",
         "data": {
             "connection_retries": state.connection_retries
         }
     });
+    if let Some(seconds) = state.before_all_seconds {
+        report["data"]["seconds_in_before_all_hooks"] = json!(seconds);
+    }
     if send_json(link, &report).await.is_err() {
         return Action::Lost;
     }

@@ -12,6 +12,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
@@ -26,30 +28,66 @@ pub struct Scenario {
     pub requires_record: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_for_languages: Vec<String>,
+    #[serde(default)]
+    pub requires_hook_time: bool,
+    #[serde(default)]
+    pub no_keepalive_env: bool,
     pub steps: Vec<Step>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Step {
-    Send { message: Value },
-    ExpectManifest { tree: bool },
-    ExpectResult { id: String, status: String },
-    ExpectUncollected { id: String },
-    ExpectTerminating { signal: String },
+    Send {
+        message: Value,
+    },
+    ExpectManifest {
+        tree: bool,
+    },
+    ExpectResult {
+        id: String,
+        status: String,
+    },
+    ExpectUncollected {
+        id: String,
+    },
+    ExpectTerminating {
+        signal: String,
+    },
     Drop,
     ExpectReconnect,
-    ExpectFragment { ids: Vec<String> },
-    ExpectReport { connection_retries: u64 },
-    ExpectNoFrame { ms: u64 },
+    ExpectFragment {
+        ids: Vec<String>,
+    },
+    ExpectReport {
+        connection_retries: u64,
+        #[serde(default)]
+        hook_time: bool,
+    },
+    ExpectNoFrame {
+        ms: u64,
+    },
     ArmHoldUpload,
     WaitUpload,
     SignalTerm,
-    ExpectExit { code: i32 },
-    RejectConnections { times: u32 },
+    ExpectExit {
+        code: i32,
+    },
+    RejectConnections {
+        times: u32,
+    },
     Idle,
     IgnorePongs,
-    ExpectOutput { text: String },
+    ExpectOutput {
+        text: String,
+    },
+    Busy {
+        ms: u64,
+    },
+    CloseSocket {
+        #[serde(default)]
+        code: Option<u16>,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -94,6 +132,11 @@ fn scenarios() -> Result<Vec<Scenario>, Error> {
         include_str!("../../../conformance/scenarios/idle_keepalive.json"),
         include_str!("../../../conformance/scenarios/pong_timeout.json"),
         include_str!("../../../conformance/scenarios/print_commands.json"),
+        include_str!("../../../conformance/scenarios/busy_server.json"),
+        include_str!("../../../conformance/scenarios/close_frame.json"),
+        include_str!("../../../conformance/scenarios/reconnect_then_going_away.json"),
+        include_str!("../../../conformance/scenarios/retries_across_reconnects.json"),
+        include_str!("../../../conformance/scenarios/group_hook_time.json"),
     ];
     RAW.iter()
         .map(|raw| serde_json::from_str(raw).map_err(Error::from))
@@ -118,6 +161,10 @@ pub struct ConformanceRun<'a> {
 
 pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), Error> {
     let pace = conformance_pace();
+    let before_all_seconds = run
+        .fixtures
+        .before_all_seconds()
+        .or(run.client.is_none().then_some(BUILTIN_BEFORE_ALL_SECONDS));
     let mut failures = Vec::new();
     let mut trials = 0usize;
     for scenario in scenarios()? {
@@ -154,6 +201,7 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
                 fixture_file: run.fixture_file,
                 transport: run.transport,
                 fixtures: &run.fixtures,
+                before_all_seconds,
                 pace,
             };
             let label = if run.client.is_some() {
@@ -196,9 +244,12 @@ struct Trial<'a> {
     client: Option<&'a str>,
     fixture_file: Option<&'a Path>,
     fixtures: &'a FixtureIds,
+    before_all_seconds: Option<f64>,
     transport: Option<&'a Path>,
     pace: Pace,
 }
+
+const BUILTIN_BEFORE_ALL_SECONDS: f64 = 0.2;
 
 const RUNNER_ENV: &[(&str, &str)] = &[
     ("SELECTIVE_PLATFORM", "conformance"),
@@ -316,11 +367,59 @@ fn uses_keepalive(scenario: &Scenario) -> bool {
         .any(|step| matches!(step, Step::Idle | Step::IgnorePongs))
 }
 
-async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
+fn not_applicable(trial: &Trial<'_>) -> Option<&'static str> {
     if trial.client.is_none() && matches!(trial.via, Via::Fifo) && uses_keepalive(trial.scenario) {
-        return Ok(Played::NotApplicable(
-            "the transport's FIFO mode has no keepalive".to_owned(),
-        ));
+        return Some("the transport's FIFO mode has no keepalive");
+    }
+    if trial.scenario.requires_hook_time && trial.before_all_seconds.is_none() {
+        return Some("the fixture file declares no before_all_seconds");
+    }
+    None
+}
+
+fn client_env(command: &mut Command, trial: &Trial<'_>, url: &str, host: &str) {
+    command
+        .env("SELECTIVE_TRANSPORT_URL", url)
+        .env("SELECTIVE_API_KEY", "conformance-key")
+        .env("SELECTIVE_HOST", host)
+        .env("SELECTIVE_RUN_ID", "run-1")
+        .env("SELECTIVE_RUN_ATTEMPT", "1")
+        .env("SELECTIVE_RUNNER_ID", "runner-1")
+        .env("SELECTIVE_TEST_MAP_UPLOAD_KEY", "conformance-key")
+        .env("SELECTIVE_CONFORMANCE_FAST", "1");
+    if trial.scenario.no_keepalive_env {
+        command
+            .env_remove("SELECTIVE_WS_PING_INTERVAL_MS")
+            .env_remove("SELECTIVE_WS_PONG_TIMEOUT_MS");
+    } else {
+        command
+            .env(
+                "SELECTIVE_WS_PING_INTERVAL_MS",
+                trial.pace.ping.as_millis().to_string(),
+            )
+            .env(
+                "SELECTIVE_WS_PONG_TIMEOUT_MS",
+                trial.pace.pong.as_millis().to_string(),
+            );
+    }
+    if let Some(path) = trial.fixture_file {
+        command.env("SELECTIVE_CONFORMANCE_FIXTURE_IDS", path);
+    }
+    if let (None, Some(seconds)) = (trial.client, trial.before_all_seconds) {
+        command.env(
+            "SELECTIVE_CONFORMANCE_BEFORE_ALL_SECONDS",
+            seconds.to_string(),
+        );
+    }
+    if let Some(path) = trial.transport {
+        command.env("SELECTIVE_TRANSPORT", path);
+    }
+    command.envs(runner_env_defaults(|key| std::env::var(key).ok()));
+}
+
+async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
+    if let Some(why) = not_applicable(trial) {
+        return Ok(Played::NotApplicable(why.to_owned()));
     }
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -338,33 +437,11 @@ async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
     });
     let logs = Arc::new(Mutex::new(String::new()));
     let mut command = client_command(trial)?;
+    client_env(&mut command, trial, &url, &format!("ws://{addr}"));
     command
-        .env("SELECTIVE_TRANSPORT_URL", &url)
-        .env("SELECTIVE_API_KEY", "conformance-key")
-        .env("SELECTIVE_HOST", format!("ws://{addr}"))
-        .env("SELECTIVE_RUN_ID", "run-1")
-        .env("SELECTIVE_RUN_ATTEMPT", "1")
-        .env("SELECTIVE_RUNNER_ID", "runner-1")
-        .env("SELECTIVE_TEST_MAP_UPLOAD_KEY", "conformance-key")
-        .env("SELECTIVE_CONFORMANCE_FAST", "1")
-        .env(
-            "SELECTIVE_WS_PING_INTERVAL_MS",
-            trial.pace.ping.as_millis().to_string(),
-        )
-        .env(
-            "SELECTIVE_WS_PONG_TIMEOUT_MS",
-            trial.pace.pong.as_millis().to_string(),
-        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if let Some(path) = trial.fixture_file {
-        command.env("SELECTIVE_CONFORMANCE_FIXTURE_IDS", path);
-    }
-    if let Some(path) = trial.transport {
-        command.env("SELECTIVE_TRANSPORT", path);
-    }
-    command.envs(runner_env_defaults(|key| std::env::var(key).ok()));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let accept_gate = Arc::clone(&gate);
     tokio::spawn(async move {
@@ -393,8 +470,10 @@ async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
         language: None,
         gate,
         fixtures: trial.fixtures.clone(),
+        before_all_seconds: trial.before_all_seconds,
+        connections: 0,
         ping_interval: trial.pace.ping,
-        ignore_pongs: false,
+        reading: Reading::Open,
         pings: 0,
         frames_end_in_newline: trial.client.is_none() && !matches!(trial.via, Via::Direct),
     };
@@ -464,6 +543,12 @@ enum Played {
     NotApplicable(String),
 }
 
+enum Reading {
+    Open,
+    UntilReconnect,
+    Busy,
+}
+
 struct Player {
     incoming: tokio::sync::mpsc::UnboundedReceiver<Incoming>,
     current: Option<Live>,
@@ -475,8 +560,10 @@ struct Player {
     language: Option<String>,
     gate: Arc<Gate>,
     fixtures: FixtureIds,
+    before_all_seconds: Option<f64>,
+    connections: u32,
     ping_interval: Duration,
-    ignore_pongs: bool,
+    reading: Reading,
     pings: u32,
     frames_end_in_newline: bool,
 }
@@ -569,9 +656,16 @@ impl Player {
             }
             Step::ExpectReconnect => self.expect_reconnect().await,
             Step::ExpectFragment { ids } => self.expect_fragment(ids).await,
-            Step::ExpectReport { connection_retries } => {
+            Step::ExpectReport {
+                connection_retries,
+                hook_time,
+            } => {
                 let frame = self.next_frame().await?;
-                expect_report(&frame, *connection_retries)
+                expect_report(&frame, *connection_retries)?;
+                match (hook_time, self.before_all_seconds) {
+                    (true, Some(seconds)) => expect_hook_time(&frame, seconds),
+                    _ => Ok(()),
+                }
             }
             Step::ExpectNoFrame { ms } => self.expect_no_frame(*ms).await,
             Step::ArmHoldUpload => {
@@ -584,11 +678,57 @@ impl Player {
             Step::RejectConnections { times } => self.reject_connections(*times).await,
             Step::Idle => self.idle().await,
             Step::IgnorePongs => {
-                self.ignore_pongs = true;
+                self.reading = Reading::UntilReconnect;
                 Ok(())
             }
             Step::ExpectOutput { text } => self.expect_output(text).await,
+            Step::Busy { ms } => self.busy_for(*ms).await,
+            Step::CloseSocket { code } => self.close_socket(*code).await,
         }
+    }
+
+    async fn busy_for(&mut self, ms: u64) -> Result<(), Error> {
+        let connections = self.connections;
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        let before = std::mem::replace(&mut self.reading, Reading::Busy);
+        let outcome = loop {
+            if Instant::now() >= deadline {
+                break Ok(());
+            }
+            if let Err(err) = self.pump(deadline).await {
+                break Err(err);
+            }
+            if self.connections != connections {
+                break Err(Error::new(
+                    "the client reconnected while the server was busy",
+                ));
+            }
+        };
+        self.reading = before;
+        outcome
+    }
+
+    async fn close_socket(&mut self, code: Option<u16>) -> Result<(), Error> {
+        let mut live = self
+            .current
+            .take()
+            .ok_or_else(|| Error::new("no websocket to close"))?;
+        let frame = code.map(|code| CloseFrame {
+            code: CloseCode::from(code),
+            reason: "".into(),
+        });
+        live.ws.send(Message::Close(frame)).await?;
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(Ok(message)) = live.ws.next().await {
+                    if matches!(message, Message::Close(_)) {
+                        break;
+                    }
+                }
+            })
+            .await;
+        });
+        Ok(())
     }
 
     async fn expect_output(&mut self, text: &str) -> Result<(), Error> {
@@ -684,7 +824,7 @@ impl Player {
         if remaining.is_zero() {
             return Ok(None);
         }
-        let read_allowed = self.current.is_some() && !self.ignore_pongs;
+        let read_allowed = self.current.is_some() && matches!(self.reading, Reading::Open);
         let event = tokio::select! {
             next = self.incoming.recv() => Event::Accepted(next),
             message = recv_live(self.current.as_mut()), if read_allowed => Event::Socket(message),
@@ -732,7 +872,7 @@ impl Player {
             )));
         }
         if self.saw_connection {
-            self.ignore_pongs = false;
+            self.reading = Reading::Open;
         } else {
             if socket.uri.contains("reconnect=true") {
                 return Err(Error::new(
@@ -743,6 +883,7 @@ impl Player {
             self.test_map = query_value(&socket.uri, "test_map");
             self.language = query_value(&socket.uri, "language");
         }
+        self.connections += 1;
         self.current = Some(socket);
         Ok(())
     }
@@ -1151,6 +1292,25 @@ fn expect_report(frame: &Value, connection_retries: u64) -> Result<(), Error> {
     }
 }
 
+fn expect_hook_time(frame: &Value, declared: f64) -> Result<(), Error> {
+    let total: f64 = frame
+        .get("data")
+        .and_then(Value::as_object)
+        .map_or(0.0, |data| {
+            data.iter()
+                .filter(|(key, _)| key.starts_with("seconds_in_") && key.ends_with("_hooks"))
+                .filter_map(|(_, value)| value.as_f64())
+                .sum()
+        });
+    if total >= declared * 0.5 && total <= declared * 5.0 + 1.0 {
+        Ok(())
+    } else {
+        Err(Error::new(format!(
+            "group hooks took {total}s by the report, but the fixture's before-all hook sleeps {declared}s"
+        )))
+    }
+}
+
 fn connect_metadata_is_json(uri: &str) -> bool {
     query_value(uri, "metadata").is_some_and(|value| serde_json::from_str::<Value>(&value).is_ok())
 }
@@ -1381,6 +1541,31 @@ mod tests {
             .map(|scenario| scenario.name.clone())
             .collect();
         assert_eq!(keepalive, vec!["idle_keepalive", "pong_timeout"]);
+    }
+
+    #[test]
+    fn hook_time_must_be_on_the_scale_of_the_declared_sleep() {
+        let report = |data: Value| serde_json::json!({"type": "report_at_finish", "data": data});
+        for data in [
+            serde_json::json!({"seconds_in_before_all_hooks": 0.21}),
+            serde_json::json!({"seconds_in_beforeclass_all_hooks": 0.15, "seconds_in_afterclass_all_hooks": 0.0}),
+            serde_json::json!({"seconds_in_setup_all_all_hooks": 0.4, "connection_retries": 3}),
+        ] {
+            expect_hook_time(&report(data.clone()), 0.2)
+                .unwrap_or_else(|err| panic!("{data}: {err}"));
+        }
+        for data in [
+            serde_json::json!({}),
+            serde_json::json!({"seconds_in_before_all_hooks": 0.0}),
+            serde_json::json!({"seconds_in_before_all_hooks": "0.2"}),
+            serde_json::json!({"seconds_in_before_all_hooks": 200}),
+            serde_json::json!({"before_all": 0.2}),
+        ] {
+            assert!(
+                expect_hook_time(&report(data.clone()), 0.2).is_err(),
+                "{data}"
+            );
+        }
     }
 
     #[test]
