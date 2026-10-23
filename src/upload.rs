@@ -27,17 +27,9 @@ pub fn gzip_bytes(bytes: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 pub fn http_origin(websocket_url: &str) -> Result<String, Error> {
-    let converted = ws_to_http(websocket_url);
-    let url = Url::parse(&converted)?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| Error::new("websocket url has no host"))?;
-    let mut origin = format!("{}://{}", url.scheme(), host);
-    if let Some(port) = url.port() {
-        origin.push(':');
-        origin.push_str(&port.to_string());
-    }
-    Ok(origin)
+    Ok(Url::parse(&ws_to_http(websocket_url))?
+        .origin()
+        .ascii_serialization())
 }
 
 pub fn fragment_endpoint(
@@ -49,7 +41,7 @@ pub fn fragment_endpoint(
     let base = if host.starts_with("ws://") || host.starts_with("wss://") {
         http_origin(host)?
     } else {
-        ws_to_http(host).trim_end_matches('/').to_owned()
+        host.trim_end_matches('/').to_owned()
     };
     let mut url = Url::parse(&format!("{base}/test_maps/fragments"))?;
     url.query_pairs_mut()
@@ -145,9 +137,6 @@ pub fn split_fragment_stdin(raw: &[u8]) -> Result<(Option<Value>, Vec<u8>), Erro
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     let payload: Value = serde_json::from_slice(line)
         .map_err(|err| Error::new(format!("upload command payload is not JSON: {err}")))?;
-    if !payload.is_object() {
-        return Err(Error::new("upload command payload must be a JSON object"));
-    }
     if rest.is_empty() {
         return Err(Error::new(
             "--upload-fragment expected a gzip body after the command payload",
