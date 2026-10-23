@@ -137,39 +137,30 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
         }
         let mut scenario = scenario;
         apply_fixtures(&mut scenario, &run.fixtures)?;
-        if let Some(client) = run.client {
+        let vias = if run.client.is_some() {
+            vec![Via::Direct]
+        } else {
+            run.via.list()
+        };
+        for via in vias {
+            trials += 1;
             let trial = Trial {
                 bin,
                 scenario: &scenario,
-                via: Via::Direct,
-                client: Some(client),
+                via,
+                client: run.client,
                 fixture_file: run.fixture_file,
                 fixtures: &run.fixtures,
                 pace,
             };
-            trials += 1;
+            let label = if run.client.is_some() {
+                "client"
+            } else {
+                via_name(via)
+            };
             match run_one(&trial).await {
-                Ok(()) => eprintln!("ok {} client", scenario.name),
-                Err(err) => failures.push(format!("{} client: {err}", scenario.name)),
-            }
-        } else {
-            for via in run.via.list() {
-                trials += 1;
-                let trial = Trial {
-                    bin,
-                    scenario: &scenario,
-                    via,
-                    client: None,
-                    fixture_file: run.fixture_file,
-                    fixtures: &run.fixtures,
-                    pace,
-                };
-                match run_one(&trial).await {
-                    Ok(()) => eprintln!("ok {} {}", scenario.name, via_name(via)),
-                    Err(err) => {
-                        failures.push(format!("{} {}: {err}", scenario.name, via_name(via)));
-                    }
-                }
+                Ok(()) => eprintln!("ok {} {label}", scenario.name),
+                Err(err) => failures.push(format!("{} {label}: {err}", scenario.name)),
             }
         }
     }
