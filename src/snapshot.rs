@@ -45,7 +45,9 @@ fn head_sha(root: &Path) -> Option<String> {
 }
 
 fn prefix_for(root: &Path, cwd: &Path) -> String {
-    let Ok(rest) = cwd.strip_prefix(root) else {
+    let root = resolved(root);
+    let cwd = resolved(cwd);
+    let Ok(rest) = cwd.strip_prefix(&root) else {
         return String::new();
     };
     if rest.as_os_str().is_empty() {
@@ -60,6 +62,10 @@ fn prefix_for(root: &Path, cwd: &Path) -> String {
         prefix.push('/');
     }
     prefix
+}
+
+fn resolved(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn committed_files(root: &Path) -> Option<Map<String, Value>> {
@@ -274,6 +280,26 @@ mod tests {
         git_cmd(&root, &["commit", "-m", "readme"]);
         let tree = snapshot_tree(&nested).unwrap();
         assert_eq!(tree.prefix, "services/api/");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_prefix_follows_a_symlinked_checkout() {
+        let root = init_repo();
+        let nested = root.join("services").join("api");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("README"), b"root\n").unwrap();
+        git_cmd(&root, &["add", "README"]);
+        git_cmd(&root, &["commit", "-m", "readme"]);
+        let link_dir =
+            std::env::temp_dir().join(format!("transport-snapshot-link-{}", std::process::id()));
+        fs::create_dir_all(&link_dir).unwrap();
+        let link = link_dir.join("repo");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let tree = snapshot_tree(&link.join("services").join("api")).unwrap();
+        assert_eq!(tree.prefix, "services/api/");
+        let _ = fs::remove_dir_all(&link_dir);
         let _ = fs::remove_dir_all(&root);
     }
 
