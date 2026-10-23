@@ -6,13 +6,23 @@ rust-version = "1.91"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+name = "transport"
+path = "src/lib.rs"
+
 [dependencies]
 tokio = { version = "1.28.0", features = ["full"] }
 futures-util = "0.3.15"
 url = "2.2"
+http = "0.2"
 tungstenite = "0.19"
 tokio-tungstenite = { version = "0.19", features = ["rustls-tls-native-roots"] }
-serde_json = "1"
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = { version = "1.0.128", features = ["preserve_order"] }
+reqwest = { version = "0.12.8", default-features = false, features = ["rustls-tls-native-roots"] }
+flate2 = { version = "1.0.34", default-features = false, features = ["rust_backend"] }
+shell-words = "1.1.1"
 
 [profile.release]
 strip = true
+codegen-units = 1

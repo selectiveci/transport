@@ -1,0 +1,38 @@
+{
+  "name": "pong_timeout",
+  "steps": [
+    {
+      "op": "send",
+      "message": {
+        "command": "connected"
+      }
+    },
+    {
+      "op": "ignore_pongs"
+    },
+    {
+      "op": "expect_reconnect"
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "connected"
+      }
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "close",
+        "exit_status": 0
+      }
+    },
+    {
+      "op": "expect_report",
+      "connection_retries": 1
+    },
+    {
+      "op": "expect_exit",
+      "code": 0
+    }
+  ]
+}

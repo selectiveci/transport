@@ -1,0 +1,997 @@
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
+use url::Url;
+
+use crate::fixtures::FixtureIds;
+use transport::session::{PollFrame, Session};
+use transport::snapshot_tree;
+use transport::Error;
+use transport::{gzip_bytes, upload_fragment, FragmentUpload};
+
+const FILE_PATH: &str = "tests/example.py";
+
+struct Fixture {
+    id: String,
+    status: &'static str,
+    line: i64,
+    flake: bool,
+}
+
+fn load_fixtures() -> Result<Vec<Fixture>, Error> {
+    let ids = match std::env::var("SELECTIVE_CONFORMANCE_FIXTURE_IDS") {
+        Ok(path) if !path.is_empty() => FixtureIds::load(Path::new(&path))?,
+        _ => FixtureIds::default(),
+    };
+    Ok([
+        ("pass", "passed", 1, false),
+        ("fail", "failed", 2, false),
+        ("pending", "pending", 3, false),
+        ("flaky", "failed", 4, true),
+    ]
+    .into_iter()
+    .map(|(role, status, line, flake)| Fixture {
+        id: ids.id(role),
+        status,
+        line,
+        flake,
+    })
+    .collect())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Via {
+    Direct,
+    Stdio,
+    Fifo,
+}
+
+pub struct RunOpts {
+    pub url: String,
+    pub via: Via,
+    pub transport: Option<PathBuf>,
+    pub catch_signals: bool,
+}
+
+pub async fn run(opts: RunOpts) -> i32 {
+    let (tx, rx) = watch::channel(None);
+    if opts.catch_signals {
+        tokio::spawn(async move {
+            if let Some(signal) = wait_for_signal().await {
+                let _ = tx.send(Some(signal));
+            }
+        });
+    }
+    let fixtures = match load_fixtures() {
+        Ok(fixtures) => fixtures,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    let mut state = State {
+        fixtures,
+        before_all_seconds: std::env::var("SELECTIVE_CONFORMANCE_BEFORE_ALL_SECONDS")
+            .ok()
+            .and_then(|seconds| seconds.parse().ok()),
+        ..State::default()
+    };
+    let base = match with_default_param(&opts.url, "test_map", "record") {
+        Ok(url) => url,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    let mut failures: u32 = 0;
+    let mut reconnect = false;
+    loop {
+        if let Some(signal) = signal_now(&rx) {
+            return finish_signal(&mut Link::Closed, &state, signal, None).await;
+        }
+        let url = if reconnect {
+            match with_reconnect(&base) {
+                Ok(url) => url,
+                Err(err) => {
+                    eprintln!("{err}");
+                    return 1;
+                }
+            }
+        } else {
+            base.clone()
+        };
+        let mut link = match Link::open(&url, opts.via, opts.transport.as_deref()).await {
+            Ok(link) => link,
+            Err(err) => {
+                failures += 1;
+                eprintln!("connect failed ({failures}): {err}");
+                if failures > 10 {
+                    return 1;
+                }
+                tokio::time::sleep(retry_delay(failures, fast_retries())).await;
+                reconnect = true;
+                continue;
+            }
+        };
+        match drive(&mut link, &mut state, &opts.url, &rx).await {
+            Drive::Finished(code) => return code,
+            Drive::Signal(signal, exit_status) => {
+                return finish_signal(&mut link, &state, signal, exit_status).await;
+            }
+            Drive::Lost => {
+                failures += 1;
+                state.connection_retries = failures;
+                if failures > 10 {
+                    eprintln!("giving up after {failures} connection failures");
+                    return 1;
+                }
+                tokio::time::sleep(retry_delay(failures, fast_retries())).await;
+                reconnect = true;
+            }
+            Drive::Reconnect => {
+                reconnect = true;
+            }
+        }
+    }
+}
+
+pub(crate) fn retry_delay(failures: u32, fast: bool) -> Duration {
+    if fast {
+        Duration::from_millis(0)
+    } else {
+        Duration::from_secs(u64::from(failures.min(4)))
+    }
+}
+
+pub(crate) const TERMINATION_GRACE: Duration = Duration::from_millis(250);
+
+fn fast_retries() -> bool {
+    std::env::var("SELECTIVE_CONFORMANCE_FAST").ok().as_deref() == Some("1")
+}
+
+#[derive(Default)]
+struct State {
+    fixtures: Vec<Fixture>,
+    before_all_seconds: Option<f64>,
+    record: bool,
+    tree: bool,
+    connection_retries: u32,
+    attempts: HashMap<String, u32>,
+    results: HashMap<String, String>,
+    traced: BTreeSet<String>,
+}
+
+enum Drive {
+    Finished(i32),
+    Lost,
+    Reconnect,
+    Signal(&'static str, Option<i32>),
+}
+
+async fn drive(
+    link: &mut Link,
+    state: &mut State,
+    base_url: &str,
+    signals: &watch::Receiver<Option<&'static str>>,
+) -> Drive {
+    let mut queued = VecDeque::new();
+    match wait_connected(link, &mut queued, signals).await {
+        Ok(()) => {}
+        Err(WaitFail::Lost) => return Drive::Lost,
+        Err(WaitFail::Timeout) => return Drive::Finished(1),
+        Err(WaitFail::Signal(signal)) => return Drive::Signal(signal, None),
+        Err(WaitFail::Unparseable(frame)) => return Drive::Finished(unparseable(&frame)),
+    }
+    loop {
+        let command = if let Some(command) = queued.pop_front() {
+            command
+        } else {
+            match recv_frame(link, signals).await {
+                FrameIn::Value(value) => value,
+                FrameIn::Lost => return Drive::Lost,
+                FrameIn::Signal(signal) => return Drive::Signal(signal, None),
+                FrameIn::Unparseable(frame) => return Drive::Finished(unparseable(&frame)),
+            }
+        };
+        match dispatch(link, state, base_url, signals, command, &mut queued).await {
+            Action::Continue => {}
+            Action::Lost => return Drive::Lost,
+            Action::Reconnect => return Drive::Reconnect,
+            Action::Exit(code) => return Drive::Finished(code),
+            Action::Signal(signal, exit_status) => return Drive::Signal(signal, exit_status),
+        }
+    }
+}
+
+enum WaitFail {
+    Lost,
+    Timeout,
+    Signal(&'static str),
+    Unparseable(String),
+}
+
+fn unparseable(frame: &str) -> i32 {
+    eprintln!("Selective sent a message this runner could not parse: {frame}");
+    1
+}
+
+async fn wait_connected(
+    link: &mut Link,
+    queued: &mut VecDeque<Value>,
+    signals: &watch::Receiver<Option<&'static str>>,
+) -> Result<(), WaitFail> {
+    let deadline = tokio::time::Instant::now() + CONNECTED_TIMEOUT;
+    loop {
+        if let Some(signal) = signal_now(signals) {
+            return Err(WaitFail::Signal(signal));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            eprintln!("timed out waiting for connected");
+            return Err(WaitFail::Timeout);
+        }
+        match tokio::time::timeout(remaining, recv_frame(link, signals)).await {
+            Ok(FrameIn::Value(value)) => {
+                if command_name(&value) == "connected" {
+                    return Ok(());
+                }
+                queued.push_back(value);
+            }
+            Ok(FrameIn::Lost) => return Err(WaitFail::Lost),
+            Ok(FrameIn::Signal(signal)) => return Err(WaitFail::Signal(signal)),
+            Ok(FrameIn::Unparseable(frame)) => return Err(WaitFail::Unparseable(frame)),
+            Err(_) => {
+                eprintln!("timed out waiting for connected");
+                return Err(WaitFail::Timeout);
+            }
+        }
+    }
+}
+
+enum Action {
+    Continue,
+    Lost,
+    Reconnect,
+    Exit(i32),
+    Signal(&'static str, Option<i32>),
+}
+
+async fn dispatch(
+    link: &mut Link,
+    state: &mut State,
+    base_url: &str,
+    signals: &watch::Receiver<Option<&'static str>>,
+    command: Value,
+    queued: &mut VecDeque<Value>,
+) -> Action {
+    match command_name(&command) {
+        "configure_test_map" => {
+            if command.get("record").and_then(Value::as_bool) == Some(true) {
+                state.record = true;
+            }
+            if command.get("tree").and_then(Value::as_bool) == Some(true) {
+                state.tree = true;
+            }
+            Action::Continue
+        }
+        "test_manifest" => match send_json(link, &manifest(state)).await {
+            Ok(()) => Action::Continue,
+            Err(_) => Action::Lost,
+        },
+        "run_test_cases" => {
+            let ids = command
+                .get("test_case_ids")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for id in ids {
+                let Some(id) = id.as_str() else {
+                    continue;
+                };
+                let result = result_message(state, id);
+                if send_json(link, &result).await.is_err() {
+                    return Action::Lost;
+                }
+                remember(
+                    state,
+                    id,
+                    result["data"]["status"].as_str().unwrap_or("passed"),
+                );
+                match drain(link, queued) {
+                    Action::Continue => {}
+                    other => return other,
+                }
+            }
+            Action::Continue
+        }
+        "remove_failed_test_case_result" => {
+            if let Some(id) = command.get("test_case_id").and_then(Value::as_str) {
+                state.results.remove(id);
+            }
+            Action::Continue
+        }
+        "reconnect" => Action::Reconnect,
+        "close" => close_session(link, state, base_url, signals, &command).await,
+        "print_notice" | "print_message" => {
+            if let Some(message) = command.get("message").and_then(Value::as_str) {
+                println!("{message}");
+            }
+            Action::Continue
+        }
+        _ => Action::Continue,
+    }
+}
+
+fn drain(link: &mut Link, queued: &mut VecDeque<Value>) -> Action {
+    drain_polled(|| link.poll(), queued)
+}
+
+fn drain_polled(
+    mut poll: impl FnMut() -> Result<PollFrame, Error>,
+    queued: &mut VecDeque<Value>,
+) -> Action {
+    loop {
+        match poll() {
+            Ok(PollFrame::Empty) => return Action::Continue,
+            Ok(PollFrame::Closed) | Err(_) => return Action::Lost,
+            Ok(PollFrame::Frame(frame)) => match parse_frame(&frame) {
+                Some(value) => queued.push_back(value),
+                None => return Action::Exit(unparseable(&frame)),
+            },
+        }
+    }
+}
+
+async fn close_session(
+    link: &mut Link,
+    state: &mut State,
+    base_url: &str,
+    signals: &watch::Receiver<Option<&'static str>>,
+    command: &Value,
+) -> Action {
+    if let Some(message) = command.get("message").and_then(Value::as_str) {
+        if !message.is_empty() {
+            println!("{message}");
+        }
+    }
+    let override_status = command
+        .get("exit_status")
+        .and_then(Value::as_i64)
+        .and_then(|code| i32::try_from(code).ok());
+    let mut report = json!({
+        "type": "report_at_finish",
+        "data": {
+            "connection_retries": state.connection_retries
+        }
+    });
+    if let Some(seconds) = state.before_all_seconds {
+        report["data"]["seconds_in_before_all_hooks"] = json!(seconds);
+    }
+    if send_json(link, &report).await.is_err() {
+        return Action::Lost;
+    }
+    if state.record && !state.traced.is_empty() {
+        if let Some(signal) = signal_now(signals) {
+            return Action::Signal(signal, override_status);
+        }
+        let mut signals = signals.clone();
+        tokio::select! {
+            biased;
+            Some(signal) = next_signal(&mut signals) => {
+                return Action::Signal(signal, override_status);
+            }
+            result = upload_traces(state, base_url) => {
+                if let Err(err) = result {
+                    eprintln!("Selective could not upload this runner's test map ({err}). Its tests will run on the next build rather than be skipped.");
+                }
+            }
+        }
+    }
+    let _ = link.close().await;
+    Action::Exit(override_status.unwrap_or_else(|| framework_status(state)))
+}
+
+async fn finish_signal(
+    link: &mut Link,
+    state: &State,
+    signal: &'static str,
+    exit_status: Option<i32>,
+) -> i32 {
+    let frame = json!({"type": "terminating", "data": {"signal": signal}});
+    let _ = send_json(link, &frame).await;
+    tokio::time::sleep(TERMINATION_GRACE).await;
+    let _ = link.close().await;
+    exit_status.unwrap_or_else(|| framework_status(state))
+}
+
+fn framework_status(state: &State) -> i32 {
+    i32::from(state.results.values().any(|status| status == "failed"))
+}
+
+fn remember(state: &mut State, id: &str, status: &str) {
+    state.results.insert(id.to_owned(), status.to_owned());
+    if state.record {
+        state.traced.insert(id.to_owned());
+    }
+}
+
+fn manifest(state: &State) -> Value {
+    let test_cases: Vec<Value> = state
+        .fixtures
+        .iter()
+        .map(|case| {
+            json!({
+                "id": case.id,
+                "file_path": FILE_PATH,
+                "line_number": case.line,
+                "description": case.id,
+                "full_description": case.id,
+                "run_time": 0.0
+            })
+        })
+        .collect();
+    let mut data = json!({ "test_cases": test_cases });
+    if state.tree {
+        if let Some(tree) = snapshot_tree(Path::new(".")) {
+            if let Ok(value) = serde_json::to_value(tree) {
+                data["test_map_tree"] = value;
+            }
+        }
+    }
+    json!({"type": "test_manifest", "data": data})
+}
+
+fn result_message(state: &mut State, id: &str) -> Value {
+    let attempt = state.attempts.entry(id.to_owned()).or_insert(0);
+    *attempt += 1;
+    let attempt = *attempt;
+    let fixture = state.fixtures.iter().find(|case| case.id == id);
+    let collected = fixture.is_some();
+    let (status, line, failure_message) = match fixture {
+        Some(case) => (
+            status_for(case.status, case.flake, attempt),
+            case.line,
+            "assertion failed",
+        ),
+        None => ("failed".to_owned(), 1, "not collected"),
+    };
+    let mut data = json!({
+        "id": clean(id),
+        "description": clean(id),
+        "full_description": clean(id),
+        "status": status,
+        "file_path": FILE_PATH,
+        "line_number": line,
+        "run_time": 0.01,
+        "pending_message": if status == "pending" { json!("skipped") } else { Value::Null }
+    });
+    if status == "failed" {
+        data["failure_message_lines"] = json!([clean(failure_message)]);
+        data["failure_formatted_backtrace"] = if collected {
+            json!([format!("{FILE_PATH}:{line}: in {id}")])
+        } else {
+            json!([])
+        };
+    }
+    json!({"type": "test_case_result", "data": data})
+}
+
+pub(crate) fn status_for(base: &str, flake: bool, attempt: u32) -> String {
+    if flake && attempt >= 2 {
+        "passed".to_owned()
+    } else {
+        base.to_owned()
+    }
+}
+
+fn clean(value: &str) -> String {
+    value.replace('\0', "")
+}
+
+async fn upload_traces(state: &State, base_url: &str) -> Result<(), Error> {
+    let fragment = json!({
+        "version": 1,
+        "files": [FILE_PATH],
+        "tests": state.traced.iter().map(|id| json!({"id": id, "deps": [0]})).collect::<Vec<_>>()
+    });
+    let gzip_body = gzip_bytes(serde_json::to_vec(&fragment)?.as_slice())?;
+    upload_fragment(&FragmentUpload {
+        host: upload_host(base_url),
+        api_key: query_param(base_url, "api_key"),
+        run_id: query_param(base_url, "run_id"),
+        run_attempt: query_param(base_url, "run_attempt"),
+        runner_id: query_param(base_url, "runner_id"),
+        gzip_body,
+    })
+    .await
+}
+
+fn upload_host(base_url: &str) -> String {
+    match std::env::var("SELECTIVE_HOST") {
+        Ok(host) if !host.is_empty() => host,
+        _ => Url::parse(base_url)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_default(),
+    }
+}
+
+fn command_name(value: &Value) -> &str {
+    value.get("command").and_then(Value::as_str).unwrap_or("")
+}
+
+fn parse_frame(frame: &str) -> Option<Value> {
+    serde_json::from_str(frame.trim()).ok()
+}
+
+async fn send_json(link: &mut Link, value: &Value) -> Result<(), Error> {
+    let frame = serde_json::to_string(value)?;
+    link.send(&frame).await
+}
+
+enum FrameIn {
+    Value(Value),
+    Lost,
+    Signal(&'static str),
+    Unparseable(String),
+}
+
+async fn recv_frame(link: &mut Link, signals: &watch::Receiver<Option<&'static str>>) -> FrameIn {
+    if let Some(signal) = signal_now(signals) {
+        return FrameIn::Signal(signal);
+    }
+    let mut signals = signals.clone();
+    tokio::select! {
+        biased;
+        Some(signal) = next_signal(&mut signals) => FrameIn::Signal(signal),
+        incoming = link.recv() => match incoming {
+            Ok(Some(frame)) => match parse_frame(&frame) {
+                Some(value) => FrameIn::Value(value),
+                None => FrameIn::Unparseable(frame),
+            },
+            Ok(None) | Err(_) => FrameIn::Lost,
+        },
+    }
+}
+
+async fn next_signal(signals: &mut watch::Receiver<Option<&'static str>>) -> Option<&'static str> {
+    signals
+        .wait_for(Option::is_some)
+        .await
+        .ok()
+        .and_then(|signal| *signal)
+}
+
+fn signal_now(signals: &watch::Receiver<Option<&'static str>>) -> Option<&'static str> {
+    *signals.borrow()
+}
+
+const CONNECTED_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn with_reconnect(url: &str) -> Result<String, Error> {
+    let mut parsed = Url::parse(url)?;
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(key, _)| key != "reconnect")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .chain(std::iter::once(("reconnect".to_owned(), "true".to_owned())))
+        .collect();
+    parsed.query_pairs_mut().clear().extend_pairs(&pairs);
+    Ok(parsed.into())
+}
+
+fn with_default_param(url: &str, key: &str, value: &str) -> Result<String, Error> {
+    let mut parsed = Url::parse(url)?;
+    if !parsed.query_pairs().any(|(name, _)| name == key) {
+        parsed.query_pairs_mut().append_pair(key, value);
+    }
+    Ok(parsed.into())
+}
+
+fn query_param(url: &str, key: &str) -> String {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .query_pairs()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.into_owned())
+        })
+        .unwrap_or_default()
+}
+
+enum Link {
+    Direct(Session),
+    Stdio(StdioLink),
+    Fifo(FifoLink),
+    Closed,
+}
+
+impl Link {
+    async fn open(url: &str, via: Via, transport: Option<&Path>) -> Result<Self, Error> {
+        match via {
+            Via::Direct => Ok(Self::Direct(Session::connect(url).await?)),
+            Via::Stdio => {
+                let transport = transport.ok_or_else(|| {
+                    Error::new("the stdio link needs the transport binary (SELECTIVE_TRANSPORT)")
+                })?;
+                Ok(Self::Stdio(StdioLink::spawn(url, transport)?))
+            }
+            Via::Fifo => {
+                let transport = transport.ok_or_else(|| {
+                    Error::new("the FIFO link needs the transport binary (SELECTIVE_TRANSPORT)")
+                })?;
+                Ok(Self::Fifo(FifoLink::spawn(url, transport).await?))
+            }
+        }
+    }
+
+    async fn send(&mut self, frame: &str) -> Result<(), Error> {
+        match self {
+            Self::Direct(session) => session.send(frame).await,
+            Self::Stdio(child) => child.send(frame),
+            Self::Fifo(link) => link.send(frame),
+            Self::Closed => Err(Error::new("session closed")),
+        }
+    }
+
+    async fn recv(&mut self) -> Result<Option<String>, Error> {
+        match self {
+            Self::Direct(session) => session.recv().await,
+            Self::Stdio(child) => child.recv().await,
+            Self::Fifo(link) => recv_incoming(&mut link.incoming).await,
+            Self::Closed => Ok(None),
+        }
+    }
+
+    fn poll(&mut self) -> Result<PollFrame, Error> {
+        match self {
+            Self::Direct(session) => session.poll(),
+            Self::Stdio(child) => child.poll(),
+            Self::Fifo(link) => poll_frames(&mut link.incoming),
+            Self::Closed => Ok(PollFrame::Closed),
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), Error> {
+        match self {
+            Self::Direct(session) => session.close().await,
+            Self::Stdio(child) => {
+                child.close();
+                Ok(())
+            }
+            Self::Fifo(link) => {
+                link.close();
+                Ok(())
+            }
+            Self::Closed => Ok(()),
+        }
+    }
+}
+
+struct StdioLink {
+    child: Child,
+    stdin: Option<std::process::ChildStdin>,
+    incoming: UnboundedReceiver<Result<Option<String>, Error>>,
+}
+
+impl StdioLink {
+    fn spawn(url: &str, transport: &Path) -> Result<Self, Error> {
+        let mut child = Command::new(transport)
+            .arg("--stdio")
+            .env("SELECTIVE_TRANSPORT_URL", url)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::new("stdio transport has no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::new("stdio transport has no stdout"))?;
+        let (tx, incoming) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || forward_lines(stdout, &tx));
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            incoming,
+        })
+    }
+
+    fn send(&mut self, frame: &str) -> Result<(), Error> {
+        use std::io::Write;
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| Error::new("session closed"))?;
+        writeln!(stdin, "{frame}")?;
+        stdin.flush()?;
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Option<String>, Error> {
+        recv_incoming(&mut self.incoming).await
+    }
+
+    fn poll(&mut self) -> Result<PollFrame, Error> {
+        poll_frames(&mut self.incoming)
+    }
+
+    fn close(&mut self) {
+        use std::io::Write;
+        if let Some(mut stdin) = self.stdin.take() {
+            let _ = writeln!(stdin, "exit");
+            let _ = stdin.flush();
+            drop(stdin);
+        }
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for StdioLink {
+    fn drop(&mut self) {
+        if self.stdin.is_some() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+fn forward_lines(output: impl std::io::Read, tx: &UnboundedSender<Result<Option<String>, Error>>) {
+    let mut reader = std::io::BufReader::new(output);
+    loop {
+        let mut line = String::new();
+        match std::io::BufRead::read_line(&mut reader, &mut line) {
+            Ok(0) => {
+                let _ = tx.send(Ok(None));
+                break;
+            }
+            Ok(_) => {
+                let trimmed = line.trim_end_matches(['\n', '\r']).to_owned();
+                if tx.send(Ok(Some(trimmed))).is_err() {
+                    break;
+                }
+            }
+            Err(err) => {
+                let _ = tx.send(Err(Error::from(err)));
+                break;
+            }
+        }
+    }
+}
+
+static NEXT_PIPE: AtomicU32 = AtomicU32::new(0);
+const PIPE_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct FifoLink {
+    child: Child,
+    input: Option<std::fs::File>,
+    closed: bool,
+    pipes: [PathBuf; 2],
+    incoming: UnboundedReceiver<Result<Option<String>, Error>>,
+}
+
+impl FifoLink {
+    async fn spawn(url: &str, transport: &Path) -> Result<Self, Error> {
+        let prefix = std::env::var("SELECTIVE_CONFORMANCE_FIFO_PREFIX")
+            .ok()
+            .filter(|prefix| !prefix.is_empty())
+            .unwrap_or_else(|| format!("conformance-{}", std::process::id()));
+        let id = format!("{prefix}-{}", NEXT_PIPE.fetch_add(1, Ordering::Relaxed));
+        let pipes = [
+            PathBuf::from(format!("/tmp/{id}_1")),
+            PathBuf::from(format!("/tmp/{id}_2")),
+        ];
+        let made = Command::new("mkfifo")
+            .args(["-m", "600"])
+            .args(&pipes)
+            .status();
+        if !made.is_ok_and(|status| status.success()) {
+            remove_pipes(&pipes);
+            return Err(Error::new("mkfifo failed: the FIFO link needs a unix host"));
+        }
+        let child = match Command::new(transport)
+            .arg(url)
+            .arg(&id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                remove_pipes(&pipes);
+                return Err(Error::from(err));
+            }
+        };
+        let (tx, incoming) = tokio::sync::mpsc::unbounded_channel();
+        let output = pipes[1].clone();
+        std::thread::spawn(move || match std::fs::File::open(&output) {
+            Ok(file) => forward_lines(file, &tx),
+            Err(err) => {
+                let _ = tx.send(Err(Error::from(err)));
+            }
+        });
+        let input = pipes[0].clone();
+        let mut link = Self {
+            child,
+            input: None,
+            closed: false,
+            pipes,
+            incoming,
+        };
+        let opener = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new().write(true).open(input)
+        });
+        let deadline = tokio::time::Instant::now() + PIPE_OPEN_TIMEOUT;
+        while !opener.is_finished() {
+            let exited = link.child.try_wait().is_ok_and(|status| status.is_some());
+            if exited || tokio::time::Instant::now() >= deadline {
+                let _ = std::fs::File::open(&link.pipes[0]);
+                let _ = opener.await;
+                return Err(Error::new(if exited {
+                    "the FIFO transport exited before opening its input pipe"
+                } else {
+                    "the FIFO transport never opened its input pipe"
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        match opener.await {
+            Ok(Ok(file)) => {
+                link.input = Some(file);
+                Ok(link)
+            }
+            _ => Err(Error::new("the FIFO transport never opened its input pipe")),
+        }
+    }
+
+    fn send(&mut self, frame: &str) -> Result<(), Error> {
+        use std::io::Write;
+        let input = self
+            .input
+            .as_mut()
+            .ok_or_else(|| Error::new("session closed"))?;
+        writeln!(input, "{frame}")?;
+        input.flush()?;
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        use std::io::Write;
+        if let Some(mut input) = self.input.take() {
+            let _ = writeln!(input, "exit");
+            let _ = input.flush();
+        }
+        self.closed = true;
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for FifoLink {
+    fn drop(&mut self) {
+        if !self.closed {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        remove_pipes(&self.pipes);
+    }
+}
+
+fn remove_pipes(pipes: &[PathBuf]) {
+    for pipe in pipes {
+        let _ = std::fs::remove_file(pipe);
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_signal() -> Option<&'static str> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).ok()?;
+    let mut interrupt = signal(SignalKind::interrupt()).ok()?;
+    tokio::select! {
+        _ = term.recv() => Some("TERM"),
+        _ = interrupt.recv() => Some("INT"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_signal() -> Option<&'static str> {
+    std::future::pending().await
+}
+
+async fn recv_incoming(
+    incoming: &mut UnboundedReceiver<Result<Option<String>, Error>>,
+) -> Result<Option<String>, Error> {
+    incoming.recv().await.unwrap_or(Ok(None))
+}
+
+fn poll_frames(
+    incoming: &mut UnboundedReceiver<Result<Option<String>, Error>>,
+) -> Result<PollFrame, Error> {
+    match incoming.try_recv() {
+        Ok(Ok(Some(frame))) => Ok(PollFrame::Frame(frame)),
+        Ok(Ok(None)) | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+            Ok(PollFrame::Closed)
+        }
+        Ok(Err(err)) => Err(err),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(PollFrame::Empty),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delays_and_flake_status_match_the_ruby_loop() {
+        assert_eq!(retry_delay(1, false), Duration::from_secs(1));
+        assert_eq!(retry_delay(4, false), Duration::from_secs(4));
+        assert_eq!(retry_delay(9, false), Duration::from_secs(4));
+        assert_eq!(retry_delay(3, true), Duration::from_millis(0));
+        assert_eq!(TERMINATION_GRACE, Duration::from_millis(250));
+        assert_eq!(status_for("failed", true, 1), "failed");
+        assert_eq!(status_for("failed", true, 2), "passed");
+        assert_eq!(status_for("failed", false, 2), "failed");
+        assert_eq!(clean("a\0b"), "ab");
+        let mut state = State::default();
+        let message = result_message(&mut state, "missing-case");
+        assert_eq!(message["data"]["status"], "failed");
+        assert_eq!(message["data"]["failure_message_lines"][0], "not collected");
+    }
+
+    #[test]
+    fn a_remove_drained_mid_batch_stays_queued() {
+        let mut state = State::default();
+        remember(&mut state, "case-fail", "failed");
+        let mut frames = VecDeque::from([
+            Ok(PollFrame::Frame(
+                r#"{"command":"remove_failed_test_case_result","test_case_id":"case-fail"}"#
+                    .to_owned(),
+            )),
+            Ok(PollFrame::Empty),
+        ]);
+        let mut queued = VecDeque::new();
+        let action = drain_polled(|| frames.pop_front().unwrap(), &mut queued);
+        assert!(matches!(action, Action::Continue));
+        remember(&mut state, "case-fail", "failed");
+        assert_eq!(state.results["case-fail"], "failed");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0]["test_case_id"], "case-fail");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_transport_that_exits_early_fails_the_link_fast() {
+        let started = std::time::Instant::now();
+        let link = FifoLink::spawn("ws://127.0.0.1:9/transport", Path::new("false")).await;
+        let err = link.err().expect("the link must fail");
+        assert!(err.to_string().contains("exited before"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_unparseable_frame_mid_batch_exits_1() {
+        let mut frames = VecDeque::from([
+            Ok(PollFrame::Frame(r#"{"command":"print_notice"}"#.to_owned())),
+            Ok(PollFrame::Frame("{not json".to_owned())),
+            Ok(PollFrame::Empty),
+        ]);
+        let mut queued = VecDeque::new();
+        let action = drain_polled(|| frames.pop_front().unwrap(), &mut queued);
+        assert!(matches!(action, Action::Exit(1)));
+        assert_eq!(queued.len(), 1);
+    }
+}
