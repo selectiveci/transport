@@ -106,7 +106,9 @@ impl Session {
         recv_incoming(&mut self.incoming).await
     }
 
-    pub(crate) fn poll(&mut self) -> Result<PollFrame, Error> {
+    /// # Errors
+    /// Fails when the connection errors. `PollFrame::Closed` means it closed.
+    pub fn poll(&mut self) -> Result<PollFrame, Error> {
         poll_frames(&mut self.incoming)
     }
 

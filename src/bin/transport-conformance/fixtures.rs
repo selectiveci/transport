@@ -3,7 +3,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::error::Error;
+use transport::Error;
 
 const ROLES: &[(&str, &str)] = &[
     ("pass", "case-pass"),
@@ -29,8 +29,6 @@ impl Default for FixtureIds {
 }
 
 impl FixtureIds {
-    /// # Errors
-    /// Fails when the file can't be read or isn't a JSON object of non-empty strings.
     pub fn load(path: &Path) -> Result<Self, Error> {
         let text = std::fs::read_to_string(path)?;
         Self::parse(&text)

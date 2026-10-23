@@ -1,7 +1,18 @@
-#[tokio::test]
-async fn conformance_suite_passes_for_direct_and_stdio() {
-    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_transport"));
-    transport::conformance::run_suite(&bin, None, transport::conformance::SuiteVia::Both)
-        .await
+#[test]
+fn conformance_suite_passes_for_direct_and_stdio() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_transport-conformance"))
+        .args([
+            "run",
+            "--via",
+            "both",
+            "--transport",
+            env!("CARGO_BIN_EXE_transport"),
+        ])
+        .output()
         .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

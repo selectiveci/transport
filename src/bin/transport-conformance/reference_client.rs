@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -7,11 +7,11 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc::UnboundedReceiver, watch};
 use url::Url;
 
-use crate::error::Error;
 use crate::fixtures::FixtureIds;
-use crate::session::{poll_frames, recv_incoming, PollFrame, Session};
-use crate::snapshot::snapshot_tree;
-use crate::upload::{gzip_bytes, upload_fragment, FragmentUpload};
+use transport::session::{PollFrame, Session};
+use transport::snapshot_tree;
+use transport::Error;
+use transport::{gzip_bytes, upload_fragment, FragmentUpload};
 
 const FILE_PATH: &str = "tests/example.py";
 
@@ -52,6 +52,7 @@ pub enum Via {
 pub struct RunOpts {
     pub url: String,
     pub via: Via,
+    pub transport: Option<PathBuf>,
     pub catch_signals: bool,
 }
 
@@ -99,7 +100,7 @@ pub async fn run(opts: RunOpts) -> i32 {
         } else {
             base.clone()
         };
-        let mut link = match Link::open(&url, opts.via).await {
+        let mut link = match Link::open(&url, opts.via, opts.transport.as_deref()).await {
             Ok(link) => link,
             Err(err) => {
                 failures += 1;
@@ -580,10 +581,15 @@ enum Link {
 }
 
 impl Link {
-    async fn open(url: &str, via: Via) -> Result<Self, Error> {
+    async fn open(url: &str, via: Via, transport: Option<&Path>) -> Result<Self, Error> {
         match via {
             Via::Direct => Ok(Self::Direct(Session::connect(url).await?)),
-            Via::Stdio => Ok(Self::Stdio(StdioLink::spawn(url)?)),
+            Via::Stdio => {
+                let transport = transport.ok_or_else(|| {
+                    Error::new("the stdio link needs the transport binary (SELECTIVE_TRANSPORT)")
+                })?;
+                Ok(Self::Stdio(StdioLink::spawn(url, transport)?))
+            }
         }
     }
 
@@ -630,9 +636,8 @@ struct StdioLink {
 }
 
 impl StdioLink {
-    fn spawn(url: &str) -> Result<Self, Error> {
-        let bin = std::env::current_exe().map_err(Error::from)?;
-        let mut child = Command::new(bin)
+    fn spawn(url: &str, transport: &Path) -> Result<Self, Error> {
+        let mut child = Command::new(transport)
             .arg("--stdio")
             .env("SELECTIVE_TRANSPORT_URL", url)
             .stdin(Stdio::piped())
@@ -730,6 +735,25 @@ async fn wait_for_signal() -> Option<&'static str> {
 #[cfg(not(unix))]
 async fn wait_for_signal() -> Option<&'static str> {
     std::future::pending().await
+}
+
+async fn recv_incoming(
+    incoming: &mut UnboundedReceiver<Result<Option<String>, Error>>,
+) -> Result<Option<String>, Error> {
+    incoming.recv().await.unwrap_or(Ok(None))
+}
+
+fn poll_frames(
+    incoming: &mut UnboundedReceiver<Result<Option<String>, Error>>,
+) -> Result<PollFrame, Error> {
+    match incoming.try_recv() {
+        Ok(Ok(Some(frame))) => Ok(PollFrame::Frame(frame)),
+        Ok(Ok(None)) | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+            Ok(PollFrame::Closed)
+        }
+        Ok(Err(err)) => Err(err),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(PollFrame::Empty),
+    }
 }
 
 #[cfg(test)]

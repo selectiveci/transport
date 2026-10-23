@@ -15,9 +15,9 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::error::Error;
 use crate::fixtures::FixtureIds;
 use crate::reference_client::Via;
+use transport::Error;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Scenario {
@@ -68,32 +68,30 @@ impl SuiteVia {
 
 fn scenarios() -> Result<Vec<Scenario>, Error> {
     const RAW: &[&str] = &[
-        include_str!("../conformance/scenarios/happy_two_batches.json"),
-        include_str!("../conformance/scenarios/remove_failed.json"),
-        include_str!("../conformance/scenarios/repeated_id.json"),
-        include_str!("../conformance/scenarios/reconnect.json"),
-        include_str!("../conformance/scenarios/socket_drop.json"),
-        include_str!("../conformance/scenarios/close_rejected.json"),
-        include_str!("../conformance/scenarios/sigterm_after_failure.json"),
-        include_str!("../conformance/scenarios/test_map_fragment.json"),
-        include_str!("../conformance/scenarios/queued_before_connected.json"),
-        include_str!("../conformance/scenarios/unknown_command.json"),
-        include_str!("../conformance/scenarios/reconnect_exhausted.json"),
-        include_str!("../conformance/scenarios/overlap_buffered.json"),
-        include_str!("../conformance/scenarios/upload_stall.json"),
-        include_str!("../conformance/scenarios/signal_keeps_close_status.json"),
-        include_str!("../conformance/scenarios/uncollected_id.json"),
-        include_str!("../conformance/scenarios/remove_failed_mid_batch.json"),
-        include_str!("../conformance/scenarios/idle_keepalive.json"),
-        include_str!("../conformance/scenarios/pong_timeout.json"),
+        include_str!("../../../conformance/scenarios/happy_two_batches.json"),
+        include_str!("../../../conformance/scenarios/remove_failed.json"),
+        include_str!("../../../conformance/scenarios/repeated_id.json"),
+        include_str!("../../../conformance/scenarios/reconnect.json"),
+        include_str!("../../../conformance/scenarios/socket_drop.json"),
+        include_str!("../../../conformance/scenarios/close_rejected.json"),
+        include_str!("../../../conformance/scenarios/sigterm_after_failure.json"),
+        include_str!("../../../conformance/scenarios/test_map_fragment.json"),
+        include_str!("../../../conformance/scenarios/queued_before_connected.json"),
+        include_str!("../../../conformance/scenarios/unknown_command.json"),
+        include_str!("../../../conformance/scenarios/reconnect_exhausted.json"),
+        include_str!("../../../conformance/scenarios/overlap_buffered.json"),
+        include_str!("../../../conformance/scenarios/upload_stall.json"),
+        include_str!("../../../conformance/scenarios/signal_keeps_close_status.json"),
+        include_str!("../../../conformance/scenarios/uncollected_id.json"),
+        include_str!("../../../conformance/scenarios/remove_failed_mid_batch.json"),
+        include_str!("../../../conformance/scenarios/idle_keepalive.json"),
+        include_str!("../../../conformance/scenarios/pong_timeout.json"),
     ];
     RAW.iter()
         .map(|raw| serde_json::from_str(raw).map_err(Error::from))
         .collect()
 }
 
-/// # Errors
-/// Fails when a bundled scenario isn't valid JSON.
 pub fn scenario_names() -> Result<Vec<String>, Error> {
     Ok(scenarios()?
         .into_iter()
@@ -107,26 +105,9 @@ pub struct ConformanceRun<'a> {
     pub client: Option<&'a str>,
     pub fixtures: FixtureIds,
     pub fixture_file: Option<&'a Path>,
+    pub transport: Option<&'a Path>,
 }
 
-/// # Errors
-/// Fails when no trial runs, or lists every trial that failed.
-pub async fn run_suite(bin: &Path, filter: Option<&str>, via: SuiteVia) -> Result<(), Error> {
-    run_suite_with(
-        bin,
-        ConformanceRun {
-            filter,
-            via,
-            client: None,
-            fixtures: FixtureIds::default(),
-            fixture_file: None,
-        },
-    )
-    .await
-}
-
-/// # Errors
-/// Fails when no trial runs, or lists every trial that failed.
 pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), Error> {
     let pace = conformance_pace();
     let mut failures = Vec::new();
@@ -159,6 +140,7 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
                 via,
                 client: run.client,
                 fixture_file: run.fixture_file,
+                transport: run.transport,
                 fixtures: &run.fixtures,
                 pace,
             };
@@ -202,6 +184,7 @@ struct Trial<'a> {
     client: Option<&'a str>,
     fixture_file: Option<&'a Path>,
     fixtures: &'a FixtureIds,
+    transport: Option<&'a Path>,
     pace: Pace,
 }
 
@@ -267,7 +250,7 @@ fn client_command(trial: &Trial<'_>) -> Result<Command, Error> {
         return Ok(command);
     }
     let mut command = Command::new(trial.bin);
-    command.arg("conformance-client");
+    command.arg("client");
     if matches!(trial.via, Via::Stdio) {
         command.arg("--via-stdio");
     }
@@ -329,6 +312,9 @@ async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
         .kill_on_drop(true);
     if let Some(path) = trial.fixture_file {
         command.env("SELECTIVE_CONFORMANCE_FIXTURE_IDS", path);
+    }
+    if let Some(path) = trial.transport {
+        command.env("SELECTIVE_TRANSPORT", path);
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let accept_gate = Arc::clone(&gate);
@@ -1155,7 +1141,7 @@ mod tests {
         )
         .unwrap();
         let mut scenario: Scenario = serde_json::from_str(include_str!(
-            "../conformance/scenarios/happy_two_batches.json"
+            "../../../conformance/scenarios/happy_two_batches.json"
         ))
         .unwrap();
         apply_fixtures(&mut scenario, &fixtures).unwrap();

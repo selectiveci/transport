@@ -4,12 +4,9 @@ mod engine;
 
 use std::path::PathBuf;
 
-use transport::conformance::{run_suite_with, scenario_names, ConformanceRun, SuiteVia};
-use transport::reference_client::{RunOpts, Via};
 use transport::upload::{
     resolve_run_identity, split_fragment_stdin, upload_fragment, FragmentUpload,
 };
-use transport::FixtureIds;
 
 const USAGE: &str = "\
 usage:
@@ -18,10 +15,6 @@ usage:
   transport --snapshot [dir]
   transport --upload-fragment [--run-id ID] [--run-attempt N] [--runner-id ID]
   transport --build-env
-  transport conformance list
-  transport conformance run [--scenario NAME] [--via direct|stdio|both]
-                            [--client COMMAND] [--fixture-ids FILE]
-  transport conformance-client [--via-stdio]
 ";
 
 fn main() {
@@ -52,8 +45,6 @@ fn dispatch() -> Result<i32, transport::Error> {
             println!("{}", serde_json::to_string(&transport::detect_build_env())?);
             Ok(0)
         }
-        Some("conformance") => conformance_main(&args.collect::<Vec<_>>()),
-        Some("conformance-client") => conformance_client_main(args.any(|arg| arg == "--via-stdio")),
         Some(url) => match args.next() {
             Some(runner_id) => Ok(block_on(engine::run_fifo(url, &runner_id))),
             None => Err(transport::Error::new(USAGE)),
@@ -120,94 +111,6 @@ fn upload_main(args: &[String]) -> Result<i32, transport::Error> {
         ))
     })?;
     Ok(0)
-}
-
-fn conformance_main(args: &[String]) -> Result<i32, transport::Error> {
-    let mut scenario = None;
-    let mut via = SuiteVia::Both;
-    let mut command = None;
-    let mut client = std::env::var("SELECTIVE_CONFORMANCE_CLIENT")
-        .ok()
-        .filter(|value| !value.is_empty());
-    let mut fixture_file = std::env::var("SELECTIVE_CONFORMANCE_FIXTURE_IDS")
-        .ok()
-        .filter(|value| !value.is_empty());
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "list" => command = Some("list"),
-            "run" => command = Some("run"),
-            "--scenario" => {
-                index += 1;
-                scenario = Some(required(args, index, "--scenario")?.to_owned());
-            }
-            "--via" => {
-                index += 1;
-                via = match required(args, index, "--via")? {
-                    "direct" => SuiteVia::Direct,
-                    "stdio" => SuiteVia::Stdio,
-                    "both" => SuiteVia::Both,
-                    other => {
-                        return Err(transport::Error::new(format!("unknown --via {other}")));
-                    }
-                };
-            }
-            "--client" => {
-                index += 1;
-                client = Some(required(args, index, "--client")?.to_owned());
-            }
-            "--fixture-ids" => {
-                index += 1;
-                fixture_file = Some(required(args, index, "--fixture-ids")?.to_owned());
-            }
-            other => {
-                return Err(transport::Error::new(format!(
-                    "unknown conformance argument {other}\n{USAGE}"
-                )));
-            }
-        }
-        index += 1;
-    }
-    match command {
-        Some("list") => {
-            for name in scenario_names()? {
-                println!("{name}");
-            }
-            Ok(0)
-        }
-        Some("run") => {
-            let bin = std::env::current_exe()?;
-            let fixture_path = fixture_file.as_deref().map(PathBuf::from);
-            let fixtures = match fixture_path.as_deref() {
-                Some(path) => FixtureIds::load(path)?,
-                None => FixtureIds::default(),
-            };
-            let run = ConformanceRun {
-                filter: scenario.as_deref(),
-                via,
-                client: client.as_deref(),
-                fixtures,
-                fixture_file: fixture_path.as_deref(),
-            };
-            block_on(run_suite_with(&bin, run))?;
-            Ok(0)
-        }
-        _ => Err(transport::Error::new(USAGE)),
-    }
-}
-
-fn conformance_client_main(via_stdio: bool) -> Result<i32, transport::Error> {
-    let url = std::env::var("SELECTIVE_TRANSPORT_URL")
-        .ok()
-        .filter(|url| !url.is_empty())
-        .ok_or_else(|| {
-            transport::Error::new("conformance-client requires SELECTIVE_TRANSPORT_URL")
-        })?;
-    Ok(block_on(transport::reference_client::run(RunOpts {
-        url,
-        via: if via_stdio { Via::Stdio } else { Via::Direct },
-        catch_signals: true,
-    })))
 }
 
 fn required<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str, transport::Error> {

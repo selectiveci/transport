@@ -12,6 +12,10 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_transport")
 }
 
+fn conformance_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_transport-conformance")
+}
+
 async fn within<F: std::future::Future>(future: F) -> F::Output {
     timeout(Duration::from_secs(5), future)
         .await
@@ -616,9 +620,8 @@ fn write_executable(path: &std::path::Path, body: &str) {
 #[tokio::test]
 async fn conformance_unknown_scenario_exits_nonzero() {
     for args in [
-        vec!["conformance", "run", "--scenario", "no_such_scenario"],
+        vec!["run", "--scenario", "no_such_scenario"],
         vec![
-            "conformance",
             "run",
             "--scenario",
             "no_such_scenario",
@@ -626,7 +629,11 @@ async fn conformance_unknown_scenario_exits_nonzero() {
             "/bin/false",
         ],
     ] {
-        let output = Command::new(bin()).args(&args).output().await.unwrap();
+        let output = Command::new(conformance_bin())
+            .args(&args)
+            .output()
+            .await
+            .unwrap();
         assert!(
             !output.status.success(),
             "args {args:?} stdout {}\nstderr {}",
@@ -648,12 +655,16 @@ async fn conformance_run_client_drives_an_external_command() {
     let script = dir.join("client.sh");
     write_executable(
         &script,
-        "#!/bin/sh\nprintf '%s\\n' invoked >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_TRANSPORT_URL\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_API_KEY\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_HOST\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUN_ID\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUN_ATTEMPT\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUNNER_ID\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_TEST_MAP_UPLOAD_KEY\" >> \"$1\"\nexec \"$2\" conformance-client\n",
+        "#!/bin/sh\nprintf '%s\\n' invoked >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_TRANSPORT_URL\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_API_KEY\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_HOST\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUN_ID\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUN_ATTEMPT\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUNNER_ID\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_TEST_MAP_UPLOAD_KEY\" >> \"$1\"\nexec \"$2\" client\n",
     );
-    let command = format!("{} {} {}", script.display(), marker.display(), bin());
-    let output = Command::new(bin())
+    let command = format!(
+        "{} {} {}",
+        script.display(),
+        marker.display(),
+        conformance_bin()
+    );
+    let output = Command::new(conformance_bin())
         .args([
-            "conformance",
             "run",
             "--scenario",
             "happy_two_batches",
@@ -690,12 +701,11 @@ async fn conformance_marks_record_scenarios_not_applicable_for_a_select_client()
     let script = dir.join("client.sh");
     write_executable(
         &script,
-        "#!/bin/sh\nSELECTIVE_TRANSPORT_URL=\"$SELECTIVE_TRANSPORT_URL&test_map=select\" exec \"$1\" conformance-client\n",
+        "#!/bin/sh\nSELECTIVE_TRANSPORT_URL=\"$SELECTIVE_TRANSPORT_URL&test_map=select\" exec \"$1\" client\n",
     );
-    let command = format!("{} {}", script.display(), bin());
-    let output = Command::new(bin())
+    let command = format!("{} {}", script.display(), conformance_bin());
+    let output = Command::new(conformance_bin())
         .args([
-            "conformance",
             "run",
             "--scenario",
             "test_map_fragment",
@@ -723,9 +733,8 @@ async fn conformance_fixture_ids_round_trip_through_the_builtin_client() {
         r#"{"pass":"spec.ok","fail":"spec.bad","pending":"spec.skip","flaky":"spec.flake"}"#,
     )
     .unwrap();
-    let output = Command::new(bin())
+    let output = Command::new(conformance_bin())
         .args([
-            "conformance",
             "run",
             "--scenario",
             "happy_two_batches",
@@ -971,33 +980,18 @@ fn scenario_and_via_require_a_value() {
     assert_eq!(bare.stderr, help.stderr);
 
     let cases = [
+        (vec!["run", "--scenario"], "missing value for --scenario\n"),
+        (vec!["run", "--via"], "missing value for --via\n"),
+        (vec!["run", "--client"], "missing value for --client\n"),
         (
-            vec!["conformance", "run", "--scenario"],
-            "missing value for --scenario\n",
-        ),
-        (
-            vec!["conformance", "run", "--via"],
-            "missing value for --via\n",
-        ),
-        (
-            vec!["conformance", "run", "--client"],
-            "missing value for --client\n",
-        ),
-        (
-            vec!["conformance", "run", "--fixture-ids"],
+            vec!["run", "--fixture-ids"],
             "missing value for --fixture-ids\n",
         ),
-        (
-            vec!["conformance", "run", "--via", "sideways"],
-            "unknown --via sideways\n",
-        ),
-        (
-            vec!["conformance-client"],
-            "conformance-client requires SELECTIVE_TRANSPORT_URL\n",
-        ),
+        (vec!["run", "--via", "sideways"], "unknown --via sideways\n"),
+        (vec!["client"], "client requires SELECTIVE_TRANSPORT_URL\n"),
     ];
     for (args, stderr) in cases {
-        let output = std::process::Command::new(bin())
+        let output = std::process::Command::new(conformance_bin())
             .args(&args)
             .output()
             .unwrap();
