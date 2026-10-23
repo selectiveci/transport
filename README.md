@@ -49,11 +49,11 @@ SELECTIVE_TRANSPORT_URL=wss://... transport --stdio
 transport --snapshot [dir]
 transport --upload-fragment [--run-id ID] [--run-attempt N] [--runner-id ID]
 transport --build-env
-transport conformance run [--scenario NAME] [--via direct|stdio|both]
-                          [--client COMMAND] [--fixture-ids FILE]
 ```
 
-`--stdio` reads the URL from `SELECTIVE_TRANSPORT_URL` or, if that is unset, from the first stdin line. The API key is not an argument. Client messages are JSON lines on stdin. `exit` shuts the process down and is not forwarded. Server commands are JSON lines on stdout. The legacy FIFO command is unchanged: newline-delimited JSON on `/tmp/<runner_id>_1` and `_2`, and text frames still include the trailing newline. WebSocket control frames are not written to that pipe.
+`--stdio` reads the URL from `SELECTIVE_TRANSPORT_URL` or, if that is unset, from the first stdin line. The API key is not an argument. Client messages are JSON lines on stdin. `exit` shuts the process down and is not forwarded. Server commands are JSON lines on stdout. `--stdio` and the FIFO command (newline-delimited JSON on `/tmp/<runner_id>_1` and `_2`) run the same transport: text frames include the trailing newline, WebSocket control frames are not written out, and the transport moves its own connection when the server asks.
+
+When a `--stdio` connection ends, stderr says how: `websocket closed by the server`, `websocket connection dropped`, or `websocket keepalive timeout: ...`.
 
 In-process callers use `Session` on a Tokio runtime or `BlockingSession` from any thread, plus `snapshot_tree`, `upload_fragment`, and `detect_build_env`.
 
@@ -83,11 +83,17 @@ Pass the ids the WebSocket URL was opened with. A flag wins over the payload, an
 
 ### Websocket keepalive
 
-`Session`, `BlockingSession`, `--stdio`, and the FIFO transport send a WebSocket ping every `SELECTIVE_WS_PING_INTERVAL_MS` milliseconds (default `20000`, under a typical 60s proxy idle timeout). `0` disables pings. If no pong arrives within `SELECTIVE_WS_PONG_TIMEOUT_MS` (default `10000`), the socket closes and the caller reconnects through the same path as a dropped connection. `conformance-client` treats that close as connection loss and dials again with `reconnect=true`.
+Keepalive is off unless the client sets `SELECTIVE_WS_PING_INTERVAL_MS`, and the FIFO transport never pings. When it is set, `--stdio`, `Session`, and `BlockingSession` send a WebSocket ping at that interval, and treat the connection as dead once nothing at all has arrived from the server for the interval plus `SELECTIVE_WS_PONG_TIMEOUT_MS` (default `45000`). With a `20000` interval that is 65s, longer than the 30s a busy server can take to read a test manifest. A send that is waiting on a server that has stopped reading fails only at that same deadline. The caller reconnects as it would after a dropped connection.
 
 ### Conformance
 
-`transport conformance run` is the shared scenario suite. The built-in `conformance-client` is the default. `--via direct|stdio|both` applies only to that client (default `both`).
+The shared scenario suite is its own binary, `transport-conformance`, built next to `transport` by `cargo build --release`. A client's CI runs:
+
+```text
+transport-conformance run --client 'COMMAND' --fixture-ids ids.json --transport /path/to/transport
+```
+
+The transport is `--transport`, else `SELECTIVE_TRANSPORT`, else the `transport` next to `transport-conformance`. The client command gets it as `SELECTIVE_TRANSPORT`. Without `--client`, the built-in reference client (`transport-conformance client`) runs every scenario, and `--via direct|stdio|both` (default `both`) picks how it connects. `transport-conformance list` prints the scenario names.
 
 `--client COMMAND` (or `SELECTIVE_CONFORMANCE_CLIENT`) runs each scenario once against that command. The value is a command line split on whitespace, with quotes honored. The URL and key are not arguments. The child receives:
 
@@ -103,10 +109,9 @@ Pass the ids the WebSocket URL was opened with. A flag wins over the payload, an
 | `SELECTIVE_CONFORMANCE_FAST` | `1` |
 | `SELECTIVE_WS_PING_INTERVAL_MS` | `200`, or `SELECTIVE_CONFORMANCE_PING_INTERVAL_MS` |
 | `SELECTIVE_WS_PONG_TIMEOUT_MS` | `1000`, or `SELECTIVE_CONFORMANCE_PONG_TIMEOUT_MS` |
+| `SELECTIVE_TRANSPORT` | the transport binary, when one was found |
 
-```text
-transport conformance run --client '/path/to/client --suite' --fixture-ids ids.json
-```
+A scenario that needs a recording client (`requires_record`) reports `n/a` unless the client's connect URL advertises `test_map=record`.
 
 `--fixture-ids FILE` (or `SELECTIVE_CONFORMANCE_FIXTURE_IDS`) maps roles to the client's test ids. Missing roles keep the built-in literals. The manifest order is `pass`, `fail`, `pending`, `flaky`.
 
@@ -114,9 +119,9 @@ transport conformance run --client '/path/to/client --suite' --fixture-ids ids.j
 {"pass":"spec.ok","fail":"spec.bad","pending":"spec.skip","flaky":"spec.flake"}
 ```
 
-The harness rewrites scenario ids before it sends or expects them. `conformance-client` reads the same file so it can emit those ids. A language client should emit its native ids and ignore `SELECTIVE_CONFORMANCE_FIXTURE_IDS`. Forward `SELECTIVE_WS_PING_INTERVAL_MS` and `SELECTIVE_WS_PONG_TIMEOUT_MS` to a child `transport --stdio`, or the idle scenario will wait on a cadence the child is not using.
+The harness rewrites scenario ids before it sends or expects them. The built-in client reads the same file so it can emit those ids. A language client should emit its native ids and ignore `SELECTIVE_CONFORMANCE_FIXTURE_IDS`. Forward `SELECTIVE_WS_PING_INTERVAL_MS` and `SELECTIVE_WS_PONG_TIMEOUT_MS` to a child `transport --stdio`, or the idle scenario will wait on a cadence the child is not using.
 
-`idle_keepalive` keeps the mock quiet for three ping intervals (65s when the interval is the 20s default, which is longer than a 60s proxy idle timeout) and requires the connection to stay up and deliver a ping. `pong_timeout` stops answering pongs and requires a clean `reconnect=true` dial. Scenario files live in `conformance/scenarios`.
+`idle_keepalive` keeps the mock quiet for three ping intervals and requires the connection to stay up and deliver a ping. `pong_timeout` stops answering pongs and requires a clean `reconnect=true` dial. Scenario files live in `conformance/scenarios`.
 
 ## Release platforms
 
