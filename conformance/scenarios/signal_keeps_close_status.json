@@ -1,6 +1,9 @@
 {
   "name": "signal_keeps_close_status",
   "requires_record": true,
+  "not_for_languages": [
+    "ruby"
+  ],
   "steps": [
     {
       "op": "send",

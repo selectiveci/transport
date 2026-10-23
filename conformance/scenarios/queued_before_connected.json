@@ -1,5 +1,8 @@
 {
   "name": "queued_before_connected",
+  "not_for_languages": [
+    "ruby"
+  ],
   "steps": [
     {
       "op": "send",

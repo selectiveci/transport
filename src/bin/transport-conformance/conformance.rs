@@ -24,6 +24,8 @@ pub struct Scenario {
     pub name: String,
     #[serde(default)]
     pub requires_record: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_for_languages: Vec<String>,
     pub steps: Vec<Step>,
 }
 
@@ -47,6 +49,7 @@ pub enum Step {
     RejectConnections { times: u32 },
     Idle,
     IgnorePongs,
+    ExpectOutput { text: String },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -86,6 +89,7 @@ fn scenarios() -> Result<Vec<Scenario>, Error> {
         include_str!("../../../conformance/scenarios/remove_failed_mid_batch.json"),
         include_str!("../../../conformance/scenarios/idle_keepalive.json"),
         include_str!("../../../conformance/scenarios/pong_timeout.json"),
+        include_str!("../../../conformance/scenarios/print_commands.json"),
     ];
     RAW.iter()
         .map(|raw| serde_json::from_str(raw).map_err(Error::from))
@@ -186,6 +190,23 @@ struct Trial<'a> {
     fixtures: &'a FixtureIds,
     transport: Option<&'a Path>,
     pace: Pace,
+}
+
+const RUNNER_ENV: &[(&str, &str)] = &[
+    ("SELECTIVE_PLATFORM", "conformance"),
+    ("SELECTIVE_BRANCH", "conformance"),
+    ("SELECTIVE_SHA", "0123456789abcdef0123456789abcdef01234567"),
+    ("SELECTIVE_GIT_REPO", "selectiveci/conformance"),
+    ("SELECTIVE_GIT_PROVIDER", "github"),
+    ("SELECTIVE_PR_TITLE", "conformance"),
+];
+
+fn runner_env_defaults(var: impl Fn(&str) -> Option<String>) -> Vec<(&'static str, &'static str)> {
+    RUNNER_ENV
+        .iter()
+        .copied()
+        .filter(|(key, _)| var(key).is_none_or(|value| value.is_empty()))
+        .collect()
 }
 
 fn conformance_pace() -> Pace {
@@ -316,6 +337,7 @@ async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
     if let Some(path) = trial.transport {
         command.env("SELECTIVE_TRANSPORT", path);
     }
+    command.envs(runner_env_defaults(|key| std::env::var(key).ok()));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let accept_gate = Arc::clone(&gate);
     tokio::spawn(async move {
@@ -338,8 +360,10 @@ async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
         current: None,
         fragments: Vec::new(),
         child: Some(child),
+        logs: Arc::clone(&logs),
         saw_connection: false,
         test_map: None,
+        language: None,
         gate,
         fixtures: trial.fixtures.clone(),
         ping_interval: trial.pace.ping,
@@ -417,8 +441,10 @@ struct Player {
     current: Option<Live>,
     fragments: Vec<CapturedHttp>,
     child: Option<Child>,
+    logs: Arc<Mutex<String>>,
     saw_connection: bool,
     test_map: Option<String>,
+    language: Option<String>,
     gate: Arc<Gate>,
     fixtures: FixtureIds,
     ping_interval: Duration,
@@ -436,6 +462,29 @@ impl Player {
                     "client advertises test_map={advertised}"
                 )));
             }
+        }
+        if !scenario.not_for_languages.is_empty() {
+            self.ensure_connection().await?;
+            let language = self.language.as_deref().unwrap_or("");
+            if scenario
+                .not_for_languages
+                .iter()
+                .any(|excluded| excluded == language)
+            {
+                return Ok(Played::NotApplicable(format!(
+                    "not run for language={language} yet"
+                )));
+            }
+        }
+        let wants_tree = scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::ExpectManifest { tree: true }));
+        if wants_tree && !inside_git_checkout() {
+            return Err(Error::new(format!(
+                "{} needs a git checkout: run transport-conformance from inside the client's repository",
+                scenario.name
+            )));
         }
         for step in &scenario.steps {
             self.step(step)
@@ -509,6 +558,21 @@ impl Player {
                 self.ignore_pongs = true;
                 Ok(())
             }
+            Step::ExpectOutput { text } => self.expect_output(text).await,
+        }
+    }
+
+    async fn expect_output(&mut self, text: &str) -> Result<(), Error> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let printed = self.logs.lock().is_ok_and(|logs| logs.contains(text));
+            if printed {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::new(format!("client output never showed {text:?}")));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -641,6 +705,7 @@ impl Player {
             }
             self.saw_connection = true;
             self.test_map = query_value(&socket.uri, "test_map");
+            self.language = query_value(&socket.uri, "language");
         }
         self.current = Some(socket);
         Ok(())
@@ -895,10 +960,14 @@ fn expect_manifest(frame: &Value, tree: bool, expected_ids: &[String]) -> Result
     if frame.get("type").and_then(Value::as_str) != Some("test_manifest") {
         return Err(Error::new(format!("expected test_manifest, got {frame}")));
     }
-    let ids: Vec<&str> = frame
+    let cases = frame
         .pointer("/data/test_cases")
         .and_then(Value::as_array)
-        .ok_or_else(|| Error::new("manifest test_cases"))?
+        .ok_or_else(|| Error::new("manifest test_cases"))?;
+    for case in cases {
+        expect_manifest_entry(case)?;
+    }
+    let ids: Vec<&str> = cases
         .iter()
         .filter_map(|case| case.get("id").and_then(Value::as_str))
         .collect();
@@ -925,13 +994,40 @@ fn expect_manifest(frame: &Value, tree: bool, expected_ids: &[String]) -> Result
     Ok(())
 }
 
+fn expect_manifest_entry(case: &Value) -> Result<(), Error> {
+    let id = case.get("id").and_then(Value::as_str).unwrap_or("?");
+    if !case.get("run_time").is_some_and(Value::is_number) {
+        return Err(Error::new(format!(
+            "manifest entry {id} needs a numeric run_time"
+        )));
+    }
+    let file_path = case.get("file_path").and_then(Value::as_str).unwrap_or("");
+    if file_path.trim().is_empty() || is_absolute_path(file_path) {
+        return Err(Error::new(format!(
+            "manifest entry {id} needs a repo-relative file_path, got {file_path:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn is_absolute_path(path: &str) -> bool {
+    let path = path.trim().replace('\\', "/");
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
+fn inside_git_checkout() -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout.starts_with(b"true"))
+}
+
 fn repo_relative_backtrace(frame: &str) -> bool {
     let frame = frame.trim().replace('\\', "/");
-    if frame.is_empty() || frame.starts_with('/') {
-        return false;
-    }
-    let bytes = frame.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+    if frame.is_empty() || is_absolute_path(&frame) {
         return false;
     }
     ![
@@ -1150,35 +1246,87 @@ mod tests {
         assert!(encoded.contains("spec.skip"));
         assert!(!encoded.contains("case-pass"));
         assert!(!encoded.contains("case-pend"));
-        let frame = serde_json::json!({
-            "type": "test_manifest",
-            "data": {
-                "test_cases": [
-                    {"id": "spec.ok"},
-                    {"id": "spec.bad"},
-                    {"id": "spec.skip"},
-                    {"id": "spec.flake"}
-                ]
-            }
-        });
-        expect_manifest(&frame, false, &fixtures.manifest_ids()).unwrap();
-        let defaults = FixtureIds::default();
+        let manifest = |ids: &[&str]| {
+            let cases: Vec<Value> = ids
+                .iter()
+                .map(|id| serde_json::json!({"id": id, "file_path": "spec/a_spec.rb", "run_time": 0}))
+                .collect();
+            serde_json::json!({"type": "test_manifest", "data": {"test_cases": cases}})
+        };
         expect_manifest(
-            &serde_json::json!({
-                "type": "test_manifest",
-                "data": {
-                    "test_cases": [
-                        {"id": "case-pass"},
-                        {"id": "case-fail"},
-                        {"id": "case-pend"},
-                        {"id": "case-flake"}
-                    ]
-                }
-            }),
+            &manifest(&["spec.ok", "spec.bad", "spec.skip", "spec.flake"]),
             false,
-            &defaults.manifest_ids(),
+            &fixtures.manifest_ids(),
         )
         .unwrap();
+        expect_manifest(
+            &manifest(&["case-pass", "case-fail", "case-pend", "case-flake"]),
+            false,
+            &FixtureIds::default().manifest_ids(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn every_manifest_entry_needs_run_time_and_a_repo_relative_file_path() {
+        let check = |case: Value| expect_manifest_entry(&case).map_err(|err| err.to_string());
+        check(serde_json::json!({"id": "a", "file_path": "tests/a.py", "run_time": 0.0})).unwrap();
+        check(serde_json::json!({"id": "a", "file_path": "./spec/a_spec.rb", "run_time": 3}))
+            .unwrap();
+        for (case, want) in [
+            (
+                serde_json::json!({"id": "a", "file_path": "tests/a.py"}),
+                "run_time",
+            ),
+            (
+                serde_json::json!({"id": "a", "file_path": "tests/a.py", "run_time": "0.1"}),
+                "run_time",
+            ),
+            (
+                serde_json::json!({"id": "a", "file_path": "tests/a.py", "run_time": null}),
+                "run_time",
+            ),
+            (serde_json::json!({"id": "a", "run_time": 0.1}), "file_path"),
+            (
+                serde_json::json!({"id": "a", "file_path": " ", "run_time": 0.1}),
+                "file_path",
+            ),
+            (
+                serde_json::json!({"id": "a", "file_path": "/repo/tests/a.py", "run_time": 0.1}),
+                "file_path",
+            ),
+            (
+                serde_json::json!({"id": "a", "file_path": r"C:\repo\a.py", "run_time": 0.1}),
+                "file_path",
+            ),
+        ] {
+            let err = check(case.clone()).unwrap_err();
+            assert!(err.contains(want), "{case}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_runner_fills_only_the_build_env_the_caller_left_unset() {
+        let all = runner_env_defaults(|_| None);
+        let keys: Vec<&str> = all.iter().map(|(key, _)| *key).collect();
+        for key in [
+            "SELECTIVE_PLATFORM",
+            "SELECTIVE_BRANCH",
+            "SELECTIVE_SHA",
+            "SELECTIVE_GIT_REPO",
+            "SELECTIVE_GIT_PROVIDER",
+            "SELECTIVE_PR_TITLE",
+        ] {
+            assert!(keys.contains(&key), "{key}");
+        }
+        assert!(all.iter().all(|(_, value)| !value.is_empty()));
+        let kept = runner_env_defaults(|key| match key {
+            "SELECTIVE_BRANCH" => Some("main".to_owned()),
+            "SELECTIVE_SHA" => Some(String::new()),
+            _ => None,
+        });
+        assert!(!kept.iter().any(|(key, _)| *key == "SELECTIVE_BRANCH"));
+        assert!(kept.iter().any(|(key, _)| *key == "SELECTIVE_SHA"));
     }
 
     #[test]
