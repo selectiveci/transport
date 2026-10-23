@@ -12,6 +12,12 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_transport")
 }
 
+async fn within<F: std::future::Future>(future: F) -> F::Output {
+    timeout(Duration::from_secs(5), future)
+        .await
+        .expect("timed out after 5s")
+}
+
 #[tokio::test]
 async fn stdio_uses_the_env_url_and_does_not_forward_exit() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -28,10 +34,7 @@ async fn stdio_uses_the_env_url_and_does_not_forward_exit() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let (sock, _) = timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
+    let (sock, _) = within(listener.accept()).await.unwrap();
     let mut ws = accept_async(sock).await.unwrap();
     let mut stdin = child.stdin.take().unwrap();
     stdin
@@ -39,11 +42,7 @@ async fn stdio_uses_the_env_url_and_does_not_forward_exit() {
         .await
         .unwrap();
     stdin.flush().await.unwrap();
-    let frame = timeout(Duration::from_secs(5), ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let frame = within(ws.next()).await.unwrap().unwrap();
     match frame {
         Message::Text(text) => assert_eq!(text, "{\"type\":\"test_case_result\"}"),
         other => panic!("unexpected {other:?}"),
@@ -53,10 +52,7 @@ async fn stdio_uses_the_env_url_and_does_not_forward_exit() {
         .unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     let mut line = String::new();
-    timeout(Duration::from_secs(5), stdout.read_line(&mut line))
-        .await
-        .unwrap()
-        .unwrap();
+    within(stdout.read_line(&mut line)).await.unwrap();
     assert_eq!(line, "{\"command\":\"connected\"}\n");
     stdin.write_all(b"exit\n").await.unwrap();
     stdin.flush().await.unwrap();
@@ -64,10 +60,7 @@ async fn stdio_uses_the_env_url_and_does_not_forward_exit() {
     if let Ok(Some(Ok(Message::Text(text)))) = extra {
         assert_ne!(text.trim(), "exit");
     }
-    let status = timeout(Duration::from_secs(5), child.wait())
-        .await
-        .unwrap()
-        .unwrap();
+    let status = within(child.wait()).await.unwrap();
     assert!(status.success());
 }
 
@@ -88,25 +81,15 @@ async fn stdio_reads_the_url_from_stdin_when_env_is_absent() {
     stdin.write_all(url.as_bytes()).await.unwrap();
     stdin.write_all(b"{\"type\":\"hello\"}\n").await.unwrap();
     stdin.flush().await.unwrap();
-    let (sock, _) = timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
+    let (sock, _) = within(listener.accept()).await.unwrap();
     let mut ws = accept_async(sock).await.unwrap();
-    let frame = timeout(Duration::from_secs(5), ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let frame = within(ws.next()).await.unwrap().unwrap();
     match frame {
         Message::Text(text) => assert_eq!(text, "{\"type\":\"hello\"}"),
         other => panic!("unexpected {other:?}"),
     }
     stdin.write_all(b"exit\n").await.unwrap();
-    let status = timeout(Duration::from_secs(5), child.wait())
-        .await
-        .unwrap()
-        .unwrap();
+    let status = within(child.wait()).await.unwrap();
     assert!(status.success());
 }
 
@@ -122,10 +105,7 @@ async fn missing_stdio_url_exits_1() {
         .spawn()
         .unwrap();
     drop(child.stdin.take());
-    let status = timeout(Duration::from_secs(5), child.wait())
-        .await
-        .unwrap()
-        .unwrap();
+    let status = within(child.wait()).await.unwrap();
     assert_eq!(status.code(), Some(1));
 }
 
@@ -134,68 +114,24 @@ async fn missing_stdio_url_exits_1() {
 async fn fifo_round_trip_keeps_the_legacy_framing() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let id = format!(
-        "seltest{}{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let input = format!("/tmp/{id}_1");
-    let output = format!("/tmp/{id}_2");
-    let _ = std::fs::remove_file(&input);
-    let _ = std::fs::remove_file(&output);
-    assert!(std::process::Command::new("mkfifo")
-        .arg(&input)
-        .status()
-        .unwrap()
-        .success());
-    assert!(std::process::Command::new("mkfifo")
-        .arg(&output)
-        .status()
-        .unwrap()
-        .success());
+    let (id, input, output) = fifo_paths();
     let mut child = Command::new(bin())
         .arg(format!("ws://{addr}"))
         .arg(&id)
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let input_path = input.clone();
-    let output_path = output.clone();
-    let writer = tokio::spawn(async move {
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(input_path)
-            .await
-            .unwrap()
-    });
-    let reader = tokio::spawn(async move {
-        let file = tokio::fs::OpenOptions::new()
-            .read(true)
-            .open(output_path)
-            .await
-            .unwrap();
-        BufReader::new(file)
-    });
-    let (sock, _) = timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
+    let (writer, reader) = open_fifos(&input, &output);
+    let (sock, _) = within(listener.accept()).await.unwrap();
     let mut ws = accept_async(sock).await.unwrap();
     let mut to_transport = writer.await.unwrap();
-    let mut from_transport = reader.await.unwrap();
+    let mut from_transport = BufReader::new(reader.await.unwrap());
     to_transport
         .write_all(b"{\"type\":\"ping\"}\n")
         .await
         .unwrap();
     to_transport.flush().await.unwrap();
-    let frame = timeout(Duration::from_secs(5), ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let frame = within(ws.next()).await.unwrap().unwrap();
     match frame {
         Message::Text(text) => assert_eq!(text, "{\"type\":\"ping\"}\n"),
         other => panic!("unexpected {other:?}"),
@@ -204,20 +140,41 @@ async fn fifo_round_trip_keeps_the_legacy_framing() {
         .await
         .unwrap();
     let mut line = String::new();
-    timeout(Duration::from_secs(5), from_transport.read_line(&mut line))
-        .await
-        .unwrap()
-        .unwrap();
+    within(from_transport.read_line(&mut line)).await.unwrap();
     assert_eq!(line, "{\"command\":\"connected\"}\n");
     to_transport.write_all(b"  exit  \n").await.unwrap();
     to_transport.flush().await.unwrap();
-    let status = timeout(Duration::from_secs(5), child.wait())
-        .await
-        .unwrap()
-        .unwrap();
+    let status = within(child.wait()).await.unwrap();
     assert!(status.success());
     let _ = std::fs::remove_file(&input);
     let _ = std::fs::remove_file(&output);
+}
+
+#[cfg(unix)]
+fn open_fifos(
+    input: &str,
+    output: &str,
+) -> (
+    tokio::task::JoinHandle<tokio::fs::File>,
+    tokio::task::JoinHandle<tokio::fs::File>,
+) {
+    let input_path = input.to_owned();
+    let output_path = output.to_owned();
+    let writer = tokio::spawn(async move {
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(input_path)
+            .await
+            .unwrap()
+    });
+    let reader = tokio::spawn(async move {
+        tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(output_path)
+            .await
+            .unwrap()
+    });
+    (writer, reader)
 }
 
 #[cfg(unix)]
@@ -259,26 +216,8 @@ async fn fifo_exits_on_close_while_the_input_pipe_stays_open() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let input_path = input.clone();
-    let output_path = output.clone();
-    let writer = tokio::spawn(async move {
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(input_path)
-            .await
-            .unwrap()
-    });
-    let reader = tokio::spawn(async move {
-        tokio::fs::OpenOptions::new()
-            .read(true)
-            .open(output_path)
-            .await
-            .unwrap()
-    });
-    let (sock, _) = timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
+    let (writer, reader) = open_fifos(&input, &output);
+    let (sock, _) = within(listener.accept()).await.unwrap();
     let mut ws = accept_async(sock).await.unwrap();
     let _held_input = writer.await.unwrap();
     let _held_output = reader.await.unwrap();
@@ -302,30 +241,9 @@ async fn fifo_exits_when_connect_is_refused_while_the_input_pipe_stays_open() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let input_path = input.clone();
-    let output_path = output.clone();
-    let writer = tokio::spawn(async move {
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(input_path)
-            .await
-            .unwrap()
-    });
-    let reader = tokio::spawn(async move {
-        tokio::fs::OpenOptions::new()
-            .read(true)
-            .open(output_path)
-            .await
-            .unwrap()
-    });
-    let _held_input = timeout(Duration::from_secs(5), writer)
-        .await
-        .unwrap()
-        .unwrap();
-    let _held_output = timeout(Duration::from_secs(5), reader)
-        .await
-        .unwrap()
-        .unwrap();
+    let (writer, reader) = open_fifos(&input, &output);
+    let _held_input = within(writer).await.unwrap();
+    let _held_output = within(reader).await.unwrap();
     let status = timeout(Duration::from_secs(3), child.wait())
         .await
         .expect("fifo connect failure waited on the input pipe")
@@ -347,26 +265,8 @@ async fn fifo_input_eof_sends_close_and_exits() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let input_path = input.clone();
-    let output_path = output.clone();
-    let writer = tokio::spawn(async move {
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(input_path)
-            .await
-            .unwrap()
-    });
-    let reader = tokio::spawn(async move {
-        tokio::fs::OpenOptions::new()
-            .read(true)
-            .open(output_path)
-            .await
-            .unwrap()
-    });
-    let (sock, _) = timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
+    let (writer, reader) = open_fifos(&input, &output);
+    let (sock, _) = within(listener.accept()).await.unwrap();
     let mut ws = accept_async(sock).await.unwrap();
     let input_writer = writer.await.unwrap();
     let _held_output = reader.await.unwrap();
@@ -404,26 +304,8 @@ async fn fifo_stalled_output_is_not_a_pong_timeout() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let input_path = input.clone();
-    let output_path = output.clone();
-    let writer = tokio::spawn(async move {
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(input_path)
-            .await
-            .unwrap()
-    });
-    let reader = tokio::spawn(async move {
-        tokio::fs::OpenOptions::new()
-            .read(true)
-            .open(output_path)
-            .await
-            .unwrap()
-    });
-    let (sock, _) = timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
+    let (writer, reader) = open_fifos(&input, &output);
+    let (sock, _) = within(listener.accept()).await.unwrap();
     let mut ws = accept_async(sock).await.unwrap();
     let _held_input = writer.await.unwrap();
     let _stalled_output = reader.await.unwrap();
