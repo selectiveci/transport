@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -89,6 +89,8 @@ fn scenarios() -> Result<Vec<Scenario>, Error> {
         .collect()
 }
 
+/// # Errors
+/// Fails when a bundled scenario isn't valid JSON.
 pub fn scenario_names() -> Result<Vec<String>, Error> {
     Ok(scenarios()?
         .into_iter()
@@ -104,6 +106,8 @@ pub struct ConformanceRun<'a> {
     pub fixture_file: Option<&'a Path>,
 }
 
+/// # Errors
+/// Fails when no trial runs, or lists every trial that failed.
 pub async fn run_suite(bin: &Path, filter: Option<&str>, via: SuiteVia) -> Result<(), Error> {
     run_suite_with(
         bin,
@@ -118,6 +122,8 @@ pub async fn run_suite(bin: &Path, filter: Option<&str>, via: SuiteVia) -> Resul
     .await
 }
 
+/// # Errors
+/// Fails when no trial runs, or lists every trial that failed.
 pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), Error> {
     let pace = conformance_pace();
     let mut failures = Vec::new();
@@ -287,7 +293,7 @@ async fn run_one(trial: &Trial<'_>) -> Result<(), Error> {
         "ws://{addr}/transport/websocket?api_key=conformance-key&run_id=run-1&run_attempt=1&runner_id=runner-1&metadata=%7B%22ci%22%3A%22conformance%22%7D"
     );
     let gate = Arc::new(Gate {
-        reject_budget: AtomicU32::new(match trial.scenario.steps.first() {
+        reject_budget: Mutex::new(match trial.scenario.steps.first() {
             Some(Step::RejectConnections { times }) => *times,
             _ => 0,
         }),
@@ -349,14 +355,14 @@ async fn run_one(trial: &Trial<'_>) -> Result<(), Error> {
         ignore_pongs: false,
         pings: 0,
     };
-    let played = player.play(trial.scenario).await;
-    if played.is_err() {
+    let outcome = player.play(trial.scenario).await;
+    if outcome.is_err() {
         if let Some(mut child) = player.child.take() {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
     }
-    played.map_err(|err| {
+    outcome.map_err(|err| {
         let extra = logs.lock().map(|guard| guard.clone()).unwrap_or_default();
         Error::new(format!("{err}\n--- client output ---\n{extra}"))
     })
@@ -397,14 +403,14 @@ struct CapturedHttp {
 }
 
 enum Incoming {
-    Socket(Live),
+    Socket(Box<Live>),
     Fragment(CapturedHttp),
     Rejected,
     Failed(Error),
 }
 
 struct Gate {
-    reject_budget: AtomicU32,
+    reject_budget: Mutex<u32>,
     hold_uploads: AtomicBool,
     upload_held: AtomicBool,
     upload_notify: Notify,
@@ -579,11 +585,11 @@ impl Player {
         let event = tokio::select! {
             next = self.incoming.recv() => Event::Accepted(next),
             message = recv_live(self.current.as_mut()), if read_allowed => Event::Socket(message),
-            _ = tokio::time::sleep(remaining) => Event::Timeout,
+            () = tokio::time::sleep(remaining) => Event::Timeout,
         };
         match event {
             Event::Accepted(Some(Incoming::Socket(socket))) => {
-                self.install(socket)?;
+                self.install(*socket)?;
                 Ok(None)
             }
             Event::Accepted(Some(Incoming::Fragment(fragment))) => {
@@ -600,12 +606,11 @@ impl Player {
                 self.pings = self.pings.saturating_add(1);
                 Ok(None)
             }
-            Event::Socket(Pump::Continue) => Ok(None),
             Event::Socket(Pump::Closed) => {
                 self.current = None;
                 Ok(None)
             }
-            Event::Timeout => Ok(None),
+            Event::Socket(Pump::Continue) | Event::Timeout => Ok(None),
         }
     }
 
@@ -616,15 +621,15 @@ impl Player {
                 socket.uri
             )));
         }
-        if !self.saw_connection {
+        if self.saw_connection {
+            self.ignore_pongs = false;
+        } else {
             if socket.uri.contains("reconnect=true") {
                 return Err(Error::new(
                     "the first connection must not set reconnect=true",
                 ));
             }
             self.saw_connection = true;
-        } else {
-            self.ignore_pongs = false;
         }
         self.current = Some(socket);
         Ok(())
@@ -636,13 +641,10 @@ impl Player {
             if Instant::now() >= deadline {
                 return Ok(());
             }
-            match self.pump(deadline).await? {
-                Some(frame) => {
-                    return Err(Error::new(format!(
-                        "expected no frame before connected, got {frame}"
-                    )));
-                }
-                None => {}
+            if let Some(frame) = self.pump(deadline).await? {
+                return Err(Error::new(format!(
+                    "expected no frame before connected, got {frame}"
+                )));
             }
         }
     }
@@ -692,8 +694,7 @@ impl Player {
         }
         let mut decoder = flate2::read::GzDecoder::new(captured.body.as_slice());
         let mut plain = String::new();
-        use std::io::Read;
-        decoder.read_to_string(&mut plain)?;
+        std::io::Read::read_to_string(&mut decoder, &mut plain)?;
         let json: Value = serde_json::from_str(&plain)?;
         if json.get("version").and_then(Value::as_u64) != Some(1) {
             return Err(Error::new(format!("fragment version: {json}")));
@@ -720,7 +721,10 @@ impl Player {
                 .and_then(Value::as_array)
                 .ok_or_else(|| Error::new("fragment deps"))?;
             for dep in deps {
-                let index = dep.as_u64().ok_or_else(|| Error::new("dep index"))? as usize;
+                let index = dep
+                    .as_u64()
+                    .and_then(|index| usize::try_from(index).ok())
+                    .ok_or_else(|| Error::new("dep index"))?;
                 if index >= files.len() {
                     return Err(Error::new("dep index out of range"));
                 }
@@ -810,6 +814,8 @@ async fn forward_connection(
     }
 }
 
+// The handshake callback's error type is fixed by tungstenite.
+#[allow(clippy::result_large_err)]
 async fn classify(mut stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, Error> {
     let mut peeked = [0u8; 4];
     let n = stream.peek(&mut peeked).await.unwrap_or(0);
@@ -826,13 +832,13 @@ async fn classify(mut stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, E
     let mut rejected = false;
     let handshake =
         tokio_tungstenite::accept_hdr_async(stream, |request: &Request, response: Response| {
-            if gate
-                .reject_budget
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                    current.checked_sub(1)
-                })
-                .is_ok()
-            {
+            let reject = {
+                let mut left = gate.reject_budget.lock().expect("reject budget");
+                let reject = *left > 0;
+                *left = left.saturating_sub(1);
+                reject
+            };
+            if reject {
                 rejected = true;
                 return Err(http::Response::builder()
                     .status(503)
@@ -847,7 +853,7 @@ async fn classify(mut stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, E
         return Ok(Incoming::Rejected);
     }
     let ws = handshake?;
-    Ok(Incoming::Socket(Live { uri, ws }))
+    Ok(Incoming::Socket(Box::new(Live { uri, ws })))
 }
 
 enum Pump {
@@ -863,15 +869,14 @@ async fn recv_live(live: Option<&mut Live>) -> Pump {
     };
     match live.ws.next().await {
         Some(Ok(Message::Text(text))) => Pump::Frame(
-            serde_json::from_str(text.trim()).unwrap_or_else(|_| Value::String(text.to_owned())),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| Value::String(text.clone())),
         ),
         Some(Ok(Message::Ping(payload))) => {
             let _ = live.ws.send(Message::Pong(payload)).await;
             Pump::Ping
         }
-        Some(Ok(Message::Close(_))) | None => Pump::Closed,
+        Some(Ok(Message::Close(_)) | Err(_)) | None => Pump::Closed,
         Some(Ok(_)) => Pump::Continue,
-        Some(Err(_)) => Pump::Closed,
     }
 }
 
@@ -977,12 +982,12 @@ fn expect_report(frame: &Value, connection_retries: u64) -> Result<(), Error> {
     let got = frame
         .pointer("/data/connection_retries")
         .and_then(Value::as_u64);
-    if got != Some(connection_retries) {
+    if got == Some(connection_retries) {
+        Ok(())
+    } else {
         Err(Error::new(format!(
             "connection_retries {got:?}, expected {connection_retries}"
         )))
-    } else {
-        Ok(())
     }
 }
 
@@ -1053,7 +1058,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let gate = Arc::new(Gate {
-            reject_budget: AtomicU32::new(0),
+            reject_budget: Mutex::new(0),
             hold_uploads: AtomicBool::new(false),
             upload_held: AtomicBool::new(false),
             upload_notify: Notify::new(),
@@ -1071,7 +1076,7 @@ mod tests {
         forward_connection(stream, gate, tx).await;
         client.await.unwrap();
         match rx.recv().await {
-            Some(Incoming::Failed(err)) => assert!(!err.to_string().is_empty()),
+            Some(Incoming::Failed(err)) => assert_ne!(err.to_string(), ""),
             _ => panic!("expected a handshake error"),
         }
     }

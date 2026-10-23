@@ -20,6 +20,8 @@ pub struct FragmentUpload {
     pub gzip_body: Vec<u8>,
 }
 
+/// # Errors
+/// Propagates the gzip encoder's I/O error.
 pub fn gzip_bytes(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(bytes)?;
@@ -51,6 +53,8 @@ pub(crate) fn fragment_endpoint(
     Ok(url.to_string())
 }
 
+/// # Errors
+/// Fails when the endpoint is invalid or all three attempts fail.
 pub async fn upload_fragment(upload: &FragmentUpload) -> Result<(), Error> {
     upload_fragment_retry(upload, Duration::from_secs(1)).await
 }
@@ -106,6 +110,7 @@ async fn post_once(
     }
 }
 
+#[must_use]
 pub fn resolve_run_identity(
     flag_run_id: &str,
     flag_run_attempt: &str,
@@ -125,6 +130,8 @@ pub fn resolve_run_identity(
     )
 }
 
+/// # Errors
+/// Fails when a leading `{` line isn't JSON or no gzip body follows it.
 pub fn split_fragment_stdin(raw: &[u8]) -> Result<(Option<Value>, Vec<u8>), Error> {
     if raw.first() != Some(&b'{') {
         return Ok((None, raw.to_vec()));

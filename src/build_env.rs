@@ -24,6 +24,7 @@ pub struct BuildEnv {
     pub git_provider: String,
 }
 
+#[must_use]
 pub fn detect_build_env() -> BuildEnv {
     detect_build_env_at(Path::new("."), |key| std::env::var(key).ok())
 }
@@ -35,85 +36,13 @@ pub(crate) fn detect_build_env_at(cwd: &Path, var: impl Fn(&str) -> Option<Strin
         ..BuildEnv::default()
     };
     if present(&var, "GITHUB_ACTIONS") {
-        env.platform = "github_actions".to_owned();
-        env.branch = first_non_empty(&var, &["GITHUB_HEAD_REF", "GITHUB_REF_NAME"]);
-        env.target_branch = value(&var, "GITHUB_BASE_REF");
-        env.actor = value(&var, "GITHUB_ACTOR");
-        env.sha = value(&var, "GITHUB_SHA");
-        env.run_id = value(&var, "GITHUB_RUN_ID");
-        env.run_attempt = value(&var, "GITHUB_RUN_ATTEMPT");
-        env.runner_id = value(&var, "SELECTIVE_RUNNER_ID");
-        env.commit_message = git_format(cwd, &env.sha, "%s");
-        env.committer_name = git_format(cwd, &env.sha, "%an");
-        env.committer_email = git_format(cwd, &env.sha, "%ae");
-        env.git_repo_full_name = value(&var, "GITHUB_REPOSITORY");
-        env.git_provider = "github".to_owned();
-        env.base_sha = github_base_sha(&var).unwrap_or_default();
+        fill_github(&var, &mut env, cwd);
     } else if present(&var, "CIRCLECI") {
-        env.platform = "circleci".to_owned();
-        env.branch = value(&var, "CIRCLE_BRANCH");
-        env.actor = first_non_empty(&var, &["CIRCLE_USERNAME", "CIRCLE_PR_USERNAME"]);
-        env.sha = value(&var, "CIRCLE_SHA1");
-        env.run_attempt = value(&var, "CIRCLE_BUILD_NUM");
-        env.runner_id = value(&var, "CIRCLE_NODE_INDEX");
-        env.commit_message = git_format(cwd, &env.sha, "%s");
-        env.committer_name = git_format(cwd, &env.sha, "%an");
-        env.committer_email = git_format(cwd, &env.sha, "%ae");
-        let username = value(&var, "CIRCLE_PROJECT_USERNAME");
-        let reponame = value(&var, "CIRCLE_PROJECT_REPONAME");
-        if !username.is_empty() && !reponame.is_empty() {
-            let repo_url = value(&var, "CIRCLE_REPOSITORY_URL");
-            let provider = provider_from_url(&repo_url);
-            if provider.as_deref() == Some("github") || repo_url.is_empty() {
-                env.git_repo_full_name = format!("{username}/{reponame}");
-                env.git_provider = provider.unwrap_or_else(|| "github".to_owned());
-            } else if let Some(provider) = provider {
-                env.git_provider = provider;
-            }
-        }
+        fill_circleci(&var, &mut env, cwd);
     } else if present(&var, "SEMAPHORE") {
-        env.platform = "semaphore".to_owned();
-        env.branch = first_non_empty(&var, &["SEMAPHORE_GIT_PR_BRANCH", "SEMAPHORE_GIT_BRANCH"]);
-        if !value(&var, "SEMAPHORE_GIT_PR_BRANCH").is_empty() {
-            env.target_branch = value(&var, "SEMAPHORE_GIT_BRANCH");
-        }
-        env.actor = value(&var, "SEMAPHORE_GIT_COMMITTER");
-        env.sha = value(&var, "SEMAPHORE_GIT_SHA");
-        env.run_id = value(&var, "SEMAPHORE_WORKFLOW_ID");
-        env.run_attempt = "1".to_owned();
-        env.runner_id = value(&var, "SEMAPHORE_JOB_ID");
-        env.pr_title = value(&var, "SEMAPHORE_GIT_PR_NAME");
-        env.commit_message = git_format(cwd, &env.sha, "%s");
-        env.committer_name = git_format(cwd, &env.sha, "%an");
-        env.committer_email = git_format(cwd, &env.sha, "%ae");
-        env.git_provider = value(&var, "SEMAPHORE_GIT_PROVIDER");
-        if env.git_provider == "github" {
-            env.git_repo_full_name = value(&var, "SEMAPHORE_GIT_REPO_SLUG");
-        }
-        let range = value(&var, "SEMAPHORE_GIT_COMMIT_RANGE");
-        if !range.is_empty() {
-            env.base_sha = range.split("...").next().unwrap_or("").to_owned();
-        }
+        fill_semaphore(&var, &mut env, cwd);
     } else if present(&var, "BUILDKITE") {
-        env.platform = "buildkite".to_owned();
-        env.branch = value(&var, "BUILDKITE_BRANCH");
-        env.target_branch = value(&var, "BUILDKITE_PULL_REQUEST_BASE_BRANCH");
-        env.actor = value(&var, "BUILDKITE_BUILD_AUTHOR");
-        env.sha = value(&var, "BUILDKITE_COMMIT");
-        env.run_id = value(&var, "BUILDKITE_BUILD_ID");
-        env.run_attempt = value(&var, "BUILDKITE_RETRY_COUNT");
-        env.runner_id = value(&var, "BUILDKITE_PARALLEL_JOB");
-        env.pr_title = value(&var, "BUILDKITE_PULL_REQUEST_TITLE");
-        env.commit_message = value(&var, "BUILDKITE_MESSAGE");
-        env.committer_name = value(&var, "BUILDKITE_BUILD_AUTHOR");
-        env.committer_email = value(&var, "BUILDKITE_BUILD_AUTHOR_EMAIL");
-        if value(&var, "BUILDKITE_PIPELINE_PROVIDER") == "github" {
-            env.git_provider = "github".to_owned();
-            env.git_repo_full_name =
-                parse_github_slug(&value(&var, "BUILDKITE_REPO")).unwrap_or_default();
-        } else {
-            env.git_provider = value(&var, "BUILDKITE_PIPELINE_PROVIDER");
-        }
+        fill_buildkite(&var, &mut env);
     } else if present(&var, "RWX") {
         fill_rwx(&var, &mut env, "RWX");
     } else if present(&var, "MINT") {
@@ -121,18 +50,7 @@ pub(crate) fn detect_build_env_at(cwd: &Path, var: impl Fn(&str) -> Option<Strin
     }
 
     if env.git_repo_full_name.is_empty() {
-        if let Some(origin) = git_origin(cwd) {
-            if let Some(slug) = parse_github_slug(&origin) {
-                env.git_repo_full_name = slug;
-                if env.git_provider.is_empty() {
-                    env.git_provider = "github".to_owned();
-                }
-            } else if env.git_provider.is_empty() {
-                if let Some(provider) = provider_from_url(&origin) {
-                    env.git_provider = provider;
-                }
-            }
-        }
+        fill_from_origin(&mut env, cwd);
     }
 
     for (key, field) in [
@@ -160,8 +78,111 @@ pub(crate) fn detect_build_env_at(cwd: &Path, var: impl Fn(&str) -> Option<Strin
     env
 }
 
+fn fill_github(var: &impl Fn(&str) -> Option<String>, env: &mut BuildEnv, cwd: &Path) {
+    env.platform = "github_actions".into();
+    env.branch = first_non_empty(var, &["GITHUB_HEAD_REF", "GITHUB_REF_NAME"]);
+    env.target_branch = value(var, "GITHUB_BASE_REF");
+    env.actor = value(var, "GITHUB_ACTOR");
+    env.sha = value(var, "GITHUB_SHA");
+    env.run_id = value(var, "GITHUB_RUN_ID");
+    env.run_attempt = value(var, "GITHUB_RUN_ATTEMPT");
+    env.runner_id = value(var, "SELECTIVE_RUNNER_ID");
+    env.commit_message = git_format(cwd, &env.sha, "%s");
+    env.committer_name = git_format(cwd, &env.sha, "%an");
+    env.committer_email = git_format(cwd, &env.sha, "%ae");
+    env.git_repo_full_name = value(var, "GITHUB_REPOSITORY");
+    env.git_provider = "github".into();
+    env.base_sha = github_base_sha(var).unwrap_or_default();
+}
+
+fn fill_circleci(var: &impl Fn(&str) -> Option<String>, env: &mut BuildEnv, cwd: &Path) {
+    env.platform = "circleci".into();
+    env.branch = value(var, "CIRCLE_BRANCH");
+    env.actor = first_non_empty(var, &["CIRCLE_USERNAME", "CIRCLE_PR_USERNAME"]);
+    env.sha = value(var, "CIRCLE_SHA1");
+    env.run_attempt = value(var, "CIRCLE_BUILD_NUM");
+    env.runner_id = value(var, "CIRCLE_NODE_INDEX");
+    env.commit_message = git_format(cwd, &env.sha, "%s");
+    env.committer_name = git_format(cwd, &env.sha, "%an");
+    env.committer_email = git_format(cwd, &env.sha, "%ae");
+    let username = value(var, "CIRCLE_PROJECT_USERNAME");
+    let reponame = value(var, "CIRCLE_PROJECT_REPONAME");
+    if !username.is_empty() && !reponame.is_empty() {
+        let repo_url = value(var, "CIRCLE_REPOSITORY_URL");
+        let provider = provider_from_url(&repo_url);
+        if provider.as_deref() == Some("github") || repo_url.is_empty() {
+            env.git_repo_full_name = format!("{username}/{reponame}");
+            env.git_provider = provider.unwrap_or_else(|| "github".to_owned());
+        } else if let Some(provider) = provider {
+            env.git_provider = provider;
+        }
+    }
+}
+
+fn fill_semaphore(var: &impl Fn(&str) -> Option<String>, env: &mut BuildEnv, cwd: &Path) {
+    env.platform = "semaphore".into();
+    env.branch = first_non_empty(var, &["SEMAPHORE_GIT_PR_BRANCH", "SEMAPHORE_GIT_BRANCH"]);
+    if !value(var, "SEMAPHORE_GIT_PR_BRANCH").is_empty() {
+        env.target_branch = value(var, "SEMAPHORE_GIT_BRANCH");
+    }
+    env.actor = value(var, "SEMAPHORE_GIT_COMMITTER");
+    env.sha = value(var, "SEMAPHORE_GIT_SHA");
+    env.run_id = value(var, "SEMAPHORE_WORKFLOW_ID");
+    env.run_attempt = "1".into();
+    env.runner_id = value(var, "SEMAPHORE_JOB_ID");
+    env.pr_title = value(var, "SEMAPHORE_GIT_PR_NAME");
+    env.commit_message = git_format(cwd, &env.sha, "%s");
+    env.committer_name = git_format(cwd, &env.sha, "%an");
+    env.committer_email = git_format(cwd, &env.sha, "%ae");
+    env.git_provider = value(var, "SEMAPHORE_GIT_PROVIDER");
+    if env.git_provider == "github" {
+        env.git_repo_full_name = value(var, "SEMAPHORE_GIT_REPO_SLUG");
+    }
+    let range = value(var, "SEMAPHORE_GIT_COMMIT_RANGE");
+    if !range.is_empty() {
+        env.base_sha = range.split("...").next().unwrap_or("").into();
+    }
+}
+
+fn fill_buildkite(var: &impl Fn(&str) -> Option<String>, env: &mut BuildEnv) {
+    env.platform = "buildkite".into();
+    env.branch = value(var, "BUILDKITE_BRANCH");
+    env.target_branch = value(var, "BUILDKITE_PULL_REQUEST_BASE_BRANCH");
+    env.actor = value(var, "BUILDKITE_BUILD_AUTHOR");
+    env.sha = value(var, "BUILDKITE_COMMIT");
+    env.run_id = value(var, "BUILDKITE_BUILD_ID");
+    env.run_attempt = value(var, "BUILDKITE_RETRY_COUNT");
+    env.runner_id = value(var, "BUILDKITE_PARALLEL_JOB");
+    env.pr_title = value(var, "BUILDKITE_PULL_REQUEST_TITLE");
+    env.commit_message = value(var, "BUILDKITE_MESSAGE");
+    env.committer_name = value(var, "BUILDKITE_BUILD_AUTHOR");
+    env.committer_email = value(var, "BUILDKITE_BUILD_AUTHOR_EMAIL");
+    if value(var, "BUILDKITE_PIPELINE_PROVIDER") == "github" {
+        env.git_provider = "github".into();
+        env.git_repo_full_name =
+            parse_github_slug(&value(var, "BUILDKITE_REPO")).unwrap_or_default();
+    } else {
+        env.git_provider = value(var, "BUILDKITE_PIPELINE_PROVIDER");
+    }
+}
+
+fn fill_from_origin(env: &mut BuildEnv, cwd: &Path) {
+    if let Some(origin) = git_origin(cwd) {
+        if let Some(slug) = parse_github_slug(&origin) {
+            env.git_repo_full_name = slug;
+            if env.git_provider.is_empty() {
+                env.git_provider = "github".into();
+            }
+        } else if env.git_provider.is_empty() {
+            if let Some(provider) = provider_from_url(&origin) {
+                env.git_provider = provider;
+            }
+        }
+    }
+}
+
 fn fill_rwx(var: &impl Fn(&str) -> Option<String>, env: &mut BuildEnv, prefix: &str) {
-    env.platform = "rwx".to_owned();
+    env.platform = "rwx".into();
     env.branch = value(var, &format!("{prefix}_GIT_REF_NAME"));
     env.actor = value(var, &format!("{prefix}_ACTOR"));
     env.sha = value(var, &format!("{prefix}_GIT_COMMIT_SHA"));
@@ -278,7 +299,7 @@ mod tests {
             .collect()
     }
 
-    fn lookup<'a>(map: &'a HashMap<String, String>) -> impl Fn(&str) -> Option<String> + 'a {
+    fn lookup(map: &HashMap<String, String>) -> impl Fn(&str) -> Option<String> + '_ {
         move |key| map.get(key).cloned()
     }
 
@@ -342,110 +363,113 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    type Pairs = &'static [(&'static str, &'static str)];
+
+    const CI_CASES: &[(Pairs, &str, &str, &str)] = &[
+        (
+            &[
+                ("CIRCLECI", "true"),
+                ("CIRCLE_PROJECT_USERNAME", "acme"),
+                ("CIRCLE_PROJECT_REPONAME", "widgets"),
+                ("CIRCLE_REPOSITORY_URL", "git@github.com:acme/widgets.git"),
+                ("CIRCLE_SHA1", "abc123"),
+            ],
+            "circleci",
+            "acme/widgets",
+            "github",
+        ),
+        (
+            &[
+                ("CIRCLECI", "true"),
+                ("CIRCLE_PROJECT_USERNAME", "acme"),
+                ("CIRCLE_PROJECT_REPONAME", "widgets"),
+                (
+                    "CIRCLE_REPOSITORY_URL",
+                    "git@bitbucket.org:acme/widgets.git",
+                ),
+            ],
+            "circleci",
+            "",
+            "bitbucket",
+        ),
+        (
+            &[
+                ("SEMAPHORE", "true"),
+                ("SEMAPHORE_GIT_PROVIDER", "github"),
+                ("SEMAPHORE_GIT_REPO_SLUG", "acme/widgets"),
+                ("SEMAPHORE_GIT_COMMIT_RANGE", "basefeedfeed...headfeedfeed"),
+            ],
+            "semaphore",
+            "acme/widgets",
+            "github",
+        ),
+        (
+            &[
+                ("BUILDKITE", "true"),
+                ("BUILDKITE_PIPELINE_PROVIDER", "github"),
+                ("BUILDKITE_REPO", "https://github.com/acme/widgets.git"),
+            ],
+            "buildkite",
+            "acme/widgets",
+            "github",
+        ),
+        (
+            &[
+                ("BUILDKITE", "true"),
+                ("BUILDKITE_PIPELINE_PROVIDER", "gitlab"),
+                ("BUILDKITE_REPO", "git@gitlab.com:acme/widgets.git"),
+            ],
+            "buildkite",
+            "",
+            "gitlab",
+        ),
+        (
+            &[
+                ("RWX", "true"),
+                ("RWX_GIT_REPOSITORY_NAME", "acme/widgets"),
+                (
+                    "RWX_GIT_REPOSITORY_URL",
+                    "https://github.com/acme/widgets.git",
+                ),
+            ],
+            "rwx",
+            "acme/widgets",
+            "github",
+        ),
+        (
+            &[
+                ("RWX", "true"),
+                ("RWX_GIT_REPOSITORY_NAME", "acme/widgets"),
+                (
+                    "RWX_GIT_REPOSITORY_URL",
+                    "https://gitlab.com/acme/widgets.git",
+                ),
+            ],
+            "rwx",
+            "",
+            "gitlab",
+        ),
+        (
+            &[
+                ("MINT", "true"),
+                ("MINT_GIT_REPOSITORY_NAME", "acme/widgets"),
+                ("MINT_GIT_REPOSITORY_URL", "git@github.com:acme/widgets.git"),
+            ],
+            "rwx",
+            "acme/widgets",
+            "github",
+        ),
+    ];
+
     #[test]
     fn circle_buildkite_semaphore_rwx_and_mint() {
         let dir = isolated();
-        let cases = [
-            (
-                vec![
-                    ("CIRCLECI", "true"),
-                    ("CIRCLE_PROJECT_USERNAME", "acme"),
-                    ("CIRCLE_PROJECT_REPONAME", "widgets"),
-                    ("CIRCLE_REPOSITORY_URL", "git@github.com:acme/widgets.git"),
-                    ("CIRCLE_SHA1", "abc123"),
-                ],
-                "circleci",
-                "acme/widgets",
-                "github",
-            ),
-            (
-                vec![
-                    ("CIRCLECI", "true"),
-                    ("CIRCLE_PROJECT_USERNAME", "acme"),
-                    ("CIRCLE_PROJECT_REPONAME", "widgets"),
-                    (
-                        "CIRCLE_REPOSITORY_URL",
-                        "git@bitbucket.org:acme/widgets.git",
-                    ),
-                ],
-                "circleci",
-                "",
-                "bitbucket",
-            ),
-            (
-                vec![
-                    ("SEMAPHORE", "true"),
-                    ("SEMAPHORE_GIT_PROVIDER", "github"),
-                    ("SEMAPHORE_GIT_REPO_SLUG", "acme/widgets"),
-                    ("SEMAPHORE_GIT_COMMIT_RANGE", "basefeedfeed...headfeedfeed"),
-                ],
-                "semaphore",
-                "acme/widgets",
-                "github",
-            ),
-            (
-                vec![
-                    ("BUILDKITE", "true"),
-                    ("BUILDKITE_PIPELINE_PROVIDER", "github"),
-                    ("BUILDKITE_REPO", "https://github.com/acme/widgets.git"),
-                ],
-                "buildkite",
-                "acme/widgets",
-                "github",
-            ),
-            (
-                vec![
-                    ("BUILDKITE", "true"),
-                    ("BUILDKITE_PIPELINE_PROVIDER", "gitlab"),
-                    ("BUILDKITE_REPO", "git@gitlab.com:acme/widgets.git"),
-                ],
-                "buildkite",
-                "",
-                "gitlab",
-            ),
-            (
-                vec![
-                    ("RWX", "true"),
-                    ("RWX_GIT_REPOSITORY_NAME", "acme/widgets"),
-                    (
-                        "RWX_GIT_REPOSITORY_URL",
-                        "https://github.com/acme/widgets.git",
-                    ),
-                ],
-                "rwx",
-                "acme/widgets",
-                "github",
-            ),
-            (
-                vec![
-                    ("RWX", "true"),
-                    ("RWX_GIT_REPOSITORY_NAME", "acme/widgets"),
-                    (
-                        "RWX_GIT_REPOSITORY_URL",
-                        "https://gitlab.com/acme/widgets.git",
-                    ),
-                ],
-                "rwx",
-                "",
-                "gitlab",
-            ),
-            (
-                vec![
-                    ("MINT", "true"),
-                    ("MINT_GIT_REPOSITORY_NAME", "acme/widgets"),
-                    ("MINT_GIT_REPOSITORY_URL", "git@github.com:acme/widgets.git"),
-                ],
-                "rwx",
-                "acme/widgets",
-                "github",
-            ),
-        ];
-        for (pairs, platform, slug, provider) in cases {
-            let map = env_map(&pairs);
+        for (pairs, platform, slug, provider) in CI_CASES {
+            let map = env_map(pairs);
             let env = detect_build_env_at(&dir, lookup(&map));
-            assert_eq!(env.platform, platform, "{pairs:?}");
-            assert_eq!(env.git_repo_full_name, slug, "{pairs:?}");
-            assert_eq!(env.git_provider, provider, "{pairs:?}");
+            assert_eq!(env.platform, *platform, "{pairs:?}");
+            assert_eq!(env.git_repo_full_name, *slug, "{pairs:?}");
+            assert_eq!(env.git_provider, *provider, "{pairs:?}");
             if pairs
                 .iter()
                 .any(|(key, _)| *key == "SEMAPHORE_GIT_COMMIT_RANGE")

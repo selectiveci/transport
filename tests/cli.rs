@@ -549,9 +549,7 @@ async fn conformance_run_client_drives_an_external_command() {
     let script = dir.join("client.sh");
     write_executable(
         &script,
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' invoked >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_TRANSPORT_URL\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_API_KEY\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_HOST\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUN_ID\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUN_ATTEMPT\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUNNER_ID\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_TEST_MAP_UPLOAD_KEY\" >> \"$1\"\nexec \"$2\" conformance-client\n",
-        ),
+        "#!/bin/sh\nprintf '%s\\n' invoked >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_TRANSPORT_URL\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_API_KEY\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_HOST\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUN_ID\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUN_ATTEMPT\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUNNER_ID\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_TEST_MAP_UPLOAD_KEY\" >> \"$1\"\nexec \"$2\" conformance-client\n",
     );
     let command = format!("{} {} {}", script.display(), marker.display(), bin());
     let output = Command::new(bin())

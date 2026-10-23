@@ -29,12 +29,14 @@ impl Default for FixtureIds {
 }
 
 impl FixtureIds {
+    /// # Errors
+    /// Fails when the file can't be read or isn't a JSON object of non-empty strings.
     pub fn load(path: &Path) -> Result<Self, Error> {
         let text = std::fs::read_to_string(path)?;
         Self::parse(&text)
     }
 
-    pub fn parse(text: &str) -> Result<Self, Error> {
+    pub(crate) fn parse(text: &str) -> Result<Self, Error> {
         let value: Value = serde_json::from_str(text)?;
         let object = value
             .as_object()
@@ -54,18 +56,18 @@ impl FixtureIds {
         Ok(ids)
     }
 
-    pub fn id(&self, role: &str) -> String {
+    pub(crate) fn id(&self, role: &str) -> String {
         self.roles
             .get(role)
             .cloned()
             .unwrap_or_else(|| role.to_owned())
     }
 
-    pub fn manifest_ids(&self) -> Vec<String> {
+    pub(crate) fn manifest_ids(&self) -> Vec<String> {
         ROLES.iter().map(|(role, _)| self.id(role)).collect()
     }
 
-    pub fn rewrite(&self, text: &str) -> Option<String> {
+    pub(crate) fn rewrite(&self, text: &str) -> Option<String> {
         for (role, literal) in ROLES {
             if text == *literal {
                 let mapped = self.id(role);

@@ -45,12 +45,12 @@ fn dispatch() -> Result<i32, transport::Error> {
         }
         Some("--stdio") => Ok(block_on(transport::stdio::run())),
         Some("--snapshot") => snapshot_main(args.next()),
-        Some("--upload-fragment") => upload_main(args.collect()),
+        Some("--upload-fragment") => upload_main(&args.collect::<Vec<_>>()),
         Some("--build-env") => {
             println!("{}", serde_json::to_string(&transport::detect_build_env())?);
             Ok(0)
         }
-        Some("conformance") => conformance_main(args.collect()),
+        Some("conformance") => conformance_main(&args.collect::<Vec<_>>()),
         Some("conformance-client") => conformance_client_main(args.any(|arg| arg == "--via-stdio")),
         Some(url) => match args.next() {
             Some(runner_id) => Ok(block_on(legacy_fifo::run(url, &runner_id))),
@@ -70,13 +70,13 @@ fn snapshot_main(dir: Option<String>) -> Result<i32, transport::Error> {
     }
 }
 
-fn upload_main(args: Vec<String>) -> Result<i32, transport::Error> {
+fn upload_main(args: &[String]) -> Result<i32, transport::Error> {
     let mut flag_run_id = String::new();
     let mut flag_run_attempt = String::new();
     let mut flag_runner_id = String::new();
     let mut index = 0;
     while index < args.len() {
-        let value = required(&args, index + 1, &args[index])?.to_owned();
+        let value = required(args, index + 1, &args[index])?.to_owned();
         match args[index].as_str() {
             "--run-id" => flag_run_id = value,
             "--run-attempt" => flag_run_attempt = value,
@@ -120,7 +120,7 @@ fn upload_main(args: Vec<String>) -> Result<i32, transport::Error> {
     Ok(0)
 }
 
-fn conformance_main(args: Vec<String>) -> Result<i32, transport::Error> {
+fn conformance_main(args: &[String]) -> Result<i32, transport::Error> {
     let mut scenario = None;
     let mut via = SuiteVia::Both;
     let mut command = None;
@@ -137,11 +137,11 @@ fn conformance_main(args: Vec<String>) -> Result<i32, transport::Error> {
             "run" => command = Some("run"),
             "--scenario" => {
                 index += 1;
-                scenario = Some(required(&args, index, "--scenario")?.to_owned());
+                scenario = Some(required(args, index, "--scenario")?.to_owned());
             }
             "--via" => {
                 index += 1;
-                via = match required(&args, index, "--via")? {
+                via = match required(args, index, "--via")? {
                     "direct" => SuiteVia::Direct,
                     "stdio" => SuiteVia::Stdio,
                     "both" => SuiteVia::Both,
@@ -152,11 +152,11 @@ fn conformance_main(args: Vec<String>) -> Result<i32, transport::Error> {
             }
             "--client" => {
                 index += 1;
-                client = Some(required(&args, index, "--client")?.to_owned());
+                client = Some(required(args, index, "--client")?.to_owned());
             }
             "--fixture-ids" => {
                 index += 1;
-                fixture_file = Some(required(&args, index, "--fixture-ids")?.to_owned());
+                fixture_file = Some(required(args, index, "--fixture-ids")?.to_owned());
             }
             other => {
                 return Err(transport::Error::new(format!(

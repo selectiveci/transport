@@ -11,6 +11,7 @@ pub struct TestMapTree {
     pub dirty: Vec<String>,
 }
 
+#[must_use]
 pub fn snapshot_tree(cwd: &Path) -> Option<TestMapTree> {
     let root = repo_root(cwd)?;
     let mut files = committed_files(&root)?;
@@ -134,7 +135,11 @@ fn hash_objects(root: &Path, paths: &[String]) -> Option<Vec<(String, String)>> 
         .spawn()
         .ok()?;
     let mut stdin = child.stdin.take()?;
-    let input: String = existing.iter().map(|path| format!("{path}\n")).collect();
+    let mut input = String::new();
+    for path in &existing {
+        input.push_str(path);
+        input.push('\n');
+    }
     let writer = std::thread::spawn(move || {
         use std::io::Write;
         stdin.write_all(input.as_bytes())
@@ -225,7 +230,7 @@ mod tests {
             Some(blob.as_str())
         );
         assert!(!tree.files.contains_key("noise.log"));
-        assert!(tree.dirty.is_empty());
+        assert_eq!(tree.dirty, Vec::<String>::new());
         assert_eq!(tree.prefix, "");
         assert!(tree.sha.is_some());
         let _ = fs::remove_dir_all(&root);

@@ -315,13 +315,12 @@ fn drain_polled(
     loop {
         match poll() {
             Ok(PollFrame::Empty) => return Action::Continue,
-            Ok(PollFrame::Closed) => return Action::Lost,
+            Ok(PollFrame::Closed) | Err(_) => return Action::Lost,
             Ok(PollFrame::Frame(frame)) => {
                 if let Some(value) = parse_frame(&frame) {
                     queued.push_back(value);
                 }
             }
-            Err(_) => return Action::Lost,
         }
     }
 }
@@ -341,7 +340,7 @@ async fn close_session(
     let override_status = command
         .get("exit_status")
         .and_then(Value::as_i64)
-        .map(|code| code as i32);
+        .and_then(|code| i32::try_from(code).ok());
     let report = json!({
         "type": "report_at_finish",
         "data": {
@@ -386,11 +385,7 @@ async fn finish_signal(
 }
 
 fn framework_status(state: &State) -> i32 {
-    if state.results.values().any(|status| status == "failed") {
-        1
-    } else {
-        0
-    }
+    i32::from(state.results.values().any(|status| status == "failed"))
 }
 
 fn remember(state: &mut State, id: &str, status: &str) {
@@ -514,9 +509,8 @@ async fn recv_frame(link: &mut Link, signals: &watch::Receiver<Option<&'static s
         biased;
         Some(signal) = next_signal(&mut signals) => FrameIn::Signal(signal),
         incoming = link.recv() => match incoming {
-            Ok(Some(frame)) => parse_frame(&frame).map(FrameIn::Value).unwrap_or(FrameIn::Lost),
-            Ok(None) => FrameIn::Lost,
-            Err(_) => FrameIn::Lost,
+            Ok(Some(frame)) => parse_frame(&frame).map_or(FrameIn::Lost, FrameIn::Value),
+            Ok(None) | Err(_) => FrameIn::Lost,
         },
     }
 }
@@ -576,7 +570,7 @@ impl Link {
     async fn send(&mut self, frame: &str) -> Result<(), Error> {
         match self {
             Self::Direct(session) => session.send(frame).await,
-            Self::Stdio(child) => child.send(frame).await,
+            Self::Stdio(child) => child.send(frame),
             Self::Closed => Err(Error::new("session closed")),
         }
     }
@@ -600,7 +594,10 @@ impl Link {
     async fn close(&mut self) -> Result<(), Error> {
         match self {
             Self::Direct(session) => session.close().await,
-            Self::Stdio(child) => child.close().await,
+            Self::Stdio(child) => {
+                child.close();
+                Ok(())
+            }
             Self::Closed => Ok(()),
         }
     }
@@ -660,7 +657,7 @@ impl StdioLink {
         })
     }
 
-    async fn send(&mut self, frame: &str) -> Result<(), Error> {
+    fn send(&mut self, frame: &str) -> Result<(), Error> {
         use std::io::Write;
         let stdin = self
             .stdin
@@ -679,7 +676,7 @@ impl StdioLink {
         poll_frames(&mut self.incoming)
     }
 
-    async fn close(&mut self) -> Result<(), Error> {
+    fn close(&mut self) {
         use std::io::Write;
         if let Some(mut stdin) = self.stdin.take() {
             let _ = writeln!(stdin, "exit");
@@ -687,7 +684,6 @@ impl StdioLink {
             drop(stdin);
         }
         let _ = self.child.wait();
-        Ok(())
     }
 }
 
