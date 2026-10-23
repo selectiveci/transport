@@ -265,52 +265,8 @@ fn client_command(trial: &Trial<'_>) -> Result<Command, Error> {
 }
 
 fn shell_words(input: &str) -> Result<Vec<String>, Error> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut chars = input.chars().peekable();
-    let mut in_word = false;
-    let mut quote = None;
-    while let Some(ch) = chars.next() {
-        match quote {
-            Some(mark) if ch == mark => quote = None,
-            Some(_) if ch == '\\' => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-                in_word = true;
-            }
-            Some(_) => {
-                current.push(ch);
-                in_word = true;
-            }
-            None if ch == '\'' || ch == '"' => {
-                quote = Some(ch);
-                in_word = true;
-            }
-            None if ch == '\\' => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-                in_word = true;
-            }
-            None if ch.is_whitespace() => {
-                if in_word {
-                    words.push(std::mem::take(&mut current));
-                    in_word = false;
-                }
-            }
-            None => {
-                current.push(ch);
-                in_word = true;
-            }
-        }
-    }
-    if quote.is_some() {
-        return Err(Error::new("unclosed quote in --client command"));
-    }
-    if in_word {
-        words.push(current);
-    }
+    let words = shell_words::split(input)
+        .map_err(|_| Error::new("unclosed quote in --client command"))?;
     if words.is_empty() {
         return Err(Error::new("--client command is empty"));
     }
@@ -1204,7 +1160,9 @@ mod tests {
             shell_words(r#"say "two words" 'and more'"#).unwrap(),
             vec!["say", "two words", "and more"]
         );
+        assert_eq!(shell_words(r"'a\b'").unwrap(), vec![r"a\b"]);
         assert!(shell_words("  ").is_err());
+        assert!(shell_words("'unterminated").is_err());
         assert!(idle_duration(Duration::from_secs(20)) > Duration::from_secs(60));
         assert_eq!(
             idle_duration(Duration::from_millis(200)),

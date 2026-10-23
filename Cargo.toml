@@ -21,6 +21,7 @@ serde = { version = "1.0.210", features = ["derive"] }
 serde_json = { version = "1.0.128", features = ["preserve_order"] }
 reqwest = { version = "0.12.8", default-features = false, features = ["rustls-tls-native-roots"] }
 flate2 = { version = "1.0.34", default-features = false, features = ["rust_backend"] }
+shell-words = "1.1.1"
 
 [profile.release]
 strip = true
