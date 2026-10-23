@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -421,6 +421,48 @@ fn client_env(command: &mut Command, trial: &Trial<'_>, url: &str, host: &str) {
     command.envs(runner_env_defaults(|key| std::env::var(key).ok()));
 }
 
+static NEXT_TRIAL: AtomicU32 = AtomicU32::new(0);
+
+struct TrialPipes {
+    dir: std::path::PathBuf,
+    prefix: Option<String>,
+}
+
+impl TrialPipes {
+    fn new(trial: &Trial<'_>, dir: &Path) -> Self {
+        let fifo = trial.client.is_none() && matches!(trial.via, Via::Fifo);
+        Self {
+            dir: dir.to_path_buf(),
+            prefix: fifo.then(|| {
+                format!(
+                    "conformance-{}-t{}",
+                    std::process::id(),
+                    NEXT_TRIAL.fetch_add(1, Ordering::Relaxed)
+                )
+            }),
+        }
+    }
+}
+
+impl Drop for TrialPipes {
+    fn drop(&mut self) {
+        let Some(prefix) = &self.prefix else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        let stem = format!("{prefix}-");
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&stem) && (name.ends_with("_1") || name.ends_with("_2")) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
     if let Some(why) = not_applicable(trial) {
         return Ok(Played::NotApplicable(why.to_owned()));
@@ -442,6 +484,10 @@ async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
     let logs = Arc::new(Mutex::new(String::new()));
     let mut command = client_command(trial)?;
     client_env(&mut command, trial, &url, &format!("ws://{addr}"));
+    let pipes = TrialPipes::new(trial, Path::new("/tmp"));
+    if let Some(prefix) = &pipes.prefix {
+        command.env("SELECTIVE_CONFORMANCE_FIFO_PREFIX", prefix);
+    }
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1538,6 +1584,52 @@ mod tests {
         });
         assert!(!kept.iter().any(|(key, _)| *key == "SELECTIVE_BRANCH"));
         assert!(kept.iter().any(|(key, _)| *key == "SELECTIVE_SHA"));
+    }
+
+    #[test]
+    fn trial_pipes_removes_only_its_own_fifo_pair() {
+        let dir = std::env::temp_dir().join(format!("trial-pipes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let scenario: Scenario = serde_json::from_str(include_str!(
+            "../../../conformance/scenarios/happy_two_batches.json"
+        ))
+        .unwrap();
+        let fixtures = FixtureIds::default();
+        let trial = |via| Trial {
+            bin: Path::new("transport-conformance"),
+            scenario: &scenario,
+            via,
+            client: None,
+            fixture_file: None,
+            fixtures: &fixtures,
+            before_all_seconds: None,
+            transport: None,
+            pace: conformance_pace(),
+        };
+        assert!(TrialPipes::new(&trial(Via::Stdio), &dir).prefix.is_none());
+        let pipes = TrialPipes::new(&trial(Via::Fifo), &dir);
+        let prefix = pipes.prefix.clone().unwrap();
+        let mine = [
+            format!("{prefix}-0_1"),
+            format!("{prefix}-0_2"),
+            format!("{prefix}-1_1"),
+        ];
+        let others = [
+            format!("{prefix}0-0_1"),
+            format!("{prefix}-0_3"),
+            "conformance-1-t1-0_1".to_owned(),
+        ];
+        for name in mine.iter().chain(&others) {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+        drop(pipes);
+        for name in &mine {
+            assert!(!dir.join(name).exists(), "{name}");
+        }
+        for name in &others {
+            assert!(dir.join(name).exists(), "{name}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

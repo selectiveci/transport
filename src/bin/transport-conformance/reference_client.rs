@@ -781,11 +781,11 @@ struct FifoLink {
 
 impl FifoLink {
     async fn spawn(url: &str, transport: &Path) -> Result<Self, Error> {
-        let id = format!(
-            "conformance-{}-{}",
-            std::process::id(),
-            NEXT_PIPE.fetch_add(1, Ordering::Relaxed)
-        );
+        let prefix = std::env::var("SELECTIVE_CONFORMANCE_FIFO_PREFIX")
+            .ok()
+            .filter(|prefix| !prefix.is_empty())
+            .unwrap_or_else(|| format!("conformance-{}", std::process::id()));
+        let id = format!("{prefix}-{}", NEXT_PIPE.fetch_add(1, Ordering::Relaxed));
         let pipes = [
             PathBuf::from(format!("/tmp/{id}_1")),
             PathBuf::from(format!("/tmp/{id}_2")),
