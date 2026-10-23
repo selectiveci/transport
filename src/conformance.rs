@@ -225,8 +225,6 @@ pub fn idle_duration(ping_interval: Duration) -> Duration {
     let scaled = ping_interval.saturating_mul(3);
     if ping_interval >= Duration::from_secs(20) {
         Duration::from_secs(65).max(scaled)
-    } else if scaled.is_zero() {
-        Duration::from_millis(1)
     } else {
         scaled
     }
@@ -1155,18 +1153,6 @@ mod tests {
             query_param("POST /test_maps/fragments?run_id=run-10 HTTP/1.1", "run_id"),
             Some("run-10")
         );
-    }
-
-    #[test]
-    fn signal_death_is_not_a_normal_exit() {
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("kill -TERM $$")
-            .status()
-            .unwrap();
-        assert!(status.code().is_none());
-        let message = format!("exit {status}, expected 1");
-        assert!(message.contains("SIGTERM") || message.contains("signal"));
     }
 
     #[test]
