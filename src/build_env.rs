@@ -1,11 +1,9 @@
-use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
 
 use serde::Serialize;
 use serde_json::Value;
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct BuildEnv {
     pub api_key: String,
     pub host: String,
@@ -27,191 +25,165 @@ pub struct BuildEnv {
 }
 
 pub fn detect_build_env() -> BuildEnv {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-    detect_build_env_at(&cwd, |key| std::env::var(key).ok())
+    detect_build_env_at(Path::new("."), |key| std::env::var(key).ok())
 }
 
 pub fn detect_build_env_at(cwd: &Path, var: impl Fn(&str) -> Option<String>) -> BuildEnv {
-    let mut detected = Detected::default();
+    let mut env = BuildEnv {
+        api_key: value(&var, "SELECTIVE_API_KEY"),
+        host: "wss://app.selective.ci".to_owned(),
+        ..BuildEnv::default()
+    };
     if present(&var, "GITHUB_ACTIONS") {
-        detected.platform = "github_actions".to_owned();
-        detected.branch = first_non_empty(&var, &["GITHUB_HEAD_REF", "GITHUB_REF_NAME"]);
-        detected.target_branch = value(&var, "GITHUB_BASE_REF");
-        detected.actor = value(&var, "GITHUB_ACTOR");
-        detected.sha = value(&var, "GITHUB_SHA");
-        detected.run_id = value(&var, "GITHUB_RUN_ID");
-        detected.run_attempt = value(&var, "GITHUB_RUN_ATTEMPT");
-        detected.runner_id = value(&var, "SELECTIVE_RUNNER_ID");
-        detected.commit_message = git_format(cwd, &detected.sha, "%s");
-        detected.committer_name = git_show(cwd, &detected.sha, "%an");
-        detected.committer_email = git_show(cwd, &detected.sha, "%ae");
-        detected.git_repo_full_name = value(&var, "GITHUB_REPOSITORY");
-        detected.git_provider = "github".to_owned();
-        detected.base_sha = github_base_sha(&var);
+        env.platform = "github_actions".to_owned();
+        env.branch = first_non_empty(&var, &["GITHUB_HEAD_REF", "GITHUB_REF_NAME"]);
+        env.target_branch = value(&var, "GITHUB_BASE_REF");
+        env.actor = value(&var, "GITHUB_ACTOR");
+        env.sha = value(&var, "GITHUB_SHA");
+        env.run_id = value(&var, "GITHUB_RUN_ID");
+        env.run_attempt = value(&var, "GITHUB_RUN_ATTEMPT");
+        env.runner_id = value(&var, "SELECTIVE_RUNNER_ID");
+        env.commit_message = git_format(cwd, &env.sha, "%s");
+        env.committer_name = git_format(cwd, &env.sha, "%an");
+        env.committer_email = git_format(cwd, &env.sha, "%ae");
+        env.git_repo_full_name = value(&var, "GITHUB_REPOSITORY");
+        env.git_provider = "github".to_owned();
+        env.base_sha = github_base_sha(&var).unwrap_or_default();
     } else if present(&var, "CIRCLECI") {
-        detected.platform = "circleci".to_owned();
-        detected.branch = value(&var, "CIRCLE_BRANCH");
-        detected.actor = first_non_empty(&var, &["CIRCLE_USERNAME", "CIRCLE_PR_USERNAME"]);
-        detected.sha = value(&var, "CIRCLE_SHA1");
-        detected.run_attempt = value(&var, "CIRCLE_BUILD_NUM");
-        detected.runner_id = value(&var, "CIRCLE_NODE_INDEX");
-        detected.commit_message = git_format(cwd, &detected.sha, "%s");
-        detected.committer_name = git_show(cwd, &detected.sha, "%an");
-        detected.committer_email = git_show(cwd, &detected.sha, "%ae");
+        env.platform = "circleci".to_owned();
+        env.branch = value(&var, "CIRCLE_BRANCH");
+        env.actor = first_non_empty(&var, &["CIRCLE_USERNAME", "CIRCLE_PR_USERNAME"]);
+        env.sha = value(&var, "CIRCLE_SHA1");
+        env.run_attempt = value(&var, "CIRCLE_BUILD_NUM");
+        env.runner_id = value(&var, "CIRCLE_NODE_INDEX");
+        env.commit_message = git_format(cwd, &env.sha, "%s");
+        env.committer_name = git_format(cwd, &env.sha, "%an");
+        env.committer_email = git_format(cwd, &env.sha, "%ae");
         let username = value(&var, "CIRCLE_PROJECT_USERNAME");
         let reponame = value(&var, "CIRCLE_PROJECT_REPONAME");
         if !username.is_empty() && !reponame.is_empty() {
             let repo_url = value(&var, "CIRCLE_REPOSITORY_URL");
             let provider = provider_from_url(&repo_url);
             if provider.as_deref() == Some("github") || repo_url.is_empty() {
-                detected.git_repo_full_name = format!("{username}/{reponame}");
-                detected.git_provider = provider.unwrap_or_else(|| "github".to_owned());
+                env.git_repo_full_name = format!("{username}/{reponame}");
+                env.git_provider = provider.unwrap_or_else(|| "github".to_owned());
             } else if let Some(provider) = provider {
-                detected.git_provider = provider;
+                env.git_provider = provider;
             }
         }
     } else if present(&var, "SEMAPHORE") {
-        detected.platform = "semaphore".to_owned();
-        detected.branch =
+        env.platform = "semaphore".to_owned();
+        env.branch =
             first_non_empty(&var, &["SEMAPHORE_GIT_PR_BRANCH", "SEMAPHORE_GIT_BRANCH"]);
         if !value(&var, "SEMAPHORE_GIT_PR_BRANCH").is_empty() {
-            detected.target_branch = value(&var, "SEMAPHORE_GIT_BRANCH");
+            env.target_branch = value(&var, "SEMAPHORE_GIT_BRANCH");
         }
-        detected.actor = value(&var, "SEMAPHORE_GIT_COMMITTER");
-        detected.sha = value(&var, "SEMAPHORE_GIT_SHA");
-        detected.run_id = value(&var, "SEMAPHORE_WORKFLOW_ID");
-        detected.run_attempt = "1".to_owned();
-        detected.runner_id = value(&var, "SEMAPHORE_JOB_ID");
-        detected.pr_title = value(&var, "SEMAPHORE_GIT_PR_NAME");
-        detected.commit_message = git_format(cwd, &detected.sha, "%s");
-        detected.committer_name = git_show(cwd, &detected.sha, "%an");
-        detected.committer_email = git_show(cwd, &detected.sha, "%ae");
-        detected.git_provider = value(&var, "SEMAPHORE_GIT_PROVIDER");
-        if detected.git_provider == "github" {
-            detected.git_repo_full_name = value(&var, "SEMAPHORE_GIT_REPO_SLUG");
+        env.actor = value(&var, "SEMAPHORE_GIT_COMMITTER");
+        env.sha = value(&var, "SEMAPHORE_GIT_SHA");
+        env.run_id = value(&var, "SEMAPHORE_WORKFLOW_ID");
+        env.run_attempt = "1".to_owned();
+        env.runner_id = value(&var, "SEMAPHORE_JOB_ID");
+        env.pr_title = value(&var, "SEMAPHORE_GIT_PR_NAME");
+        env.commit_message = git_format(cwd, &env.sha, "%s");
+        env.committer_name = git_format(cwd, &env.sha, "%an");
+        env.committer_email = git_format(cwd, &env.sha, "%ae");
+        env.git_provider = value(&var, "SEMAPHORE_GIT_PROVIDER");
+        if env.git_provider == "github" {
+            env.git_repo_full_name = value(&var, "SEMAPHORE_GIT_REPO_SLUG");
         }
         let range = value(&var, "SEMAPHORE_GIT_COMMIT_RANGE");
         if !range.is_empty() {
-            detected.base_sha = range.split("...").next().unwrap_or("").to_owned();
+            env.base_sha = range.split("...").next().unwrap_or("").to_owned();
         }
     } else if present(&var, "BUILDKITE") {
-        detected.platform = "buildkite".to_owned();
-        detected.branch = value(&var, "BUILDKITE_BRANCH");
-        detected.target_branch = value(&var, "BUILDKITE_PULL_REQUEST_BASE_BRANCH");
-        detected.actor = value(&var, "BUILDKITE_BUILD_AUTHOR");
-        detected.sha = value(&var, "BUILDKITE_COMMIT");
-        detected.run_id = value(&var, "BUILDKITE_BUILD_ID");
-        detected.run_attempt = value(&var, "BUILDKITE_RETRY_COUNT");
-        detected.runner_id = value(&var, "BUILDKITE_PARALLEL_JOB");
-        detected.pr_title = value(&var, "BUILDKITE_PULL_REQUEST_TITLE");
-        detected.commit_message = value(&var, "BUILDKITE_MESSAGE");
-        detected.committer_name = value(&var, "BUILDKITE_BUILD_AUTHOR");
-        detected.committer_email = value(&var, "BUILDKITE_BUILD_AUTHOR_EMAIL");
+        env.platform = "buildkite".to_owned();
+        env.branch = value(&var, "BUILDKITE_BRANCH");
+        env.target_branch = value(&var, "BUILDKITE_PULL_REQUEST_BASE_BRANCH");
+        env.actor = value(&var, "BUILDKITE_BUILD_AUTHOR");
+        env.sha = value(&var, "BUILDKITE_COMMIT");
+        env.run_id = value(&var, "BUILDKITE_BUILD_ID");
+        env.run_attempt = value(&var, "BUILDKITE_RETRY_COUNT");
+        env.runner_id = value(&var, "BUILDKITE_PARALLEL_JOB");
+        env.pr_title = value(&var, "BUILDKITE_PULL_REQUEST_TITLE");
+        env.commit_message = value(&var, "BUILDKITE_MESSAGE");
+        env.committer_name = value(&var, "BUILDKITE_BUILD_AUTHOR");
+        env.committer_email = value(&var, "BUILDKITE_BUILD_AUTHOR_EMAIL");
         if value(&var, "BUILDKITE_PIPELINE_PROVIDER") == "github" {
-            detected.git_provider = "github".to_owned();
-            detected.git_repo_full_name =
+            env.git_provider = "github".to_owned();
+            env.git_repo_full_name =
                 parse_github_slug(&value(&var, "BUILDKITE_REPO")).unwrap_or_default();
         } else {
-            detected.git_provider = value(&var, "BUILDKITE_PIPELINE_PROVIDER");
+            env.git_provider = value(&var, "BUILDKITE_PIPELINE_PROVIDER");
         }
     } else if present(&var, "RWX") {
-        fill_rwx(&var, &mut detected, "RWX");
+        fill_rwx(&var, &mut env, "RWX");
     } else if present(&var, "MINT") {
-        fill_rwx(&var, &mut detected, "MINT");
+        fill_rwx(&var, &mut env, "MINT");
     }
 
-    if detected.git_repo_full_name.is_empty() {
+    if env.git_repo_full_name.is_empty() {
         if let Some(origin) = git_origin(cwd) {
             if let Some(slug) = parse_github_slug(&origin) {
-                detected.git_repo_full_name = slug;
-                if detected.git_provider.is_empty() {
-                    detected.git_provider = "github".to_owned();
+                env.git_repo_full_name = slug;
+                if env.git_provider.is_empty() {
+                    env.git_provider = "github".to_owned();
                 }
-            } else if detected.git_provider.is_empty() {
+            } else if env.git_provider.is_empty() {
                 if let Some(provider) = provider_from_url(&origin) {
-                    detected.git_provider = provider;
+                    env.git_provider = provider;
                 }
             }
         }
     }
 
-    BuildEnv {
-        api_key: value(&var, "SELECTIVE_API_KEY"),
-        host: override_var(&var, "SELECTIVE_HOST", "wss://app.selective.ci".to_owned()),
-        platform: override_var(&var, "SELECTIVE_PLATFORM", detected.platform),
-        branch: override_var(&var, "SELECTIVE_BRANCH", detected.branch),
-        pr_title: override_var(&var, "SELECTIVE_PR_TITLE", detected.pr_title),
-        target_branch: override_var(&var, "SELECTIVE_TARGET_BRANCH", detected.target_branch),
-        actor: override_var(&var, "SELECTIVE_ACTOR", detected.actor),
-        sha: override_var(&var, "SELECTIVE_SHA", detected.sha),
-        base_sha: override_var(&var, "SELECTIVE_BASE_SHA", detected.base_sha),
-        run_id: override_var(&var, "SELECTIVE_RUN_ID", detected.run_id),
-        run_attempt: override_var(&var, "SELECTIVE_RUN_ATTEMPT", detected.run_attempt),
-        runner_id: override_var(&var, "SELECTIVE_RUNNER_ID", detected.runner_id),
-        commit_message: override_var(&var, "SELECTIVE_COMMIT_MESSAGE", detected.commit_message),
-        committer_name: override_var(&var, "SELECTIVE_COMMITTER_NAME", detected.committer_name),
-        committer_email: override_var(&var, "SELECTIVE_COMMITTER_EMAIL", detected.committer_email),
-        git_repo_full_name: override_var(&var, "SELECTIVE_GIT_REPO", detected.git_repo_full_name),
-        git_provider: override_var(&var, "SELECTIVE_GIT_PROVIDER", detected.git_provider),
+    for (key, field) in [
+        ("SELECTIVE_HOST", &mut env.host),
+        ("SELECTIVE_PLATFORM", &mut env.platform),
+        ("SELECTIVE_BRANCH", &mut env.branch),
+        ("SELECTIVE_PR_TITLE", &mut env.pr_title),
+        ("SELECTIVE_TARGET_BRANCH", &mut env.target_branch),
+        ("SELECTIVE_ACTOR", &mut env.actor),
+        ("SELECTIVE_SHA", &mut env.sha),
+        ("SELECTIVE_BASE_SHA", &mut env.base_sha),
+        ("SELECTIVE_RUN_ID", &mut env.run_id),
+        ("SELECTIVE_RUN_ATTEMPT", &mut env.run_attempt),
+        ("SELECTIVE_RUNNER_ID", &mut env.runner_id),
+        ("SELECTIVE_COMMIT_MESSAGE", &mut env.commit_message),
+        ("SELECTIVE_COMMITTER_NAME", &mut env.committer_name),
+        ("SELECTIVE_COMMITTER_EMAIL", &mut env.committer_email),
+        ("SELECTIVE_GIT_REPO", &mut env.git_repo_full_name),
+        ("SELECTIVE_GIT_PROVIDER", &mut env.git_provider),
+    ] {
+        if let Some(overridden) = var(key).filter(|value| !value.is_empty()) {
+            *field = overridden;
+        }
     }
+    env
 }
 
-pub fn build_env_json() -> String {
-    serde_json::to_string(&detect_build_env()).unwrap_or_else(|_| "{}".to_owned())
-}
-
-#[derive(Default)]
-struct Detected {
-    platform: String,
-    branch: String,
-    pr_title: String,
-    target_branch: String,
-    actor: String,
-    sha: String,
-    base_sha: String,
-    run_id: String,
-    run_attempt: String,
-    runner_id: String,
-    commit_message: String,
-    committer_name: String,
-    committer_email: String,
-    git_repo_full_name: String,
-    git_provider: String,
-}
-
-fn fill_rwx(var: &impl Fn(&str) -> Option<String>, detected: &mut Detected, prefix: &str) {
-    detected.platform = "rwx".to_owned();
-    detected.branch = value(var, &format!("{prefix}_GIT_REF_NAME"));
-    detected.actor = value(var, &format!("{prefix}_ACTOR"));
-    detected.sha = value(var, &format!("{prefix}_GIT_COMMIT_SHA"));
-    detected.run_id = value(var, &format!("{prefix}_RUN_ID"));
-    detected.run_attempt = value(var, &format!("{prefix}_TASK_ATTEMPT_NUMBER"));
-    detected.runner_id = value(var, &format!("{prefix}_PARALLEL_INDEX"));
-    detected.commit_message = value(var, &format!("{prefix}_GIT_COMMIT_SUMMARY"));
-    detected.committer_name = value(var, &format!("{prefix}_GIT_COMMITTER_NAME"));
-    detected.committer_email = value(var, &format!("{prefix}_GIT_COMMITTER_EMAIL"));
+fn fill_rwx(var: &impl Fn(&str) -> Option<String>, env: &mut BuildEnv, prefix: &str) {
+    env.platform = "rwx".to_owned();
+    env.branch = value(var, &format!("{prefix}_GIT_REF_NAME"));
+    env.actor = value(var, &format!("{prefix}_ACTOR"));
+    env.sha = value(var, &format!("{prefix}_GIT_COMMIT_SHA"));
+    env.run_id = value(var, &format!("{prefix}_RUN_ID"));
+    env.run_attempt = value(var, &format!("{prefix}_TASK_ATTEMPT_NUMBER"));
+    env.runner_id = value(var, &format!("{prefix}_PARALLEL_INDEX"));
+    env.commit_message = value(var, &format!("{prefix}_GIT_COMMIT_SUMMARY"));
+    env.committer_name = value(var, &format!("{prefix}_GIT_COMMITTER_NAME"));
+    env.committer_email = value(var, &format!("{prefix}_GIT_COMMITTER_EMAIL"));
     let repo_url = value(var, &format!("{prefix}_GIT_REPOSITORY_URL"));
     if let Some(provider) = provider_from_url(&repo_url) {
-        detected.git_provider = provider;
+        env.git_provider = provider;
     }
-    if detected.git_provider == "github" {
-        detected.git_repo_full_name = value(var, &format!("{prefix}_GIT_REPOSITORY_NAME"));
+    if env.git_provider == "github" {
+        env.git_repo_full_name = value(var, &format!("{prefix}_GIT_REPOSITORY_NAME"));
     }
 }
 
-fn github_base_sha(var: &impl Fn(&str) -> Option<String>) -> String {
-    let Some(path) = var("GITHUB_EVENT_PATH") else {
-        return String::new();
-    };
-    if path.is_empty() {
-        return String::new();
-    }
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return String::new();
-    };
-    let Ok(json) = serde_json::from_str::<Value>(&text) else {
-        return String::new();
-    };
+fn github_base_sha(var: &impl Fn(&str) -> Option<String>) -> Option<String> {
+    let text = std::fs::read_to_string(var("GITHUB_EVENT_PATH")?).ok()?;
+    let json: Value = serde_json::from_str(&text).ok()?;
     let sha = json
         .pointer("/pull_request/base/sha")
         .and_then(Value::as_str)
@@ -222,12 +194,11 @@ fn github_base_sha(var: &impl Fn(&str) -> Option<String>) -> String {
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned)
-        })
-        .unwrap_or_default();
-    if sha.chars().all(|ch| ch == '0') && !sha.is_empty() {
-        String::new()
+        })?;
+    if sha.chars().all(|ch| ch == '0') {
+        None
     } else {
-        sha
+        Some(sha)
     }
 }
 
@@ -246,13 +217,6 @@ fn first_non_empty(var: &impl Fn(&str) -> Option<String>, keys: &[&str]) -> Stri
         .unwrap_or_default()
 }
 
-fn override_var(var: &impl Fn(&str) -> Option<String>, key: &str, detected: String) -> String {
-    match var(key) {
-        Some(value) if !value.is_empty() => value,
-        _ => detected,
-    }
-}
-
 fn provider_from_url(url: &str) -> Option<String> {
     if url.contains("github.com") {
         Some("github".to_owned())
@@ -266,19 +230,15 @@ fn provider_from_url(url: &str) -> Option<String> {
 }
 
 pub fn parse_github_slug(url: &str) -> Option<String> {
-    let rest = if let Some(rest) = url.strip_prefix("git@github.com:") {
-        rest
-    } else if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
-        rest
-    } else if let Some(rest) = url.strip_prefix("git://github.com/") {
-        rest
-    } else if let Some(rest) = url.strip_prefix("https://github.com/") {
-        rest
-    } else if let Some(rest) = url.strip_prefix("http://github.com/") {
-        rest
-    } else {
-        return None;
-    };
+    let rest = [
+        "git@github.com:",
+        "ssh://git@github.com/",
+        "git://github.com/",
+        "https://github.com/",
+        "http://github.com/",
+    ]
+    .iter()
+    .find_map(|prefix| url.strip_prefix(prefix))?;
     let rest = rest.trim_end_matches('/');
     let rest = rest.strip_suffix(".git").unwrap_or(rest);
     if rest.is_empty() {
@@ -289,22 +249,9 @@ pub fn parse_github_slug(url: &str) -> Option<String> {
 }
 
 fn git_origin(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["config", "--get", "remote.origin.url"])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if url.is_empty() {
-            None
-        } else {
-            Some(url)
-        }
-    } else {
-        None
-    }
+    crate::snapshot::git(cwd, &["config", "--get", "remote.origin.url"])
+        .map(|url| url.trim().to_owned())
+        .filter(|url| !url.is_empty())
 }
 
 fn git_format(cwd: &Path, sha: &str, format: &str) -> String {
@@ -313,49 +260,24 @@ fn git_format(cwd: &Path, sha: &str, format: &str) -> String {
     if !sha.is_empty() {
         args.push(sha);
     }
-    git_stdout(cwd, &args)
+    crate::snapshot::git(cwd, &args)
         .unwrap_or_default()
         .trim_end_matches(['\n', '\r'])
         .to_owned()
-}
-
-fn git_show(cwd: &Path, sha: &str, format: &str) -> String {
-    let spec = format!("--format={format}");
-    let mut args = vec!["show", "-s", spec.as_str(), "-n", "1"];
-    if !sha.is_empty() {
-        args.push(sha);
-    }
-    git_stdout(cwd, &args)
-        .unwrap_or_default()
-        .trim_end_matches(['\n', '\r'])
-        .to_owned()
-}
-
-fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        None
-    }
-}
-
-pub fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs
-        .iter()
-        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::fs;
+
+    fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
 
     fn lookup<'a>(map: &'a HashMap<String, String>) -> impl Fn(&str) -> Option<String> + 'a {
         move |key| map.get(key).cloned()

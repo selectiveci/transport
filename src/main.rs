@@ -2,7 +2,6 @@
 
 use std::path::PathBuf;
 
-use transport::build_env::build_env_json;
 use transport::conformance::{run_suite_with, scenario_names, ConformanceRun, SuiteVia};
 use transport::reference_client::{RunOpts, Via};
 use transport::upload::{
@@ -49,7 +48,7 @@ fn dispatch() -> Result<i32, transport::Error> {
         Some("--snapshot") => snapshot_main(args.next()),
         Some("--upload-fragment") => upload_main(args.collect()),
         Some("--build-env") => {
-            println!("{}", build_env_json());
+            println!("{}", serde_json::to_string(&transport::detect_build_env())?);
             Ok(0)
         }
         Some("conformance") => conformance_main(args.collect()),
