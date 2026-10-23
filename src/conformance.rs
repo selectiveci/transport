@@ -994,8 +994,8 @@ fn expect_manifest(frame: &Value, tree: bool, expected_ids: &[String]) -> Result
 }
 
 fn repo_relative_backtrace(frame: &str) -> bool {
-    let frame = frame.trim();
-    if frame.is_empty() || frame.starts_with('/') || frame.starts_with('\\') {
+    let frame = frame.trim().replace('\\', "/");
+    if frame.is_empty() || frame.starts_with('/') {
         return false;
     }
     let bytes = frame.as_bytes();
@@ -1004,19 +1004,12 @@ fn repo_relative_backtrace(frame: &str) -> bool {
     }
     ![
         "site-packages/",
-        "site-packages\\",
         "dist-packages/",
-        "dist-packages\\",
         "node_modules/",
-        "node_modules\\",
         "vendor/bundle/",
-        "vendor\\bundle\\",
         "vendor/gems/",
-        "vendor\\gems\\",
         "/gems/",
-        "\\gems\\",
         ".gem/",
-        ".gem\\",
     ]
     .iter()
     .any(|marker| frame.contains(marker))
@@ -1277,6 +1270,7 @@ mod tests {
             "vendor/gems/foo/lib/foo.rb",
             "home/.gem/ruby/3.2.0/gems/foo/lib/foo.rb",
             r"lib\site-packages\foo.py",
+            r"vendor\bundle/x",
         ] {
             assert!(!repo_relative_backtrace(frame), "{frame}");
             let value = serde_json::json!({
