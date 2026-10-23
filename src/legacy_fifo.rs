@@ -101,21 +101,9 @@ async fn run_unix(url: &str, runner_id: &str) -> i32 {
                 let last_pong = Arc::clone(&last_pong);
                 let write_blocked = Arc::clone(&write_blocked);
                 async move {
-                    if cfg!(debug_assertions) {
-                        match &message_result {
-                            Ok(Message::Text(_)) => println!("Received Text message"),
-                            Ok(Message::Binary(_)) => println!("Received Binary message"),
-                            Ok(Message::Ping(_)) => println!("Received Ping message"),
-                            Ok(Message::Pong(_)) => println!("Received Pong message"),
-                            Ok(Message::Close(_)) => println!("Received Close message, exiting..."),
-                            Err(e) => eprintln!("Error receiving message: {}", e),
-                            _ => println!("Received an unexpected type of message"),
-                        }
-                    }
-
                     match &message_result {
                         Ok(Message::Close(_)) => {
-                            let _ = exit_tx_clone
+                            exit_tx_clone
                                 .send(())
                                 .await
                                 .expect("Failed to send exit signal");
@@ -130,13 +118,12 @@ async fn run_unix(url: &str, runner_id: &str) -> i32 {
                     }
 
                     if let Ok(message) = message_result {
-                        let data = message.into_data();
-                        let mut data_with_newline = data.clone();
-                        data_with_newline.push(b'\n');
+                        let mut data = message.into_data();
+                        data.push(b'\n');
                         write_blocked.store(true, Ordering::SeqCst);
                         let mut output_fifo = output_fifo.lock().await;
                         output_fifo
-                            .write_all(&data_with_newline)
+                            .write_all(&data)
                             .await
                             .expect("Failed to write to output pipe");
                         output_fifo
@@ -193,7 +180,7 @@ async fn read_pipe(
 
         while let Some(i) = buf.iter().position(|&b| b == b'\n') {
             let line = buf.drain(..=i).collect::<Vec<_>>();
-            let line_str = String::from_utf8(line.clone()).unwrap();
+            let line_str = String::from_utf8(line).unwrap();
             if line_str.trim() == "exit" {
                 exit_tx.send(()).await.expect("Failed to send exit signal");
                 return;
