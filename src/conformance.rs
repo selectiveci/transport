@@ -31,8 +31,6 @@ pub enum Step {
     Send { message: Value },
     ExpectManifest { tree: bool },
     ExpectResult { id: String, status: String },
-    ExpectResults { ids: Vec<String> },
-    ExpectType { frame_type: String },
     ExpectTerminating { signal: String },
     Drop,
     ExpectReconnect,
@@ -512,28 +510,6 @@ impl Player {
             Step::ExpectResult { id, status } => {
                 let frame = self.next_frame().await?;
                 expect_result(&frame, id, status)
-            }
-            Step::ExpectResults { ids } => {
-                for id in ids {
-                    let frame = self.next_frame().await?;
-                    let status = frame
-                        .pointer("/data/status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    expect_result(&frame, id, status)?;
-                }
-                Ok(())
-            }
-            Step::ExpectType { frame_type } => {
-                let frame = self.next_frame().await?;
-                let got = frame.get("type").and_then(Value::as_str).unwrap_or("");
-                if got == frame_type {
-                    Ok(())
-                } else {
-                    Err(Error::new(format!(
-                        "expected type {frame_type}, got {frame}"
-                    )))
-                }
             }
             Step::ExpectTerminating { signal } => {
                 let frame = self.next_frame().await?;
