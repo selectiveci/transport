@@ -1,13 +1,11 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle as TaskHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -87,25 +85,16 @@ impl Session {
         let (out_tx, mut out_rx) = unbounded_channel();
         let (in_tx, in_rx) = unbounded_channel();
         let writer_in = in_tx.clone();
-        let pongs = Arc::new(AtomicU64::new(0));
-        let pong_notify = Arc::new(Notify::new());
-        let reader_pongs = Arc::clone(&pongs);
-        let reader_notify = Arc::clone(&pong_notify);
+        let (pong_tx, mut pong_rx) = watch::channel(());
+        let reader_pong = pong_tx;
         let writer = tokio::spawn(async move {
             let mut sink = sink;
             let mut next_ping = tokio::time::Instant::now() + keepalive.ping_interval;
-            let mut outstanding: Option<(u64, tokio::time::Instant)> = None;
+            let mut pong_deadline: Option<tokio::time::Instant> = None;
             loop {
-                if let Some((stamp, _)) = outstanding {
-                    if pongs.load(Ordering::SeqCst) != stamp {
-                        outstanding = None;
-                    }
-                }
-                let scheduled_ping = (outstanding.is_none() && !keepalive.ping_interval.is_zero())
-                    .then_some(next_ping);
-                let pong_deadline = outstanding.map(|(_, deadline)| deadline);
-                let notified = pong_notify.notified();
-                tokio::pin!(notified);
+                let scheduled_ping = (pong_deadline.is_none()
+                    && !keepalive.ping_interval.is_zero())
+                .then_some(next_ping);
                 tokio::select! {
                     biased;
                     msg = out_rx.recv() => {
@@ -149,40 +138,33 @@ impl Session {
                             None => break,
                         }
                     }
-                    _ = notified, if outstanding.is_some() => {
-                        outstanding = None;
+                    Ok(()) = pong_rx.changed(), if pong_deadline.is_some() => {
+                        pong_deadline = None;
                     }
                     _ = sleep_until(pong_deadline), if pong_deadline.is_some() => {
-                        let timed_out = outstanding
-                            .is_some_and(|(stamp, _)| pongs.load(Ordering::SeqCst) == stamp);
-                        outstanding = None;
-                        if timed_out {
-                            eprintln!("websocket pong timeout");
-                            let _ = tokio::time::timeout(
-                                IO_TIMEOUT,
-                                sink.send(Message::Close(None)),
-                            )
-                            .await;
-                            let _ = writer_in.send(Ok(None));
-                            break;
-                        }
+                        eprintln!("websocket pong timeout");
+                        let _ = tokio::time::timeout(
+                            IO_TIMEOUT,
+                            sink.send(Message::Close(None)),
+                        )
+                        .await;
+                        let _ = writer_in.send(Ok(None));
+                        break;
                     }
                     _ = sleep_until(scheduled_ping), if scheduled_ping.is_some() => {
-                        let stamp = pongs.load(Ordering::SeqCst);
+                        pong_rx.borrow_and_update();
                         let sent = tokio::time::timeout(
                             IO_TIMEOUT,
                             sink.send(Message::Ping(b"selective".to_vec())),
                         )
                         .await;
-                        if sent.ok().and_then(Result::ok).is_none() {
+                        if !matches!(sent, Ok(Ok(()))) {
                             eprintln!("websocket ping failed");
                             let _ = writer_in.send(Ok(None));
                             break;
                         }
-                        outstanding = Some((
-                            stamp,
-                            tokio::time::Instant::now() + keepalive.pong_timeout,
-                        ));
+                        pong_deadline =
+                            Some(tokio::time::Instant::now() + keepalive.pong_timeout);
                         next_ping = tokio::time::Instant::now() + keepalive.ping_interval;
                     }
                 }
@@ -204,8 +186,7 @@ impl Session {
                         }
                     }
                     Some(Ok(Message::Pong(_))) => {
-                        reader_pongs.fetch_add(1, Ordering::SeqCst);
-                        reader_notify.notify_one();
+                        reader_pong.send_replace(());
                     }
                     Some(Ok(Message::Ping(_) | Message::Frame(_))) => {}
                     Some(Ok(Message::Close(_))) | None => {

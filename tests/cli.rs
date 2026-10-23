@@ -943,3 +943,47 @@ async fn session_pings_while_idle_and_closes_without_a_pong() {
     assert!(started.elapsed() < Duration::from_secs(2));
     server.abort();
 }
+
+#[tokio::test]
+async fn an_early_pong_does_not_stretch_the_dead_peer_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(sock).await.unwrap();
+        let mut answered = false;
+        while !answered {
+            match timeout(Duration::from_secs(2), ws.next()).await {
+                Ok(Some(Ok(Message::Ping(payload)))) => {
+                    ws.send(Message::Pong(payload.clone())).await.unwrap();
+                    ws.send(Message::Pong(payload)).await.unwrap();
+                    answered = true;
+                }
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => return,
+                _ => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+    let started = Instant::now();
+    let mut session = transport::Session::connect_with(
+        &format!("ws://{addr}"),
+        transport::Keepalive {
+            ping_interval: Duration::from_millis(500),
+            pong_timeout: Duration::from_millis(200),
+        },
+    )
+    .await
+    .unwrap();
+    let frame = timeout(Duration::from_millis(1450), session.recv())
+        .await
+        .expect("stray pong stretched the dead-peer timeout")
+        .unwrap();
+    assert!(frame.is_none());
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(1450),
+        "dead peer took {elapsed:?}"
+    );
+    server.abort();
+}
