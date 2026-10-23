@@ -850,9 +850,7 @@ async fn classify(mut stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, E
             let _held = read_http_request(&mut stream).await?;
             gate.upload_held.store(true, Ordering::SeqCst);
             gate.upload_notify.notify_waiters();
-            loop {
-                std::future::pending::<()>().await;
-            }
+            return std::future::pending().await;
         }
         return Ok(Incoming::Fragment(read_http(stream).await?));
     }
@@ -901,19 +899,12 @@ enum Pump {
 
 async fn recv_live(live: Option<&mut Live>) -> Pump {
     let Some(live) = live else {
-        std::future::pending::<()>().await;
-        return Pump::Closed;
+        return std::future::pending().await;
     };
     match live.ws.next().await {
-        Some(Ok(Message::Text(text))) => {
-            if text.trim() == "exit" {
-                return Pump::Frame(Value::String("exit".to_owned()));
-            }
-            match serde_json::from_str(text.trim()) {
-                Ok(value) => Pump::Frame(value),
-                Err(_) => Pump::Frame(Value::String(text)),
-            }
-        }
+        Some(Ok(Message::Text(text))) => Pump::Frame(
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| Value::String(text.to_owned())),
+        ),
         Some(Ok(Message::Ping(payload))) => {
             let _ = live.ws.send(Message::Pong(payload)).await;
             Pump::Ping
