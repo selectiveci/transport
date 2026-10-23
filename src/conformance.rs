@@ -593,7 +593,6 @@ impl Player {
                     )));
                 }
                 Ok(None) => {}
-                Err(err) if err.to_string().contains("timed out") => break,
                 Err(err) => return Err(err),
             }
         }
@@ -618,6 +617,9 @@ impl Player {
     async fn ensure_connection(&mut self) -> Result<(), Error> {
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.current.is_none() {
+            if Instant::now() >= deadline {
+                return Err(Error::new("timed out waiting for the client"));
+            }
             self.pump(deadline).await?;
         }
         Ok(())
@@ -654,17 +656,13 @@ impl Player {
     async fn pump(&mut self, deadline: Instant) -> Result<Option<Value>, Error> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(Error::new("timed out"));
+            return Ok(None);
         }
-        let mut live = self.current.take();
-        let read_allowed = live.is_some() && !self.ignore_pongs;
-        let event = {
-            let incoming = &mut self.incoming;
-            tokio::select! {
-                next = incoming.recv() => Event::Accepted(next),
-                message = recv_live(live.as_mut()), if read_allowed => Event::Socket(message),
-                _ = tokio::time::sleep(remaining) => Event::Timeout,
-            }
+        let read_allowed = self.current.is_some() && !self.ignore_pongs;
+        let event = tokio::select! {
+            next = self.incoming.recv() => Event::Accepted(next),
+            message = recv_live(self.current.as_mut()), if read_allowed => Event::Socket(message),
+            _ = tokio::time::sleep(remaining) => Event::Timeout,
         };
         match event {
             Event::Accepted(Some(Incoming::Socket(socket))) => {
@@ -672,38 +670,24 @@ impl Player {
                 Ok(None)
             }
             Event::Accepted(Some(Incoming::Fragment(fragment))) => {
-                self.current = live;
                 self.fragments.push(fragment);
                 Ok(None)
             }
-            Event::Accepted(Some(Incoming::Rejected)) => {
-                self.current = live;
-                Err(Error::new(
-                    "handshake was refused outside reject_connections",
-                ))
-            }
-            Event::Accepted(None) => {
-                self.current = live;
-                Err(Error::new("connection listener stopped"))
-            }
-            Event::Socket(Pump::Frame(value)) => {
-                self.current = live;
-                Ok(Some(value))
-            }
-            Event::Socket(Pump::Continue) => {
-                self.current = live;
-                Ok(None)
-            }
+            Event::Accepted(Some(Incoming::Rejected)) => Err(Error::new(
+                "handshake was refused outside reject_connections",
+            )),
+            Event::Accepted(None) => Err(Error::new("connection listener stopped")),
+            Event::Socket(Pump::Frame(value)) => Ok(Some(value)),
             Event::Socket(Pump::Ping) => {
-                self.current = live;
                 self.pings = self.pings.saturating_add(1);
                 Ok(None)
             }
-            Event::Socket(Pump::Closed) => Ok(None),
-            Event::Timeout => {
-                self.current = live;
-                Err(Error::new("timed out waiting for the client"))
+            Event::Socket(Pump::Continue) => Ok(None),
+            Event::Socket(Pump::Closed) => {
+                self.current = None;
+                Ok(None)
             }
+            Event::Timeout => Ok(None),
         }
     }
 
@@ -734,15 +718,13 @@ impl Player {
             if Instant::now() >= deadline {
                 return Ok(());
             }
-            match self.pump(deadline).await {
-                Ok(Some(frame)) => {
+            match self.pump(deadline).await? {
+                Some(frame) => {
                     return Err(Error::new(format!(
                         "expected no frame before connected, got {frame}"
                     )));
                 }
-                Ok(None) => {}
-                Err(err) if err.to_string() == "timed out waiting for the client" => return Ok(()),
-                Err(err) => return Err(err),
+                None => {}
             }
         }
     }
@@ -764,11 +746,7 @@ impl Player {
     async fn expect_fragment(&mut self, ids: &[String]) -> Result<(), Error> {
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.fragments.is_empty() && Instant::now() < deadline {
-            match self.pump(deadline).await {
-                Ok(_) => {}
-                Err(err) if self.fragments.is_empty() => return Err(err),
-                Err(_) => break,
-            }
+            self.pump(deadline).await?;
         }
         let captured = self
             .fragments
