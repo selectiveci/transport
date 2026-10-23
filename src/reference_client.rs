@@ -357,24 +357,15 @@ async fn close_session(
         if let Some(signal) = signal_now(signals) {
             return Action::Signal(signal, override_status);
         }
-        let upload = upload_traces(state, base_url);
-        tokio::pin!(upload);
         let mut signals = signals.clone();
-        loop {
-            tokio::select! {
-                biased;
-                changed = signals.changed() => {
-                    if changed.is_ok() {
-                        if let Some(signal) = *signals.borrow() {
-                            return Action::Signal(signal, override_status);
-                        }
-                    }
-                }
-                result = &mut upload => {
-                    if let Err(err) = result {
-                        eprintln!("Selective could not upload this runner's test map ({err}). Its tests will run on the next build rather than be skipped.");
-                    }
-                    break;
+        tokio::select! {
+            biased;
+            Some(signal) = next_signal(&mut signals) => {
+                return Action::Signal(signal, override_status);
+            }
+            result = upload_traces(state, base_url) => {
+                if let Err(err) = result {
+                    eprintln!("Selective could not upload this runner's test map ({err}). Its tests will run on the next build rather than be skipped.");
                 }
             }
         }
@@ -544,25 +535,23 @@ async fn recv_frame(link: &mut Link, signals: &watch::Receiver<Option<&'static s
     let mut signals = signals.clone();
     tokio::select! {
         biased;
-        changed = signals.changed() => {
-            if changed.is_err() {
-                return FrameIn::Lost;
-            }
-            match *signals.borrow() {
-                Some(signal) => FrameIn::Signal(signal),
-                None => match link.recv().await {
-                    Ok(Some(frame)) => parse_frame(&frame).map(FrameIn::Value).unwrap_or(FrameIn::Lost),
-                    Ok(None) => FrameIn::Lost,
-                    Err(_) => FrameIn::Lost,
-                },
-            }
-        }
+        Some(signal) = next_signal(&mut signals) => FrameIn::Signal(signal),
         incoming = link.recv() => match incoming {
             Ok(Some(frame)) => parse_frame(&frame).map(FrameIn::Value).unwrap_or(FrameIn::Lost),
             Ok(None) => FrameIn::Lost,
             Err(_) => FrameIn::Lost,
-        }
+        },
     }
+}
+
+async fn next_signal(
+    signals: &mut watch::Receiver<Option<&'static str>>,
+) -> Option<&'static str> {
+    signals
+        .wait_for(Option::is_some)
+        .await
+        .ok()
+        .and_then(|signal| *signal)
 }
 
 fn signal_now(signals: &watch::Receiver<Option<&'static str>>) -> Option<&'static str> {
