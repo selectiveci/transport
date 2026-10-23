@@ -14,10 +14,11 @@ use transport::Error;
 const USAGE: &str = "\
 usage:
   transport-conformance list
-  transport-conformance run [--scenario NAME] [--via direct|stdio|both]
+  transport-conformance run [--scenario NAME]
+                            [--via direct|stdio|fifo|both|all]
                             [--client COMMAND] [--fixture-ids FILE]
                             [--transport PATH]
-  transport-conformance client [--via-stdio]
+  transport-conformance client [--via-stdio | --via-fifo]
 
 The transport binary is --transport, else SELECTIVE_TRANSPORT, else the
 transport next to this binary. A --client command gets it as
@@ -45,7 +46,7 @@ fn dispatch() -> Result<i32, Error> {
             Ok(0)
         }
         Some("run") => run_main(&args[1..]),
-        Some("client") => client_main(args[1..].iter().any(|arg| arg == "--via-stdio")),
+        Some("client") => client_main(&args[1..]),
         Some("--help" | "-h") => {
             eprintln!("{USAGE}");
             Ok(0)
@@ -56,7 +57,7 @@ fn dispatch() -> Result<i32, Error> {
 
 fn run_main(args: &[String]) -> Result<i32, Error> {
     let mut scenario = None;
-    let mut via = SuiteVia::Both;
+    let mut via = SuiteVia::All;
     let mut client = env_value("SELECTIVE_CONFORMANCE_CLIENT");
     let mut fixture_file = env_value("SELECTIVE_CONFORMANCE_FIXTURE_IDS");
     let mut transport = None;
@@ -70,7 +71,9 @@ fn run_main(args: &[String]) -> Result<i32, Error> {
                 via = match value()? {
                     "direct" => SuiteVia::Direct,
                     "stdio" => SuiteVia::Stdio,
+                    "fifo" => SuiteVia::Fifo,
                     "both" => SuiteVia::Both,
+                    "all" => SuiteVia::All,
                     other => return Err(Error::new(format!("unknown --via {other}"))),
                 }
             }
@@ -99,12 +102,19 @@ fn run_main(args: &[String]) -> Result<i32, Error> {
     Ok(0)
 }
 
-fn client_main(via_stdio: bool) -> Result<i32, Error> {
+fn client_main(args: &[String]) -> Result<i32, Error> {
     let url = env_value("SELECTIVE_TRANSPORT_URL")
         .ok_or_else(|| Error::new("client requires SELECTIVE_TRANSPORT_URL"))?;
+    let via = if args.iter().any(|arg| arg == "--via-fifo") {
+        Via::Fifo
+    } else if args.iter().any(|arg| arg == "--via-stdio") {
+        Via::Stdio
+    } else {
+        Via::Direct
+    };
     Ok(block_on(reference_client::run(RunOpts {
         url,
-        via: if via_stdio { Via::Stdio } else { Via::Direct },
+        via,
         transport: default_transport(),
         catch_signals: true,
     })))

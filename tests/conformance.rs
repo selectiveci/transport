@@ -1,10 +1,10 @@
 #[test]
-fn conformance_suite_passes_for_direct_and_stdio() {
+fn conformance_suite_passes_for_every_via() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_transport-conformance"))
         .args([
             "run",
             "--via",
-            "both",
+            "all",
             "--transport",
             env!("CARGO_BIN_EXE_transport"),
         ])

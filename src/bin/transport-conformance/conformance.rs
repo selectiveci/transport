@@ -56,7 +56,9 @@ pub enum Step {
 pub enum SuiteVia {
     Direct,
     Stdio,
+    Fifo,
     Both,
+    All,
 }
 
 impl SuiteVia {
@@ -64,7 +66,9 @@ impl SuiteVia {
         match self {
             Self::Direct => vec![Via::Direct],
             Self::Stdio => vec![Via::Stdio],
+            Self::Fifo => vec![Via::Fifo],
             Self::Both => vec![Via::Direct, Via::Stdio],
+            Self::All => vec![Via::Direct, Via::Stdio, Via::Fifo],
         }
     }
 }
@@ -137,6 +141,10 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
             run.via.list()
         };
         for via in vias {
+            if matches!(via, Via::Fifo) && !cfg!(unix) {
+                eprintln!("skip {} fifo (FIFO mode is unix-only)", scenario.name);
+                continue;
+            }
             trials += 1;
             let trial = Trial {
                 bin,
@@ -272,8 +280,14 @@ fn client_command(trial: &Trial<'_>) -> Result<Command, Error> {
     }
     let mut command = Command::new(trial.bin);
     command.arg("client");
-    if matches!(trial.via, Via::Stdio) {
-        command.arg("--via-stdio");
+    match trial.via {
+        Via::Direct => {}
+        Via::Stdio => {
+            command.arg("--via-stdio");
+        }
+        Via::Fifo => {
+            command.arg("--via-fifo");
+        }
     }
     Ok(command)
 }
@@ -291,10 +305,23 @@ fn via_name(via: Via) -> &'static str {
     match via {
         Via::Direct => "direct",
         Via::Stdio => "stdio",
+        Via::Fifo => "fifo",
     }
 }
 
+fn uses_keepalive(scenario: &Scenario) -> bool {
+    scenario
+        .steps
+        .iter()
+        .any(|step| matches!(step, Step::Idle | Step::IgnorePongs))
+}
+
 async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
+    if trial.client.is_none() && matches!(trial.via, Via::Fifo) && uses_keepalive(trial.scenario) {
+        return Ok(Played::NotApplicable(
+            "the transport's FIFO mode has no keepalive".to_owned(),
+        ));
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let url = format!(
@@ -369,6 +396,7 @@ async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
         ping_interval: trial.pace.ping,
         ignore_pongs: false,
         pings: 0,
+        frames_end_in_newline: trial.client.is_none() && !matches!(trial.via, Via::Direct),
     };
     let outcome = player.play(trial.scenario).await;
     if !matches!(outcome, Ok(Played::Passed)) {
@@ -450,6 +478,7 @@ struct Player {
     ping_interval: Duration,
     ignore_pongs: bool,
     pings: u32,
+    frames_end_in_newline: bool,
 }
 
 impl Player {
@@ -675,7 +704,14 @@ impl Player {
             )),
             Event::Accepted(Some(Incoming::Failed(err))) => Err(err),
             Event::Accepted(None) => Err(Error::new("connection listener stopped")),
-            Event::Socket(Pump::Frame(value)) => Ok(Some(value)),
+            Event::Socket(Pump::Frame(value, newline)) => {
+                if self.frames_end_in_newline && !newline {
+                    return Err(Error::new(format!(
+                        "a frame through the transport lost its trailing \\n: {value}"
+                    )));
+                }
+                Ok(Some(value))
+            }
             Event::Socket(Pump::Ping) => {
                 self.pings = self.pings.saturating_add(1);
                 Ok(None)
@@ -935,7 +971,7 @@ async fn classify(mut stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, E
 enum Pump {
     Continue,
     Ping,
-    Frame(Value),
+    Frame(Value, bool),
     Closed,
 }
 
@@ -945,7 +981,9 @@ async fn recv_live(live: Option<&mut Live>) -> Pump {
     };
     match live.ws.next().await {
         Some(Ok(Message::Text(text))) => Pump::Frame(
-            serde_json::from_str(text.trim()).unwrap_or_else(|_| Value::String(text.clone())),
+            serde_json::from_str(text.trim())
+                .unwrap_or_else(|_| Value::String(text.trim().to_owned())),
+            text.ends_with('\n'),
         ),
         Some(Ok(Message::Ping(payload))) => {
             let _ = live.ws.send(Message::Pong(payload)).await;
@@ -1327,6 +1365,22 @@ mod tests {
         });
         assert!(!kept.iter().any(|(key, _)| *key == "SELECTIVE_BRANCH"));
         assert!(kept.iter().any(|(key, _)| *key == "SELECTIVE_SHA"));
+    }
+
+    #[test]
+    fn all_adds_fifo_and_keepalive_scenarios_are_known() {
+        assert_eq!(
+            SuiteVia::All.list(),
+            vec![Via::Direct, Via::Stdio, Via::Fifo]
+        );
+        assert_eq!(SuiteVia::Both.list(), vec![Via::Direct, Via::Stdio]);
+        let keepalive: Vec<String> = scenarios()
+            .unwrap()
+            .iter()
+            .filter(|scenario| uses_keepalive(scenario))
+            .map(|scenario| scenario.name.clone())
+            .collect();
+        assert_eq!(keepalive, vec!["idle_keepalive", "pong_timeout"]);
     }
 
     #[test]
