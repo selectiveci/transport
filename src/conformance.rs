@@ -80,6 +80,7 @@ pub fn scenarios() -> Result<Vec<Scenario>, Error> {
         include_str!("../conformance/scenarios/reconnect_exhausted.json"),
         include_str!("../conformance/scenarios/overlap_buffered.json"),
         include_str!("../conformance/scenarios/upload_stall.json"),
+        include_str!("../conformance/scenarios/signal_keeps_close_status.json"),
         include_str!("../conformance/scenarios/idle_keepalive.json"),
         include_str!("../conformance/scenarios/pong_timeout.json"),
     ];

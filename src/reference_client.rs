@@ -91,7 +91,7 @@ pub async fn run(opts: RunOpts) -> i32 {
     let mut reconnect = false;
     loop {
         if let Some(signal) = signal_now(&rx) {
-            return finish_signal(&mut Link::placeholder(), &state, signal).await;
+            return finish_signal(&mut Link::placeholder(), &state, signal, None).await;
         }
         let url = if reconnect {
             match with_reconnect(&opts.url) {
@@ -119,7 +119,9 @@ pub async fn run(opts: RunOpts) -> i32 {
         };
         match drive(&mut link, &mut state, &opts.url, &rx).await {
             Drive::Finished(code) => return code,
-            Drive::Signal(signal) => return finish_signal(&mut link, &state, signal).await,
+            Drive::Signal(signal, exit_status) => {
+                return finish_signal(&mut link, &state, signal, exit_status).await;
+            }
             Drive::Lost => {
                 failures += 1;
                 state.connection_retries = failures;
@@ -183,7 +185,7 @@ enum Drive {
     Finished(i32),
     Lost,
     Reconnect,
-    Signal(&'static str),
+    Signal(&'static str, Option<i32>),
 }
 
 async fn drive(
@@ -197,7 +199,7 @@ async fn drive(
         Ok(()) => {}
         Err(WaitFail::Lost) => return Drive::Lost,
         Err(WaitFail::Timeout) => return Drive::Finished(1),
-        Err(WaitFail::Signal(signal)) => return Drive::Signal(signal),
+        Err(WaitFail::Signal(signal)) => return Drive::Signal(signal, None),
     }
     loop {
         let command = if let Some(command) = queued.pop_front() {
@@ -206,7 +208,7 @@ async fn drive(
             match recv_frame(link, signals).await {
                 FrameIn::Value(value) => value,
                 FrameIn::Lost => return Drive::Lost,
-                FrameIn::Signal(signal) => return Drive::Signal(signal),
+                FrameIn::Signal(signal) => return Drive::Signal(signal, None),
             }
         };
         match dispatch(link, state, base_url, signals, command, &mut queued).await {
@@ -214,7 +216,7 @@ async fn drive(
             Action::Lost => return Drive::Lost,
             Action::Reconnect => return Drive::Reconnect,
             Action::Exit(code) => return Drive::Finished(code),
-            Action::Signal(signal) => return Drive::Signal(signal),
+            Action::Signal(signal, exit_status) => return Drive::Signal(signal, exit_status),
             Action::Pause => {}
         }
     }
@@ -265,7 +267,7 @@ enum Action {
     Lost,
     Reconnect,
     Exit(i32),
-    Signal(&'static str),
+    Signal(&'static str, Option<i32>),
 }
 
 async fn dispatch(
@@ -390,9 +392,9 @@ async fn close_session(
     if send_json(link, &report).await.is_err() {
         return Action::Lost;
     }
-    if state.record && !state.traces.is_empty() {
+        if state.record && !state.traces.is_empty() {
         if let Some(signal) = signal_now(signals) {
-            return Action::Signal(signal);
+            return Action::Signal(signal, override_status);
         }
         let upload = upload_traces(state, base_url);
         tokio::pin!(upload);
@@ -403,7 +405,7 @@ async fn close_session(
                 changed = signals.changed() => {
                     if changed.is_ok() {
                         if let Some(signal) = *signals.borrow() {
-                            return Action::Signal(signal);
+                            return Action::Signal(signal, override_status);
                         }
                     }
                 }
@@ -420,12 +422,17 @@ async fn close_session(
     Action::Exit(override_status.unwrap_or_else(|| framework_status(state)))
 }
 
-async fn finish_signal(link: &mut Link, state: &State, signal: &'static str) -> i32 {
+async fn finish_signal(
+    link: &mut Link,
+    state: &State,
+    signal: &'static str,
+    exit_status: Option<i32>,
+) -> i32 {
     let frame = json!({"type": "terminating", "data": {"signal": signal}});
     let _ = send_json(link, &frame).await;
     tokio::time::sleep(TERMINATION_GRACE).await;
     let _ = link.close().await;
-    framework_status(state)
+    exit_status.unwrap_or_else(|| framework_status(state))
 }
 
 fn framework_status(state: &State) -> i32 {
