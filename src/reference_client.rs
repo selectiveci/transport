@@ -149,9 +149,7 @@ struct State {
     connection_retries: u32,
     attempts: HashMap<String, u32>,
     results: HashMap<String, String>,
-    files: Vec<String>,
-    file_index: HashMap<String, usize>,
-    traces: HashMap<String, BTreeSet<usize>>,
+    traced: BTreeSet<String>,
 }
 
 enum Drive {
@@ -353,7 +351,7 @@ async fn close_session(
     if send_json(link, &report).await.is_err() {
         return Action::Lost;
     }
-    if state.record && !state.traces.is_empty() {
+    if state.record && !state.traced.is_empty() {
         if let Some(signal) = signal_now(signals) {
             return Action::Signal(signal, override_status);
         }
@@ -398,19 +396,8 @@ fn framework_status(state: &State) -> i32 {
 fn remember(state: &mut State, id: &str, status: &str) {
     state.results.insert(id.to_owned(), status.to_owned());
     if state.record {
-        let index = intern(state, FILE_PATH);
-        state.traces.entry(id.to_owned()).or_default().insert(index);
+        state.traced.insert(id.to_owned());
     }
-}
-
-fn intern(state: &mut State, path: &str) -> usize {
-    if let Some(index) = state.file_index.get(path) {
-        return *index;
-    }
-    let index = state.files.len();
-    state.files.push(path.to_owned());
-    state.file_index.insert(path.to_owned(), index);
-    index
 }
 
 fn manifest(state: &State) -> Value {
@@ -483,19 +470,10 @@ fn clean(value: &str) -> String {
 }
 
 async fn upload_traces(state: &State, base_url: &str) -> Result<(), Error> {
-    let tests: Vec<Value> = state
-        .traces
-        .iter()
-        .map(|(id, deps)| {
-            let mut deps: Vec<usize> = deps.iter().copied().collect();
-            deps.sort_unstable();
-            json!({"id": id, "deps": deps})
-        })
-        .collect();
     let fragment = json!({
         "version": 1,
-        "files": state.files,
-        "tests": tests
+        "files": [FILE_PATH],
+        "tests": state.traced.iter().map(|id| json!({"id": id, "deps": [0]})).collect::<Vec<_>>()
     });
     let gzip_body = gzip_bytes(serde_json::to_vec(&fragment)?.as_slice())?;
     upload_fragment(&FragmentUpload {
