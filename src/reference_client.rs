@@ -217,7 +217,6 @@ async fn drive(
             Action::Reconnect => return Drive::Reconnect,
             Action::Exit(code) => return Drive::Finished(code),
             Action::Signal(signal, exit_status) => return Drive::Signal(signal, exit_status),
-            Action::Pause => {}
         }
     }
 }
@@ -263,7 +262,6 @@ async fn wait_connected(
 
 enum Action {
     Continue,
-    Pause,
     Lost,
     Reconnect,
     Exit(i32),
@@ -311,8 +309,8 @@ async fn dispatch(
                     id,
                     result["data"]["status"].as_str().unwrap_or("passed"),
                 );
-                match drain(link, state, queued).await {
-                    Action::Continue | Action::Pause => {}
+                match drain(link, queued) {
+                    Action::Continue => {}
                     other => return other,
                 }
             }
@@ -336,32 +334,23 @@ async fn dispatch(
     }
 }
 
-async fn drain(link: &mut Link, state: &mut State, queued: &mut VecDeque<Value>) -> Action {
+fn drain(link: &mut Link, queued: &mut VecDeque<Value>) -> Action {
+    drain_polled(|| link.poll(), queued)
+}
+
+fn drain_polled(
+    mut poll: impl FnMut() -> Result<PollFrame, Error>,
+    queued: &mut VecDeque<Value>,
+) -> Action {
     loop {
-        match link.poll() {
+        match poll() {
             Ok(PollFrame::Empty) => return Action::Continue,
             Ok(PollFrame::Closed) => return Action::Lost,
-            Ok(PollFrame::Frame(frame)) => match parse_frame(&frame) {
-                Some(value) => match command_name(&value) {
-                    "remove_failed_test_case_result" => {
-                        if let Some(id) = value.get("test_case_id").and_then(Value::as_str) {
-                            state.results.remove(id);
-                        }
-                    }
-                    "print_notice" | "print_message" => {
-                        if let Some(message) = value.get("message").and_then(Value::as_str) {
-                            println!("{message}");
-                        }
-                    }
-                    "reconnect" | "close" | "connected" | "configure_test_map"
-                    | "test_manifest" | "run_test_cases" => {
-                        queued.push_back(value);
-                        return Action::Pause;
-                    }
-                    _ => {}
-                },
-                None => {}
-            },
+            Ok(PollFrame::Frame(frame)) => {
+                if let Some(value) = parse_frame(&frame) {
+                    queued.push_back(value);
+                }
+            }
             Err(_) => return Action::Lost,
         }
     }
@@ -832,5 +821,25 @@ mod tests {
             message["data"]["failure_message_lines"][0],
             "not collected"
         );
+    }
+
+    #[test]
+    fn a_remove_drained_mid_batch_stays_queued() {
+        let mut state = State::default();
+        remember(&mut state, "case-fail", "failed");
+        let mut frames = VecDeque::from([
+            Ok(PollFrame::Frame(
+                r#"{"command":"remove_failed_test_case_result","test_case_id":"case-fail"}"#
+                    .to_owned(),
+            )),
+            Ok(PollFrame::Empty),
+        ]);
+        let mut queued = VecDeque::new();
+        let action = drain_polled(|| frames.pop_front().unwrap(), &mut queued);
+        assert!(matches!(action, Action::Continue));
+        remember(&mut state, "case-fail", "failed");
+        assert_eq!(state.results["case-fail"], "failed");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0]["test_case_id"], "case-fail");
     }
 }
