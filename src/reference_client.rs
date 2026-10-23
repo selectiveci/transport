@@ -27,32 +27,20 @@ fn load_fixtures() -> Result<Vec<Fixture>, Error> {
         Ok(path) if !path.is_empty() => FixtureIds::load(Path::new(&path))?,
         _ => FixtureIds::default(),
     };
-    Ok(vec![
-        Fixture {
-            id: ids.id("pass"),
-            status: "passed",
-            line: 1,
-            flake: false,
-        },
-        Fixture {
-            id: ids.id("fail"),
-            status: "failed",
-            line: 2,
-            flake: false,
-        },
-        Fixture {
-            id: ids.id("pending"),
-            status: "pending",
-            line: 3,
-            flake: false,
-        },
-        Fixture {
-            id: ids.id("flaky"),
-            status: "failed",
-            line: 4,
-            flake: true,
-        },
-    ])
+    Ok([
+        ("pass", "passed", 1, false),
+        ("fail", "failed", 2, false),
+        ("pending", "pending", 3, false),
+        ("flaky", "failed", 4, true),
+    ]
+    .into_iter()
+    .map(|(role, status, line, flake)| Fixture {
+        id: ids.id(role),
+        status,
+        line,
+        flake,
+    })
+    .collect())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +79,7 @@ pub async fn run(opts: RunOpts) -> i32 {
     let mut reconnect = false;
     loop {
         if let Some(signal) = signal_now(&rx) {
-            return finish_signal(&mut Link::placeholder(), &state, signal, None).await;
+            return finish_signal(&mut Link::Closed, &state, signal, None).await;
         }
         let url = if reconnect {
             match with_reconnect(&opts.url) {
@@ -153,6 +141,7 @@ fn fast_retries() -> bool {
     std::env::var("SELECTIVE_CONFORMANCE_FAST").ok().as_deref() == Some("1")
 }
 
+#[derive(Default)]
 struct State {
     fixtures: Vec<Fixture>,
     record: bool,
@@ -163,22 +152,6 @@ struct State {
     files: Vec<String>,
     file_index: HashMap<String, usize>,
     traces: HashMap<String, BTreeSet<usize>>,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            fixtures: Vec::new(),
-            record: false,
-            tree: false,
-            connection_retries: 0,
-            attempts: HashMap::new(),
-            results: HashMap::new(),
-            files: Vec::new(),
-            file_index: HashMap::new(),
-            traces: HashMap::new(),
-        }
-    }
 }
 
 enum Drive {
@@ -232,8 +205,7 @@ async fn wait_connected(
     queued: &mut VecDeque<Value>,
     signals: &watch::Receiver<Option<&'static str>>,
 ) -> Result<(), WaitFail> {
-    let timeout = connected_timeout();
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + CONNECTED_TIMEOUT;
     loop {
         if let Some(signal) = signal_now(signals) {
             return Err(WaitFail::Signal(signal));
@@ -381,7 +353,7 @@ async fn close_session(
     if send_json(link, &report).await.is_err() {
         return Action::Lost;
     }
-        if state.record && !state.traces.is_empty() {
+    if state.record && !state.traces.is_empty() {
         if let Some(signal) = signal_now(signals) {
             return Action::Signal(signal, override_status);
         }
@@ -597,13 +569,7 @@ fn signal_now(signals: &watch::Receiver<Option<&'static str>>) -> Option<&'stati
     *signals.borrow()
 }
 
-fn connected_timeout() -> Duration {
-    std::env::var("SELECTIVE_CONNECTED_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(30))
-}
+const CONNECTED_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn with_reconnect(url: &str) -> Result<String, Error> {
     let mut parsed = Url::parse(url)?;
@@ -636,10 +602,6 @@ enum Link {
 }
 
 impl Link {
-    fn placeholder() -> Self {
-        Self::Closed
-    }
-
     async fn open(url: &str, via: Via) -> Result<Self, Error> {
         match via {
             Via::Direct => Ok(Self::Direct(Session::connect(url).await?)),
@@ -817,10 +779,7 @@ mod tests {
         let mut state = State::default();
         let message = result_message(&mut state, "missing-case");
         assert_eq!(message["data"]["status"], "failed");
-        assert_eq!(
-            message["data"]["failure_message_lines"][0],
-            "not collected"
-        );
+        assert_eq!(message["data"]["failure_message_lines"][0], "not collected");
     }
 
     #[test]
