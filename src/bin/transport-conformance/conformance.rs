@@ -28,6 +28,8 @@ const RUNNER_ID: &str = "runner-1";
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Scenario {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_for_languages: Vec<String>,
     #[serde(default)]
     pub no_keepalive_env: bool,
     pub steps: Vec<Step>,
@@ -46,15 +48,24 @@ pub enum Step {
         id: String,
         status: String,
     },
+    Drop,
     ExpectReconnect,
     ExpectReport {
         connection_retries: u64,
+    },
+    ExpectNoFrame {
+        ms: u64,
     },
     ExpectExit {
         code: i32,
     },
     RejectConnections {
         times: u32,
+    },
+    Idle,
+    IgnorePongs,
+    Busy {
+        ms: u64,
     },
     CloseSocket {
         #[serde(default)]
@@ -87,8 +98,15 @@ fn scenarios() -> Result<Vec<Scenario>, Error> {
     const RAW: &[&str] = &[
         include_str!("../../../conformance/scenarios/happy_two_batches.json"),
         include_str!("../../../conformance/scenarios/reconnect.json"),
+        include_str!("../../../conformance/scenarios/socket_drop.json"),
+        include_str!("../../../conformance/scenarios/close_rejected.json"),
+        include_str!("../../../conformance/scenarios/queued_before_connected.json"),
         include_str!("../../../conformance/scenarios/reconnect_exhausted.json"),
+        include_str!("../../../conformance/scenarios/idle_keepalive.json"),
+        include_str!("../../../conformance/scenarios/pong_timeout.json"),
+        include_str!("../../../conformance/scenarios/busy_server.json"),
         include_str!("../../../conformance/scenarios/close_frame.json"),
+        include_str!("../../../conformance/scenarios/reconnect_then_going_away.json"),
     ];
     RAW.iter()
         .map(|raw| serde_json::from_str(raw).map_err(Error::from))
@@ -122,7 +140,11 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
         let mut scenario = scenario;
         apply_fixtures(&mut scenario, &run.fixtures)?;
         let vias = if run.client.is_some() {
-            vec![Via::Direct]
+            vec![if matches!(run.via, SuiteVia::Fifo) {
+                Via::Fifo
+            } else {
+                Via::Direct
+            }]
         } else {
             run.via.list()
         };
@@ -131,7 +153,6 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
                 eprintln!("skip {} fifo (FIFO mode is unix-only)", scenario.name);
                 continue;
             }
-            trials += 1;
             let trial = Trial {
                 bin,
                 scenario: &scenario,
@@ -148,8 +169,17 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
                 via_name(via)
             };
             match run_one(&trial).await {
-                Ok(Played::Passed) => eprintln!("ok {} {label}", scenario.name),
-                Err(err) => failures.push(format!("{} {label}: {err}", scenario.name)),
+                Ok(Played::Passed) => {
+                    trials += 1;
+                    eprintln!("ok {} {label}", scenario.name);
+                }
+                Ok(Played::NotApplicable(why)) => {
+                    eprintln!("n/a {} {label}: {why}", scenario.name);
+                }
+                Err(err) => {
+                    trials += 1;
+                    failures.push(format!("{} {label}: {err}", scenario.name));
+                }
             }
         }
     }
@@ -215,6 +245,10 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .and_then(|value| value.parse().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+fn idle_duration(ping_interval: Duration, pong_timeout: Duration) -> Duration {
+    ping_interval.saturating_mul(2).saturating_add(pong_timeout)
 }
 
 fn apply_fixtures(scenario: &mut Scenario, fixtures: &FixtureIds) -> Result<(), Error> {
@@ -283,6 +317,20 @@ fn via_name(via: Via) -> &'static str {
         Via::Stdio => "stdio",
         Via::Fifo => "fifo",
     }
+}
+
+fn uses_keepalive(scenario: &Scenario) -> bool {
+    scenario
+        .steps
+        .iter()
+        .any(|step| matches!(step, Step::Idle | Step::IgnorePongs))
+}
+
+fn not_applicable(trial: &Trial<'_>) -> Option<&'static str> {
+    if matches!(trial.via, Via::Fifo) && uses_keepalive(trial.scenario) {
+        return Some("the transport's FIFO mode has no keepalive");
+    }
+    None
 }
 
 fn client_env(command: &mut Command, trial: &Trial<'_>, url: &str, host: &str) {
@@ -362,6 +410,9 @@ impl Drop for TrialPipes {
 }
 
 async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
+    if let Some(why) = not_applicable(trial) {
+        return Ok(Played::NotApplicable(why.to_owned()));
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let url = format!(
@@ -407,7 +458,11 @@ async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
         child: Some(child),
         saw_connection: false,
         attempts: 0,
+        language: None,
         fixtures: trial.fixtures.clone(),
+        connections: 0,
+        ping_interval: trial.pace.ping,
+        pong_timeout: trial.pace.pong,
         reading: Reading::Open,
         pings: 0,
         frames_end_in_newline: trial.client.is_none() && !matches!(trial.via, Via::Direct),
@@ -466,10 +521,13 @@ struct Gate {
 
 enum Played {
     Passed,
+    NotApplicable(String),
 }
 
 enum Reading {
     Open,
+    UntilReconnect,
+    Busy,
 }
 
 struct Player {
@@ -478,7 +536,11 @@ struct Player {
     child: Option<Child>,
     saw_connection: bool,
     attempts: u32,
+    language: Option<String>,
     fixtures: FixtureIds,
+    connections: u32,
+    ping_interval: Duration,
+    pong_timeout: Duration,
     reading: Reading,
     pings: u32,
     frames_end_in_newline: bool,
@@ -486,6 +548,19 @@ struct Player {
 
 impl Player {
     async fn play(&mut self, scenario: &Scenario) -> Result<Played, Error> {
+        if !scenario.not_for_languages.is_empty() {
+            self.ensure_connection().await?;
+            let language = self.language.as_deref().unwrap_or("");
+            if scenario
+                .not_for_languages
+                .iter()
+                .any(|excluded| excluded == language)
+            {
+                return Ok(Played::NotApplicable(format!(
+                    "not run for language={language} yet"
+                )));
+            }
+        }
         for step in &scenario.steps {
             self.step(step)
                 .await
@@ -515,15 +590,47 @@ impl Player {
                 let frame = self.next_frame().await?;
                 expect_result(&frame, id, status)
             }
+            Step::Drop => {
+                self.current = None;
+                Ok(())
+            }
             Step::ExpectReconnect => self.expect_reconnect().await,
             Step::ExpectReport { connection_retries } => {
                 let frame = self.next_frame().await?;
                 expect_report(&frame, *connection_retries)
             }
+            Step::ExpectNoFrame { ms } => self.expect_no_frame(*ms).await,
             Step::ExpectExit { code } => self.expect_exit(*code).await,
             Step::RejectConnections { times } => self.reject_connections(*times).await,
+            Step::Idle => self.idle().await,
+            Step::IgnorePongs => {
+                self.reading = Reading::UntilReconnect;
+                Ok(())
+            }
+            Step::Busy { ms } => self.busy_for(*ms).await,
             Step::CloseSocket { code } => self.close_socket(*code).await,
         }
+    }
+
+    async fn busy_for(&mut self, ms: u64) -> Result<(), Error> {
+        let connections = self.connections;
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        let before = std::mem::replace(&mut self.reading, Reading::Busy);
+        let outcome = loop {
+            if Instant::now() >= deadline {
+                break Ok(());
+            }
+            if let Err(err) = self.pump(deadline).await {
+                break Err(err);
+            }
+            if self.connections != connections {
+                break Err(Error::new(
+                    "the client reconnected while the server was busy",
+                ));
+            }
+        };
+        self.reading = before;
+        outcome
     }
 
     async fn close_socket(&mut self, code: Option<u16>) -> Result<(), Error> {
@@ -546,6 +653,41 @@ impl Player {
             })
             .await;
         });
+        Ok(())
+    }
+
+    async fn idle(&mut self) -> Result<(), Error> {
+        let before = self.pings;
+        let deadline = Instant::now() + idle_duration(self.ping_interval, self.pong_timeout);
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match self.pump(deadline).await {
+                Ok(Some(frame)) => {
+                    return Err(Error::new(format!(
+                        "application frame during idle: {frame}"
+                    )));
+                }
+                Ok(None) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        if self.pings <= before {
+            return Err(Error::new("idle connection received no websocket ping"));
+        }
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|live| live.uri.contains("reconnect=true"))
+        {
+            return Err(Error::new(
+                "idle connection reconnects when pongs are answered",
+            ));
+        }
+        if self.current.is_none() {
+            return Err(Error::new("idle connection dropped"));
+        }
         Ok(())
     }
 
@@ -652,9 +794,25 @@ impl Player {
             self.reading = Reading::Open;
         } else {
             self.saw_connection = true;
+            self.language = query_value(&socket.uri, "language");
         }
+        self.connections += 1;
         self.current = Some(socket);
         Ok(())
+    }
+
+    async fn expect_no_frame(&mut self, ms: u64) -> Result<(), Error> {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        loop {
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            if let Some(frame) = self.pump(deadline).await? {
+                return Err(Error::new(format!(
+                    "expected no frame before connected, got {frame}"
+                )));
+            }
+        }
     }
 
     async fn expect_exit(&mut self, code: i32) -> Result<(), Error> {
@@ -1116,6 +1274,108 @@ mod tests {
             assert!(dir.join(name).exists(), "{name}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn all_adds_fifo_and_keepalive_scenarios_are_known() {
+        assert_eq!(
+            SuiteVia::All.list(),
+            vec![Via::Direct, Via::Stdio, Via::Fifo]
+        );
+        assert_eq!(SuiteVia::Both.list(), vec![Via::Direct, Via::Stdio]);
+        let keepalive: Vec<String> = scenarios()
+            .unwrap()
+            .iter()
+            .filter(|scenario| uses_keepalive(scenario))
+            .map(|scenario| scenario.name.clone())
+            .collect();
+        assert_eq!(keepalive, vec!["idle_keepalive", "pong_timeout"]);
+    }
+
+    #[test]
+    fn client_command_is_split_without_adding_via_args() {
+        assert_eq!(
+            shell_words(r"/opt/bin/transport conformance-client").unwrap(),
+            vec!["/opt/bin/transport", "conformance-client"]
+        );
+        assert_eq!(
+            shell_words(r#"say "two words" 'and more'"#).unwrap(),
+            vec!["say", "two words", "and more"]
+        );
+        assert_eq!(shell_words(r"'a\b'").unwrap(), vec![r"a\b"]);
+        assert!(shell_words("  ").is_err());
+        assert!(shell_words("'unterminated").is_err());
+        assert_eq!(
+            idle_duration(Duration::from_millis(200), Duration::from_secs(1)),
+            Duration::from_millis(1400)
+        );
+        assert!(
+            idle_duration(Duration::from_secs(20), Duration::from_secs(45))
+                > Duration::from_secs(65)
+        );
+    }
+
+    #[test]
+    fn keepalive_is_not_applicable_to_a_fifo_client_whatever_runs_it() {
+        let fixtures = FixtureIds::default();
+        let scenario_named = |name: &str| {
+            scenarios()
+                .unwrap()
+                .into_iter()
+                .find(|scenario| scenario.name == name)
+                .unwrap()
+        };
+        let applies = |name: &str, via, client| {
+            let scenario = scenario_named(name);
+            let trial = Trial {
+                bin: Path::new("transport-conformance"),
+                scenario: &scenario,
+                via,
+                client,
+                fixture_file: None,
+                fixtures: &fixtures,
+                transport: None,
+                pace: conformance_pace(),
+            };
+            not_applicable(&trial).is_none()
+        };
+        for name in ["idle_keepalive", "pong_timeout"] {
+            assert!(!applies(name, Via::Fifo, None), "{name} built-in fifo");
+            assert!(
+                !applies(name, Via::Fifo, Some("ruby client.rb")),
+                "{name} fifo client"
+            );
+            assert!(
+                applies(name, Via::Direct, Some("ruby client.rb")),
+                "{name} direct client"
+            );
+            assert!(applies(name, Via::Stdio, None), "{name} stdio");
+        }
+        assert!(applies(
+            "happy_two_batches",
+            Via::Fifo,
+            Some("ruby client.rb")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_where_every_trial_is_not_applicable_is_an_error() {
+        let run = ConformanceRun {
+            filter: Some("idle_keepalive"),
+            via: SuiteVia::Fifo,
+            client: None,
+            fixtures: FixtureIds::default(),
+            fixture_file: None,
+            transport: None,
+        };
+        let err = run_suite_with(Path::new("transport-conformance"), run)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no conformance scenarios ran"),
+            "{err}"
+        );
     }
 
     #[test]

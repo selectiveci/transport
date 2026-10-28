@@ -1,0 +1,43 @@
+{
+  "name": "queued_before_connected",
+  "not_for_languages": [
+    "ruby"
+  ],
+  "steps": [
+    {
+      "op": "send",
+      "message": {
+        "command": "test_manifest"
+      }
+    },
+    {
+      "op": "expect_no_frame",
+      "ms": 300
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "connected"
+      }
+    },
+    {
+      "op": "expect_manifest",
+      "tree": false
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "close",
+        "exit_status": null
+      }
+    },
+    {
+      "op": "expect_report",
+      "connection_retries": 0
+    },
+    {
+      "op": "expect_exit",
+      "code": 0
+    }
+  ]
+}
