@@ -31,6 +31,8 @@ pub struct Scenario {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_for_languages: Vec<String>,
     #[serde(default)]
+    pub requires_hook_time: bool,
+    #[serde(default)]
     pub no_keepalive_env: bool,
     pub steps: Vec<Step>,
 }
@@ -41,6 +43,9 @@ pub enum Step {
     Send {
         message: Value,
     },
+    SendRaw {
+        text: String,
+    },
     ExpectManifest {
         tree: bool,
     },
@@ -48,10 +53,15 @@ pub enum Step {
         id: String,
         status: String,
     },
+    ExpectUncollected {
+        id: String,
+    },
     Drop,
     ExpectReconnect,
     ExpectReport {
         connection_retries: u64,
+        #[serde(default)]
+        hook_time: bool,
     },
     ExpectNoFrame {
         ms: u64,
@@ -64,6 +74,9 @@ pub enum Step {
     },
     Idle,
     IgnorePongs,
+    ExpectOutput {
+        text: String,
+    },
     Busy {
         ms: u64,
     },
@@ -97,16 +110,27 @@ impl SuiteVia {
 fn scenarios() -> Result<Vec<Scenario>, Error> {
     const RAW: &[&str] = &[
         include_str!("../../../conformance/scenarios/happy_two_batches.json"),
+        include_str!("../../../conformance/scenarios/remove_failed.json"),
+        include_str!("../../../conformance/scenarios/repeated_id.json"),
         include_str!("../../../conformance/scenarios/reconnect.json"),
         include_str!("../../../conformance/scenarios/socket_drop.json"),
         include_str!("../../../conformance/scenarios/close_rejected.json"),
         include_str!("../../../conformance/scenarios/queued_before_connected.json"),
+        include_str!("../../../conformance/scenarios/unknown_command.json"),
         include_str!("../../../conformance/scenarios/reconnect_exhausted.json"),
+        include_str!("../../../conformance/scenarios/overlap_buffered.json"),
+        include_str!("../../../conformance/scenarios/uncollected_id.json"),
+        include_str!("../../../conformance/scenarios/remove_failed_mid_batch.json"),
         include_str!("../../../conformance/scenarios/idle_keepalive.json"),
         include_str!("../../../conformance/scenarios/pong_timeout.json"),
+        include_str!("../../../conformance/scenarios/print_commands.json"),
         include_str!("../../../conformance/scenarios/busy_server.json"),
         include_str!("../../../conformance/scenarios/close_frame.json"),
         include_str!("../../../conformance/scenarios/reconnect_then_going_away.json"),
+        include_str!("../../../conformance/scenarios/retries_across_reconnects.json"),
+        include_str!("../../../conformance/scenarios/retries_after_rejected_connects.json"),
+        include_str!("../../../conformance/scenarios/group_hook_time.json"),
+        include_str!("../../../conformance/scenarios/unparseable_frame.json"),
     ];
     RAW.iter()
         .map(|raw| serde_json::from_str(raw).map_err(Error::from))
@@ -131,6 +155,10 @@ pub struct ConformanceRun<'a> {
 
 pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), Error> {
     let pace = conformance_pace();
+    let before_all_seconds = run
+        .fixtures
+        .before_all_seconds()
+        .or(run.client.is_none().then_some(BUILTIN_BEFORE_ALL_SECONDS));
     let mut failures = Vec::new();
     let mut trials = 0usize;
     for scenario in scenarios()? {
@@ -161,6 +189,7 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
                 fixture_file: run.fixture_file,
                 transport: run.transport,
                 fixtures: &run.fixtures,
+                before_all_seconds,
                 pace,
             };
             let label = if run.client.is_some() {
@@ -211,9 +240,12 @@ struct Trial<'a> {
     client: Option<&'a str>,
     fixture_file: Option<&'a Path>,
     fixtures: &'a FixtureIds,
+    before_all_seconds: Option<f64>,
     transport: Option<&'a Path>,
     pace: Pace,
 }
+
+const BUILTIN_BEFORE_ALL_SECONDS: f64 = 0.2;
 
 const RUNNER_ENV: &[(&str, &str)] = &[
     ("SELECTIVE_PLATFORM", "conformance"),
@@ -330,6 +362,9 @@ fn not_applicable(trial: &Trial<'_>) -> Option<&'static str> {
     if matches!(trial.via, Via::Fifo) && uses_keepalive(trial.scenario) {
         return Some("the transport's FIFO mode has no keepalive");
     }
+    if trial.scenario.requires_hook_time && trial.before_all_seconds.is_none() {
+        return Some("the fixture file declares no before_all_seconds");
+    }
     None
 }
 
@@ -360,6 +395,12 @@ fn client_env(command: &mut Command, trial: &Trial<'_>, url: &str, host: &str) {
     }
     if let Some(path) = trial.fixture_file {
         command.env("SELECTIVE_CONFORMANCE_FIXTURE_IDS", path);
+    }
+    if let (None, Some(seconds)) = (trial.client, trial.before_all_seconds) {
+        command.env(
+            "SELECTIVE_CONFORMANCE_BEFORE_ALL_SECONDS",
+            seconds.to_string(),
+        );
     }
     if let Some(path) = trial.transport {
         command.env("SELECTIVE_TRANSPORT", path);
@@ -456,10 +497,12 @@ async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
         incoming: rx,
         current: None,
         child: Some(child),
+        logs: Arc::clone(&logs),
         saw_connection: false,
         attempts: 0,
         language: None,
         fixtures: trial.fixtures.clone(),
+        before_all_seconds: trial.before_all_seconds,
         connections: 0,
         ping_interval: trial.pace.ping,
         pong_timeout: trial.pace.pong,
@@ -534,10 +577,12 @@ struct Player {
     incoming: tokio::sync::mpsc::UnboundedReceiver<Incoming>,
     current: Option<Live>,
     child: Option<Child>,
+    logs: Arc<Mutex<String>>,
     saw_connection: bool,
     attempts: u32,
     language: Option<String>,
     fixtures: FixtureIds,
+    before_all_seconds: Option<f64>,
     connections: u32,
     ping_interval: Duration,
     pong_timeout: Duration,
@@ -581,6 +626,15 @@ impl Player {
                 live.ws.send(Message::Text(text)).await?;
                 Ok(())
             }
+            Step::SendRaw { text } => {
+                self.ensure_connection().await?;
+                let live = self
+                    .current
+                    .as_mut()
+                    .ok_or_else(|| Error::new("no websocket"))?;
+                live.ws.send(Message::Text(text.clone())).await?;
+                Ok(())
+            }
             Step::ExpectManifest { tree } => {
                 let frame = self.next_frame().await?;
                 let expected = self.fixtures.manifest_ids();
@@ -590,14 +644,25 @@ impl Player {
                 let frame = self.next_frame().await?;
                 expect_result(&frame, id, status)
             }
+            Step::ExpectUncollected { id } => {
+                let frame = self.next_frame().await?;
+                expect_uncollected(&frame, id)
+            }
             Step::Drop => {
                 self.current = None;
                 Ok(())
             }
             Step::ExpectReconnect => self.expect_reconnect().await,
-            Step::ExpectReport { connection_retries } => {
+            Step::ExpectReport {
+                connection_retries,
+                hook_time,
+            } => {
                 let frame = self.next_frame().await?;
-                expect_report(&frame, *connection_retries)
+                expect_report(&frame, *connection_retries)?;
+                match (hook_time, self.before_all_seconds) {
+                    (true, Some(seconds)) => expect_hook_time(&frame, seconds),
+                    _ => Ok(()),
+                }
             }
             Step::ExpectNoFrame { ms } => self.expect_no_frame(*ms).await,
             Step::ExpectExit { code } => self.expect_exit(*code).await,
@@ -607,6 +672,7 @@ impl Player {
                 self.reading = Reading::UntilReconnect;
                 Ok(())
             }
+            Step::ExpectOutput { text } => self.expect_output(text).await,
             Step::Busy { ms } => self.busy_for(*ms).await,
             Step::CloseSocket { code } => self.close_socket(*code).await,
         }
@@ -654,6 +720,20 @@ impl Player {
             .await;
         });
         Ok(())
+    }
+
+    async fn expect_output(&mut self, text: &str) -> Result<(), Error> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let printed = self.logs.lock().is_ok_and(|logs| logs.contains(text));
+            if printed {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::new(format!("client output never showed {text:?}")));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     async fn idle(&mut self) -> Result<(), Error> {
@@ -1049,6 +1129,17 @@ fn expect_result(frame: &Value, id: &str, status: &str) -> Result<(), Error> {
     Ok(())
 }
 
+fn expect_uncollected(frame: &Value, id: &str) -> Result<(), Error> {
+    expect_status(frame, id, "failed")?;
+    match frame.pointer("/data/failure_formatted_backtrace") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Array(items)) if items.is_empty() => Ok(()),
+        Some(other) => Err(Error::new(format!(
+            "an uncollected id has no frame to report, got {other}"
+        ))),
+    }
+}
+
 fn expect_status(frame: &Value, id: &str, status: &str) -> Result<(), Error> {
     if frame.get("type").and_then(Value::as_str) != Some("test_case_result") {
         return Err(Error::new(format!(
@@ -1086,6 +1177,25 @@ fn expect_report(frame: &Value, connection_retries: u64) -> Result<(), Error> {
     } else {
         Err(Error::new(format!(
             "connection_retries {got:?}, expected {connection_retries}"
+        )))
+    }
+}
+
+fn expect_hook_time(frame: &Value, declared: f64) -> Result<(), Error> {
+    let total: f64 = frame
+        .get("data")
+        .and_then(Value::as_object)
+        .map_or(0.0, |data| {
+            data.iter()
+                .filter(|(key, _)| key.starts_with("seconds_in_") && key.ends_with("_hooks"))
+                .filter_map(|(_, value)| value.as_f64())
+                .sum()
+        });
+    if total >= declared * 0.5 && total <= declared * 5.0 + 1.0 {
+        Ok(())
+    } else {
+        Err(Error::new(format!(
+            "group hooks took {total}s by the report, but the fixture's before-all hook sleeps {declared}s"
         )))
     }
 }
@@ -1247,6 +1357,7 @@ mod tests {
             client: None,
             fixture_file: None,
             fixtures: &fixtures,
+            before_all_seconds: None,
             transport: None,
             pace: conformance_pace(),
         };
@@ -1293,6 +1404,31 @@ mod tests {
     }
 
     #[test]
+    fn hook_time_must_be_on_the_scale_of_the_declared_sleep() {
+        let report = |data: Value| serde_json::json!({"type": "report_at_finish", "data": data});
+        for data in [
+            serde_json::json!({"seconds_in_before_all_hooks": 0.21}),
+            serde_json::json!({"seconds_in_beforeclass_all_hooks": 0.15, "seconds_in_afterclass_all_hooks": 0.0}),
+            serde_json::json!({"seconds_in_setup_all_all_hooks": 0.4, "connection_retries": 3}),
+        ] {
+            expect_hook_time(&report(data.clone()), 0.2)
+                .unwrap_or_else(|err| panic!("{data}: {err}"));
+        }
+        for data in [
+            serde_json::json!({}),
+            serde_json::json!({"seconds_in_before_all_hooks": 0.0}),
+            serde_json::json!({"seconds_in_before_all_hooks": "0.2"}),
+            serde_json::json!({"seconds_in_before_all_hooks": 200}),
+            serde_json::json!({"before_all": 0.2}),
+        ] {
+            assert!(
+                expect_hook_time(&report(data.clone()), 0.2).is_err(),
+                "{data}"
+            );
+        }
+    }
+
+    #[test]
     fn client_command_is_split_without_adding_via_args() {
         assert_eq!(
             shell_words(r"/opt/bin/transport conformance-client").unwrap(),
@@ -1334,6 +1470,7 @@ mod tests {
                 client,
                 fixture_file: None,
                 fixtures: &fixtures,
+                before_all_seconds: None,
                 transport: None,
                 pace: conformance_pace(),
             };
@@ -1437,5 +1574,26 @@ mod tests {
             "passed",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn an_uncollected_id_reports_no_frame() {
+        let result = |frames: Option<Value>| {
+            let mut data = serde_json::json!({"id": "not-a-case", "status": "failed"});
+            if let Some(frames) = frames {
+                data["failure_formatted_backtrace"] = frames;
+            }
+            serde_json::json!({"type": "test_case_result", "data": data})
+        };
+        expect_uncollected(&result(None), "not-a-case").unwrap();
+        expect_uncollected(&result(Some(serde_json::json!([]))), "not-a-case").unwrap();
+        for frames in [
+            serde_json::json!(["tests/uncollected.py:1"]),
+            serde_json::json!(["/home/dev/proj/tests/foo.py:1"]),
+            serde_json::json!("tests/uncollected.py:1"),
+        ] {
+            let err = expect_uncollected(&result(Some(frames.clone())), "not-a-case").unwrap_err();
+            assert!(err.to_string().contains("no frame"), "{frames}: {err}");
+        }
     }
 }
