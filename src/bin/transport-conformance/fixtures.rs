@@ -60,4 +60,43 @@ impl FixtureIds {
             .cloned()
             .unwrap_or_else(|| role.to_owned())
     }
+
+    pub(crate) fn manifest_ids(&self) -> Vec<String> {
+        ROLES.iter().map(|(role, _)| self.id(role)).collect()
+    }
+
+    pub(crate) fn rewrite(&self, text: &str) -> Option<String> {
+        for (role, literal) in ROLES {
+            if text == *literal {
+                let mapped = self.id(role);
+                if mapped == *literal {
+                    return None;
+                }
+                return Some(mapped);
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_map_keeps_the_other_literals() {
+        let ids = FixtureIds::parse(r#"{"pass":"spec.ok","extra":"spec.other"}"#).unwrap();
+        assert_eq!(ids.id("pass"), "spec.ok");
+        assert_eq!(ids.id("fail"), "case-fail");
+        assert_eq!(ids.id("extra"), "spec.other");
+        assert_eq!(
+            ids.manifest_ids(),
+            vec!["spec.ok", "case-fail", "case-pend", "case-flake"]
+        );
+        assert_eq!(ids.rewrite("case-pass").as_deref(), Some("spec.ok"));
+        assert_eq!(ids.rewrite("case-fail"), None);
+        assert_eq!(ids.rewrite("{{extra}}"), None);
+        assert!(FixtureIds::parse(r#"{"pass":""}"#).is_err());
+        assert!(FixtureIds::parse("[]").is_err());
+    }
 }

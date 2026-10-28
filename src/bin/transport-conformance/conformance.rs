@@ -1,0 +1,965 @@
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::process::{Child, Command};
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
+
+use crate::fixtures::FixtureIds;
+use crate::reference_client::Via;
+use transport::Error;
+
+const API_KEY: &str = "conformance-key";
+const RUN_ID: &str = "run-1";
+const RUN_ATTEMPT: &str = "1";
+const RUNNER_ID: &str = "runner-1";
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Scenario {
+    pub name: String,
+    #[serde(default)]
+    pub no_keepalive_env: bool,
+    pub steps: Vec<Step>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Step {
+    Send {
+        message: Value,
+    },
+    ExpectManifest {
+        tree: bool,
+    },
+    ExpectResult {
+        id: String,
+        status: String,
+    },
+    ExpectReconnect,
+    ExpectReport {
+        connection_retries: u64,
+    },
+    ExpectExit {
+        code: i32,
+    },
+    RejectConnections {
+        times: u32,
+    },
+    CloseSocket {
+        #[serde(default)]
+        code: Option<u16>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SuiteVia {
+    Direct,
+    Stdio,
+    Fifo,
+    Both,
+    All,
+}
+
+impl SuiteVia {
+    fn list(self) -> Vec<Via> {
+        match self {
+            Self::Direct => vec![Via::Direct],
+            Self::Stdio => vec![Via::Stdio],
+            Self::Fifo => vec![Via::Fifo],
+            Self::Both => vec![Via::Direct, Via::Stdio],
+            Self::All => vec![Via::Direct, Via::Stdio, Via::Fifo],
+        }
+    }
+}
+
+fn scenarios() -> Result<Vec<Scenario>, Error> {
+    const RAW: &[&str] = &[
+        include_str!("../../../conformance/scenarios/happy_two_batches.json"),
+        include_str!("../../../conformance/scenarios/reconnect.json"),
+        include_str!("../../../conformance/scenarios/reconnect_exhausted.json"),
+        include_str!("../../../conformance/scenarios/close_frame.json"),
+    ];
+    RAW.iter()
+        .map(|raw| serde_json::from_str(raw).map_err(Error::from))
+        .collect()
+}
+
+pub fn scenario_names() -> Result<Vec<String>, Error> {
+    Ok(scenarios()?
+        .into_iter()
+        .map(|scenario| scenario.name)
+        .collect())
+}
+
+pub struct ConformanceRun<'a> {
+    pub filter: Option<&'a str>,
+    pub via: SuiteVia,
+    pub client: Option<&'a str>,
+    pub fixtures: FixtureIds,
+    pub fixture_file: Option<&'a Path>,
+    pub transport: Option<&'a Path>,
+}
+
+pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), Error> {
+    let pace = conformance_pace();
+    let mut failures = Vec::new();
+    let mut trials = 0usize;
+    for scenario in scenarios()? {
+        if run.filter.is_some_and(|name| name != scenario.name) {
+            continue;
+        }
+        let mut scenario = scenario;
+        apply_fixtures(&mut scenario, &run.fixtures)?;
+        let vias = if run.client.is_some() {
+            vec![Via::Direct]
+        } else {
+            run.via.list()
+        };
+        for via in vias {
+            if matches!(via, Via::Fifo) && !cfg!(unix) {
+                eprintln!("skip {} fifo (FIFO mode is unix-only)", scenario.name);
+                continue;
+            }
+            trials += 1;
+            let trial = Trial {
+                bin,
+                scenario: &scenario,
+                via,
+                client: run.client,
+                fixture_file: run.fixture_file,
+                transport: run.transport,
+                fixtures: &run.fixtures,
+                pace,
+            };
+            let label = if run.client.is_some() {
+                "client"
+            } else {
+                via_name(via)
+            };
+            match run_one(&trial).await {
+                Ok(Played::Passed) => eprintln!("ok {} {label}", scenario.name),
+                Err(err) => failures.push(format!("{} {label}: {err}", scenario.name)),
+            }
+        }
+    }
+    if trials == 0 {
+        return Err(match run.filter {
+            Some(name) => Error::new(format!(
+                "no conformance scenarios ran for --scenario {name}"
+            )),
+            None => Error::new("no conformance scenarios ran"),
+        });
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::new(failures.join("\n")))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Pace {
+    ping: Duration,
+    pong: Duration,
+}
+
+struct Trial<'a> {
+    bin: &'a Path,
+    scenario: &'a Scenario,
+    via: Via,
+    client: Option<&'a str>,
+    fixture_file: Option<&'a Path>,
+    fixtures: &'a FixtureIds,
+    transport: Option<&'a Path>,
+    pace: Pace,
+}
+
+fn conformance_pace() -> Pace {
+    Pace {
+        ping: Duration::from_millis(env_u64("SELECTIVE_CONFORMANCE_PING_INTERVAL_MS", 200)),
+        pong: Duration::from_millis(env_u64("SELECTIVE_CONFORMANCE_PONG_TIMEOUT_MS", 1_000)),
+    }
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn apply_fixtures(scenario: &mut Scenario, fixtures: &FixtureIds) -> Result<(), Error> {
+    for step in &mut scenario.steps {
+        let mut value = serde_json::to_value(&*step)?;
+        rewrite_value(&mut value, fixtures);
+        *step = serde_json::from_value(value)?;
+    }
+    Ok(())
+}
+
+fn rewrite_value(value: &mut Value, fixtures: &FixtureIds) {
+    match value {
+        Value::String(text) => {
+            if let Some(mapped) = fixtures.rewrite(text) {
+                *text = mapped;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                rewrite_value(item, fixtures);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                rewrite_value(item, fixtures);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn client_command(trial: &Trial<'_>) -> Result<Command, Error> {
+    if let Some(line) = trial.client {
+        let words = shell_words(line)?;
+        let mut command = Command::new(&words[0]);
+        command.args(&words[1..]);
+        return Ok(command);
+    }
+    let mut command = Command::new(trial.bin);
+    command.arg("client");
+    match trial.via {
+        Via::Direct => {}
+        Via::Stdio => {
+            command.arg("--via-stdio");
+        }
+        Via::Fifo => {
+            command.arg("--via-fifo");
+        }
+    }
+    Ok(command)
+}
+
+fn shell_words(input: &str) -> Result<Vec<String>, Error> {
+    let words =
+        shell_words::split(input).map_err(|_| Error::new("unclosed quote in --client command"))?;
+    if words.is_empty() {
+        return Err(Error::new("--client command is empty"));
+    }
+    Ok(words)
+}
+
+fn via_name(via: Via) -> &'static str {
+    match via {
+        Via::Direct => "direct",
+        Via::Stdio => "stdio",
+        Via::Fifo => "fifo",
+    }
+}
+
+fn client_env(command: &mut Command, trial: &Trial<'_>, url: &str, host: &str) {
+    command
+        .env("SELECTIVE_TRANSPORT_URL", url)
+        .env("SELECTIVE_API_KEY", API_KEY)
+        .env("SELECTIVE_HOST", host)
+        .env("SELECTIVE_RUN_ID", RUN_ID)
+        .env("SELECTIVE_RUN_ATTEMPT", RUN_ATTEMPT)
+        .env("SELECTIVE_RUNNER_ID", RUNNER_ID)
+        .env("SELECTIVE_TEST_MAP_UPLOAD_KEY", "conformance-key")
+        .env("SELECTIVE_CONFORMANCE_FAST", "1");
+    if trial.scenario.no_keepalive_env {
+        command
+            .env_remove("SELECTIVE_WS_PING_INTERVAL_MS")
+            .env_remove("SELECTIVE_WS_PONG_TIMEOUT_MS");
+    } else {
+        command
+            .env(
+                "SELECTIVE_WS_PING_INTERVAL_MS",
+                trial.pace.ping.as_millis().to_string(),
+            )
+            .env(
+                "SELECTIVE_WS_PONG_TIMEOUT_MS",
+                trial.pace.pong.as_millis().to_string(),
+            );
+    }
+    if let Some(path) = trial.fixture_file {
+        command.env("SELECTIVE_CONFORMANCE_FIXTURE_IDS", path);
+    }
+    if let Some(path) = trial.transport {
+        command.env("SELECTIVE_TRANSPORT", path);
+    }
+}
+
+static NEXT_TRIAL: AtomicU32 = AtomicU32::new(0);
+
+struct TrialPipes {
+    dir: std::path::PathBuf,
+    prefix: Option<String>,
+}
+
+impl TrialPipes {
+    fn new(trial: &Trial<'_>, dir: &Path) -> Self {
+        let fifo = trial.client.is_none() && matches!(trial.via, Via::Fifo);
+        Self {
+            dir: dir.to_path_buf(),
+            prefix: fifo.then(|| {
+                format!(
+                    "conformance-{}-t{}",
+                    std::process::id(),
+                    NEXT_TRIAL.fetch_add(1, Ordering::Relaxed)
+                )
+            }),
+        }
+    }
+}
+
+impl Drop for TrialPipes {
+    fn drop(&mut self) {
+        let Some(prefix) = &self.prefix else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        let stem = format!("{prefix}-");
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&stem) && (name.ends_with("_1") || name.ends_with("_2")) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let url = format!(
+        "ws://{addr}/transport/websocket?api_key={API_KEY}&run_id={RUN_ID}&run_attempt={RUN_ATTEMPT}&runner_id={RUNNER_ID}&metadata=%7B%22ci%22%3A%22conformance%22%7D"
+    );
+    let gate = Arc::new(Gate {
+        reject_budget: Mutex::new(match trial.scenario.steps.first() {
+            Some(Step::RejectConnections { times }) => *times,
+            _ => 0,
+        }),
+    });
+    let logs = Arc::new(Mutex::new(String::new()));
+    let mut command = client_command(trial)?;
+    client_env(&mut command, trial, &url, &format!("ws://{addr}"));
+    let pipes = TrialPipes::new(trial, Path::new("/tmp"));
+    if let Some(prefix) = &pipes.prefix {
+        command.env("SELECTIVE_CONFORMANCE_FIFO_PREFIX", prefix);
+    }
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let accept_gate = Arc::clone(&gate);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let tx = tx.clone();
+            let gate = Arc::clone(&accept_gate);
+            tokio::spawn(async move {
+                forward_connection(stream, gate, tx).await;
+            });
+        }
+    });
+    let mut child = command.spawn()?;
+    drain_pipe(child.stdout.take(), Arc::clone(&logs));
+    drain_pipe(child.stderr.take(), Arc::clone(&logs));
+    let mut player = Player {
+        incoming: rx,
+        current: None,
+        child: Some(child),
+        saw_connection: false,
+        attempts: 0,
+        fixtures: trial.fixtures.clone(),
+        reading: Reading::Open,
+        pings: 0,
+        frames_end_in_newline: trial.client.is_none() && !matches!(trial.via, Via::Direct),
+    };
+    let outcome = player.play(trial.scenario).await;
+    if !matches!(outcome, Ok(Played::Passed)) {
+        if let Some(mut child) = player.child.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+    outcome.map_err(|err| {
+        let extra = logs.lock().map(|guard| guard.clone()).unwrap_or_default();
+        Error::new(format!("{err}\n--- client output ---\n{extra}"))
+    })
+}
+
+fn drain_pipe<R>(pipe: Option<R>, logs: Arc<Mutex<String>>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let Some(pipe) = pipe else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(pipe);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if let Ok(mut guard) = logs.lock() {
+                        guard.push_str(&line);
+                    }
+                }
+            }
+        }
+    });
+}
+
+struct Live {
+    uri: String,
+    ws: WebSocketStream<TcpStream>,
+}
+
+enum Incoming {
+    Socket(Box<Live>),
+    Rejected(String),
+    Failed(Error),
+}
+
+struct Gate {
+    reject_budget: Mutex<u32>,
+}
+
+enum Played {
+    Passed,
+}
+
+enum Reading {
+    Open,
+}
+
+struct Player {
+    incoming: tokio::sync::mpsc::UnboundedReceiver<Incoming>,
+    current: Option<Live>,
+    child: Option<Child>,
+    saw_connection: bool,
+    attempts: u32,
+    fixtures: FixtureIds,
+    reading: Reading,
+    pings: u32,
+    frames_end_in_newline: bool,
+}
+
+impl Player {
+    async fn play(&mut self, scenario: &Scenario) -> Result<Played, Error> {
+        for step in &scenario.steps {
+            self.step(step)
+                .await
+                .map_err(|err| Error::new(format!("{}: {err}", scenario.name)))?;
+        }
+        Ok(Played::Passed)
+    }
+
+    async fn step(&mut self, step: &Step) -> Result<(), Error> {
+        match step {
+            Step::Send { message } => {
+                self.ensure_connection().await?;
+                let text = serde_json::to_string(message)?;
+                let live = self
+                    .current
+                    .as_mut()
+                    .ok_or_else(|| Error::new("no websocket"))?;
+                live.ws.send(Message::Text(text)).await?;
+                Ok(())
+            }
+            Step::ExpectManifest { tree } => {
+                let frame = self.next_frame().await?;
+                let expected = self.fixtures.manifest_ids();
+                expect_manifest(&frame, *tree, &expected)
+            }
+            Step::ExpectResult { id, status } => {
+                let frame = self.next_frame().await?;
+                expect_result(&frame, id, status)
+            }
+            Step::ExpectReconnect => self.expect_reconnect().await,
+            Step::ExpectReport { connection_retries } => {
+                let frame = self.next_frame().await?;
+                expect_report(&frame, *connection_retries)
+            }
+            Step::ExpectExit { code } => self.expect_exit(*code).await,
+            Step::RejectConnections { times } => self.reject_connections(*times).await,
+            Step::CloseSocket { code } => self.close_socket(*code).await,
+        }
+    }
+
+    async fn close_socket(&mut self, code: Option<u16>) -> Result<(), Error> {
+        let mut live = self
+            .current
+            .take()
+            .ok_or_else(|| Error::new("no websocket to close"))?;
+        let frame = code.map(|code| CloseFrame {
+            code: CloseCode::from(code),
+            reason: "".into(),
+        });
+        live.ws.send(Message::Close(frame)).await?;
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(Ok(message)) = live.ws.next().await {
+                    if matches!(message, Message::Close(_)) {
+                        break;
+                    }
+                }
+            })
+            .await;
+        });
+        Ok(())
+    }
+
+    async fn ensure_connection(&mut self) -> Result<(), Error> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.current.is_none() {
+            if Instant::now() >= deadline {
+                return Err(Error::new("timed out waiting for the client"));
+            }
+            self.pump(deadline).await?;
+        }
+        Ok(())
+    }
+
+    async fn expect_reconnect(&mut self) -> Result<(), Error> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if self
+                .current
+                .as_ref()
+                .is_some_and(|live| live.uri.contains("reconnect=true"))
+            {
+                return Ok(());
+            }
+            self.pump(deadline).await?;
+        }
+        Err(Error::new("timed out waiting for reconnect=true"))
+    }
+
+    async fn next_frame(&mut self) -> Result<Value, Error> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(frame) = self.pump(deadline).await? {
+                if frame.as_str() == Some("exit") {
+                    return Err(Error::new("exit was forwarded as a websocket frame"));
+                }
+                return Ok(frame);
+            }
+        }
+        Err(Error::new("timed out waiting for a client frame"))
+    }
+
+    async fn pump(&mut self, deadline: Instant) -> Result<Option<Value>, Error> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let read_allowed = self.current.is_some() && matches!(self.reading, Reading::Open);
+        let event = tokio::select! {
+            next = self.incoming.recv() => Event::Accepted(next),
+            message = recv_live(self.current.as_mut()), if read_allowed => Event::Socket(message),
+            () = tokio::time::sleep(remaining) => Event::Timeout,
+        };
+        match event {
+            Event::Accepted(Some(Incoming::Socket(socket))) => {
+                self.install(*socket)?;
+                Ok(None)
+            }
+            Event::Accepted(Some(Incoming::Rejected(_))) => Err(Error::new(
+                "handshake was refused outside reject_connections",
+            )),
+            Event::Accepted(Some(Incoming::Failed(err))) => Err(err),
+            Event::Accepted(None) => Err(Error::new("connection listener stopped")),
+            Event::Socket(Pump::Frame(value, newline)) => {
+                if self.frames_end_in_newline && !newline {
+                    return Err(Error::new(format!(
+                        "a frame through the transport lost its trailing \\n: {value}"
+                    )));
+                }
+                Ok(Some(value))
+            }
+            Event::Socket(Pump::Ping) => {
+                self.pings = self.pings.saturating_add(1);
+                Ok(None)
+            }
+            Event::Socket(Pump::Closed) => {
+                self.current = None;
+                Ok(None)
+            }
+            Event::Socket(Pump::Continue) | Event::Timeout => Ok(None),
+        }
+    }
+
+    fn check_handshake(&mut self, uri: &str) -> Result<(), Error> {
+        expect_identity(&handshake_query(uri))?;
+        if self.attempts == 0 && uri.contains("reconnect=true") {
+            return Err(Error::new(
+                "the first connection must not set reconnect=true",
+            ));
+        }
+        self.attempts += 1;
+        Ok(())
+    }
+
+    fn install(&mut self, socket: Live) -> Result<(), Error> {
+        self.check_handshake(&socket.uri)?;
+        if self.saw_connection {
+            self.reading = Reading::Open;
+        } else {
+            self.saw_connection = true;
+        }
+        self.current = Some(socket);
+        Ok(())
+    }
+
+    async fn expect_exit(&mut self, code: i32) -> Result<(), Error> {
+        let mut child = self
+            .child
+            .take()
+            .ok_or_else(|| Error::new("no client process"))?;
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .map_err(|_| Error::new("timed out waiting for the client to exit"))??;
+        if status.code() == Some(code) {
+            Ok(())
+        } else {
+            Err(Error::new(format!("exit {status}, expected {code}")))
+        }
+    }
+
+    async fn reject_connections(&mut self, times: u32) -> Result<(), Error> {
+        for _ in 0..times {
+            let next = tokio::time::timeout(Duration::from_secs(5), self.incoming.recv())
+                .await
+                .map_err(|_| Error::new("timed out accepting a rejected connection"))?
+                .ok_or_else(|| Error::new("connection listener stopped"))?;
+            let Incoming::Rejected(uri) = next else {
+                return Err(Error::new("expected the handshake to be refused with 503"));
+            };
+            self.check_handshake(&uri)?;
+        }
+        Ok(())
+    }
+}
+
+enum Event {
+    Accepted(Option<Incoming>),
+    Socket(Pump),
+    Timeout,
+}
+
+async fn forward_connection(
+    stream: TcpStream,
+    gate: Arc<Gate>,
+    tx: tokio::sync::mpsc::UnboundedSender<Incoming>,
+) {
+    match classify(stream, &gate).await {
+        Ok(incoming) => {
+            let _ = tx.send(incoming);
+        }
+        Err(err) => {
+            let _ = tx.send(Incoming::Failed(err));
+        }
+    }
+}
+
+// The handshake callback's error type is fixed by tungstenite.
+#[allow(clippy::result_large_err)]
+async fn classify(stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, Error> {
+    let mut uri = String::new();
+    let mut rejected = false;
+    let handshake =
+        tokio_tungstenite::accept_hdr_async(stream, |request: &Request, response: Response| {
+            uri = request.uri().to_string();
+            let reject = {
+                let mut left = gate.reject_budget.lock().expect("reject budget");
+                let reject = *left > 0;
+                *left = left.saturating_sub(1);
+                reject
+            };
+            if reject {
+                rejected = true;
+                return Err(http::Response::builder()
+                    .status(503)
+                    .body(Some("Service Unavailable".to_owned()))
+                    .expect("503 response"));
+            }
+            Ok(response)
+        })
+        .await;
+    if rejected {
+        return Ok(Incoming::Rejected(uri));
+    }
+    let ws = handshake?;
+    Ok(Incoming::Socket(Box::new(Live { uri, ws })))
+}
+
+enum Pump {
+    Continue,
+    Ping,
+    Frame(Value, bool),
+    Closed,
+}
+
+async fn recv_live(live: Option<&mut Live>) -> Pump {
+    let Some(live) = live else {
+        return std::future::pending().await;
+    };
+    match live.ws.next().await {
+        Some(Ok(Message::Text(text))) => Pump::Frame(
+            serde_json::from_str(text.trim())
+                .unwrap_or_else(|_| Value::String(text.trim().to_owned())),
+            text.ends_with('\n'),
+        ),
+        Some(Ok(Message::Ping(payload))) => {
+            let _ = live.ws.send(Message::Pong(payload)).await;
+            Pump::Ping
+        }
+        Some(Ok(Message::Close(_)) | Err(_)) | None => Pump::Closed,
+        Some(Ok(_)) => Pump::Continue,
+    }
+}
+
+fn handshake_query(uri: &str) -> Vec<(String, String)> {
+    let query = uri.split_once('?').map_or("", |(_, query)| query);
+    url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect()
+}
+
+fn expect_identity(query: &[(String, String)]) -> Result<(), Error> {
+    let identity = [
+        ("api_key", API_KEY),
+        ("run_id", RUN_ID),
+        ("run_attempt", RUN_ATTEMPT),
+        ("runner_id", RUNNER_ID),
+    ];
+    for (name, expected) in identity {
+        let values: Vec<&str> = query
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+            .collect();
+        if values != [expected] {
+            return Err(Error::new(format!(
+                "the websocket url must carry {name}={expected}, got {values:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn expect_manifest(frame: &Value, tree: bool, expected_ids: &[String]) -> Result<(), Error> {
+    if frame.get("type").and_then(Value::as_str) != Some("test_manifest") {
+        return Err(Error::new(format!("expected test_manifest, got {frame}")));
+    }
+    let cases = frame
+        .pointer("/data/test_cases")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::new("manifest test_cases"))?;
+    let ids: Vec<&str> = cases
+        .iter()
+        .filter_map(|case| case.get("id").and_then(Value::as_str))
+        .collect();
+    let expected: Vec<&str> = expected_ids.iter().map(String::as_str).collect();
+    if ids != expected {
+        return Err(Error::new(format!("manifest ids {ids:?}")));
+    }
+    let tree_value = frame.pointer("/data/test_map_tree");
+    if tree {
+        let tree_value = tree_value.ok_or_else(|| Error::new("missing test_map_tree"))?;
+        for key in ["sha", "prefix", "files", "dirty"] {
+            if tree_value.get(key).is_none() {
+                return Err(Error::new(format!("test_map_tree missing {key}")));
+            }
+        }
+        if !tree_value.get("files").is_some_and(Value::is_object)
+            || !tree_value.get("dirty").is_some_and(Value::is_array)
+        {
+            return Err(Error::new("test_map_tree shape"));
+        }
+    } else if tree_value.is_some() {
+        return Err(Error::new("test_map_tree was not requested"));
+    }
+    Ok(())
+}
+
+fn expect_result(frame: &Value, id: &str, status: &str) -> Result<(), Error> {
+    expect_status(frame, id, status)?;
+    Ok(())
+}
+
+fn expect_status(frame: &Value, id: &str, status: &str) -> Result<(), Error> {
+    if frame.get("type").and_then(Value::as_str) != Some("test_case_result") {
+        return Err(Error::new(format!(
+            "expected test_case_result, got {frame}"
+        )));
+    }
+    let got_id = frame
+        .pointer("/data/id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let got_status = frame
+        .pointer("/data/status")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if got_id == id && got_status == status {
+        Ok(())
+    } else {
+        Err(Error::new(format!(
+            "expected {id} {status}, got {got_id} {got_status}"
+        )))
+    }
+}
+
+fn expect_report(frame: &Value, connection_retries: u64) -> Result<(), Error> {
+    if frame.get("type").and_then(Value::as_str) != Some("report_at_finish") {
+        return Err(Error::new(format!(
+            "expected report_at_finish, got {frame}"
+        )));
+    }
+    let got = frame
+        .pointer("/data/connection_retries")
+        .and_then(Value::as_u64);
+    if got == Some(connection_retries) {
+        Ok(())
+    } else {
+        Err(Error::new(format!(
+            "connection_retries {got:?}, expected {connection_retries}"
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_map_rewrites_scenario_ids_and_the_manifest() {
+        let fixtures = FixtureIds::parse(
+            r#"{"pass":"spec.ok","fail":"spec.bad","pending":"spec.skip","flaky":"spec.flake"}"#,
+        )
+        .unwrap();
+        let mut scenario: Scenario = serde_json::from_str(include_str!(
+            "../../../conformance/scenarios/happy_two_batches.json"
+        ))
+        .unwrap();
+        apply_fixtures(&mut scenario, &fixtures).unwrap();
+        let encoded = serde_json::to_string(&scenario).unwrap();
+        assert!(encoded.contains("spec.ok"));
+        assert!(encoded.contains("spec.skip"));
+        assert!(!encoded.contains("case-pass"));
+        assert!(!encoded.contains("case-pend"));
+        let manifest = |ids: &[&str]| {
+            let cases: Vec<Value> = ids
+                .iter()
+                .map(|id| serde_json::json!({"id": id, "file_path": "spec/a_spec.rb", "run_time": 0}))
+                .collect();
+            serde_json::json!({"type": "test_manifest", "data": {"test_cases": cases}})
+        };
+        expect_manifest(
+            &manifest(&["spec.ok", "spec.bad", "spec.skip", "spec.flake"]),
+            false,
+            &fixtures.manifest_ids(),
+        )
+        .unwrap();
+        expect_manifest(
+            &manifest(&["case-pass", "case-fail", "case-pend", "case-flake"]),
+            false,
+            &FixtureIds::default().manifest_ids(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn identity_must_match_what_the_client_was_given() {
+        let url = format!(
+            "/transport/websocket?api_key={API_KEY}&run_id={RUN_ID}&run_attempt={RUN_ATTEMPT}&runner_id={RUNNER_ID}&reconnect=true"
+        );
+        expect_identity(&handshake_query(&url)).unwrap();
+        for dropped in ["api_key", "run_id", "run_attempt", "runner_id"] {
+            let stripped: Vec<String> = url
+                .split_once('?')
+                .unwrap()
+                .1
+                .split('&')
+                .filter(|pair| !pair.starts_with(dropped))
+                .map(str::to_owned)
+                .collect();
+            let err = expect_identity(&handshake_query(&format!("/x?{}", stripped.join("&"))))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(dropped), "{err}");
+        }
+        let swapped = url.replace("run_attempt=1", "run_attempt=2");
+        assert!(expect_identity(&handshake_query(&swapped)).is_err());
+        let doubled = format!("{url}&runner_id=other");
+        assert!(expect_identity(&handshake_query(&doubled)).is_err());
+    }
+
+    #[test]
+    fn trial_pipes_removes_only_its_own_fifo_pair() {
+        let dir = std::env::temp_dir().join(format!("trial-pipes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let scenario: Scenario = serde_json::from_str(include_str!(
+            "../../../conformance/scenarios/happy_two_batches.json"
+        ))
+        .unwrap();
+        let fixtures = FixtureIds::default();
+        let trial = |via| Trial {
+            bin: Path::new("transport-conformance"),
+            scenario: &scenario,
+            via,
+            client: None,
+            fixture_file: None,
+            fixtures: &fixtures,
+            transport: None,
+            pace: conformance_pace(),
+        };
+        assert!(TrialPipes::new(&trial(Via::Stdio), &dir).prefix.is_none());
+        let pipes = TrialPipes::new(&trial(Via::Fifo), &dir);
+        let prefix = pipes.prefix.clone().unwrap();
+        let mine = [
+            format!("{prefix}-0_1"),
+            format!("{prefix}-0_2"),
+            format!("{prefix}-1_1"),
+        ];
+        let others = [
+            format!("{prefix}0-0_1"),
+            format!("{prefix}-0_3"),
+            "conformance-1-t1-0_1".to_owned(),
+        ];
+        for name in mine.iter().chain(&others) {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+        drop(pipes);
+        for name in &mine {
+            assert!(!dir.join(name).exists(), "{name}");
+        }
+        for name in &others {
+            assert!(dir.join(name).exists(), "{name}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
