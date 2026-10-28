@@ -185,6 +185,23 @@ struct Trial<'a> {
     pace: Pace,
 }
 
+const RUNNER_ENV: &[(&str, &str)] = &[
+    ("SELECTIVE_PLATFORM", "conformance"),
+    ("SELECTIVE_BRANCH", "conformance"),
+    ("SELECTIVE_SHA", "0123456789abcdef0123456789abcdef01234567"),
+    ("SELECTIVE_GIT_REPO", "selectiveci/conformance"),
+    ("SELECTIVE_GIT_PROVIDER", "github"),
+    ("SELECTIVE_PR_TITLE", "conformance"),
+];
+
+fn runner_env_defaults(var: impl Fn(&str) -> Option<String>) -> Vec<(&'static str, &'static str)> {
+    RUNNER_ENV
+        .iter()
+        .copied()
+        .filter(|(key, _)| var(key).is_none_or(|value| value.is_empty()))
+        .collect()
+}
+
 fn conformance_pace() -> Pace {
     Pace {
         ping: Duration::from_millis(env_u64("SELECTIVE_CONFORMANCE_PING_INTERVAL_MS", 200)),
@@ -299,6 +316,7 @@ fn client_env(command: &mut Command, trial: &Trial<'_>, url: &str, host: &str) {
     if let Some(path) = trial.transport {
         command.env("SELECTIVE_TRANSPORT", path);
     }
+    command.envs(runner_env_defaults(|key| std::env::var(key).ok()));
 }
 
 static NEXT_TRIAL: AtomicU32 = AtomicU32::new(0);
@@ -624,6 +642,12 @@ impl Player {
 
     fn install(&mut self, socket: Live) -> Result<(), Error> {
         self.check_handshake(&socket.uri)?;
+        if !connect_metadata_is_json(&socket.uri) {
+            return Err(Error::new(format!(
+                "connect metadata is missing or not JSON: {}",
+                socket.uri
+            )));
+        }
         if self.saw_connection {
             self.reading = Reading::Open;
         } else {
@@ -778,6 +802,9 @@ fn expect_manifest(frame: &Value, tree: bool, expected_ids: &[String]) -> Result
         .pointer("/data/test_cases")
         .and_then(Value::as_array)
         .ok_or_else(|| Error::new("manifest test_cases"))?;
+    for case in cases {
+        expect_manifest_entry(case)?;
+    }
     let ids: Vec<&str> = cases
         .iter()
         .filter_map(|case| case.get("id").and_then(Value::as_str))
@@ -805,8 +832,62 @@ fn expect_manifest(frame: &Value, tree: bool, expected_ids: &[String]) -> Result
     Ok(())
 }
 
+fn expect_manifest_entry(case: &Value) -> Result<(), Error> {
+    let id = case.get("id").and_then(Value::as_str).unwrap_or("?");
+    if !case.get("run_time").is_some_and(Value::is_number) {
+        return Err(Error::new(format!(
+            "manifest entry {id} needs a numeric run_time"
+        )));
+    }
+    let file_path = case.get("file_path").and_then(Value::as_str).unwrap_or("");
+    if file_path.trim().is_empty() || is_absolute_path(file_path) {
+        return Err(Error::new(format!(
+            "manifest entry {id} needs a repo-relative file_path, got {file_path:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn is_absolute_path(path: &str) -> bool {
+    let path = path.trim().replace('\\', "/");
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
+fn repo_relative_backtrace(frame: &str) -> bool {
+    let frame = frame.trim().replace('\\', "/");
+    if frame.is_empty() || is_absolute_path(&frame) {
+        return false;
+    }
+    ![
+        "site-packages/",
+        "dist-packages/",
+        "node_modules/",
+        "vendor/bundle/",
+        "vendor/gems/",
+        "/gems/",
+        ".gem/",
+    ]
+    .iter()
+    .any(|marker| frame.contains(marker))
+}
+
 fn expect_result(frame: &Value, id: &str, status: &str) -> Result<(), Error> {
     expect_status(frame, id, status)?;
+    if status == "failed" {
+        let first = frame
+            .pointer("/data/failure_formatted_backtrace")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !repo_relative_backtrace(first) {
+            return Err(Error::new(format!(
+                "failure backtrace must be a repo-relative frame: {first}"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -849,6 +930,18 @@ fn expect_report(frame: &Value, connection_retries: u64) -> Result<(), Error> {
             "connection_retries {got:?}, expected {connection_retries}"
         )))
     }
+}
+
+fn connect_metadata_is_json(uri: &str) -> bool {
+    query_value(uri, "metadata").is_some_and(|value| serde_json::from_str::<Value>(&value).is_ok())
+}
+
+fn query_value(uri: &str, key: &str) -> Option<String> {
+    url::Url::parse(&format!("ws://conformance.invalid{uri}"))
+        .ok()?
+        .query_pairs()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned())
 }
 
 #[cfg(test)]
@@ -919,6 +1012,68 @@ mod tests {
     }
 
     #[test]
+    fn every_manifest_entry_needs_run_time_and_a_repo_relative_file_path() {
+        let check = |case: Value| expect_manifest_entry(&case).map_err(|err| err.to_string());
+        check(serde_json::json!({"id": "a", "file_path": "tests/a.py", "run_time": 0.0})).unwrap();
+        check(serde_json::json!({"id": "a", "file_path": "./spec/a_spec.rb", "run_time": 3}))
+            .unwrap();
+        for (case, want) in [
+            (
+                serde_json::json!({"id": "a", "file_path": "tests/a.py"}),
+                "run_time",
+            ),
+            (
+                serde_json::json!({"id": "a", "file_path": "tests/a.py", "run_time": "0.1"}),
+                "run_time",
+            ),
+            (
+                serde_json::json!({"id": "a", "file_path": "tests/a.py", "run_time": null}),
+                "run_time",
+            ),
+            (serde_json::json!({"id": "a", "run_time": 0.1}), "file_path"),
+            (
+                serde_json::json!({"id": "a", "file_path": " ", "run_time": 0.1}),
+                "file_path",
+            ),
+            (
+                serde_json::json!({"id": "a", "file_path": "/repo/tests/a.py", "run_time": 0.1}),
+                "file_path",
+            ),
+            (
+                serde_json::json!({"id": "a", "file_path": r"C:\repo\a.py", "run_time": 0.1}),
+                "file_path",
+            ),
+        ] {
+            let err = check(case.clone()).unwrap_err();
+            assert!(err.contains(want), "{case}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_runner_fills_only_the_build_env_the_caller_left_unset() {
+        let all = runner_env_defaults(|_| None);
+        let keys: Vec<&str> = all.iter().map(|(key, _)| *key).collect();
+        for key in [
+            "SELECTIVE_PLATFORM",
+            "SELECTIVE_BRANCH",
+            "SELECTIVE_SHA",
+            "SELECTIVE_GIT_REPO",
+            "SELECTIVE_GIT_PROVIDER",
+            "SELECTIVE_PR_TITLE",
+        ] {
+            assert!(keys.contains(&key), "{key}");
+        }
+        assert!(all.iter().all(|(_, value)| !value.is_empty()));
+        let kept = runner_env_defaults(|key| match key {
+            "SELECTIVE_BRANCH" => Some("main".to_owned()),
+            "SELECTIVE_SHA" => Some(String::new()),
+            _ => None,
+        });
+        assert!(!kept.iter().any(|(key, _)| *key == "SELECTIVE_BRANCH"));
+        assert!(kept.iter().any(|(key, _)| *key == "SELECTIVE_SHA"));
+    }
+
+    #[test]
     fn trial_pipes_removes_only_its_own_fifo_pair() {
         let dir = std::env::temp_dir().join(format!("trial-pipes-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -961,5 +1116,66 @@ mod tests {
             assert!(dir.join(name).exists(), "{name}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failure_backtrace_accepts_any_repo_relative_frame() {
+        for frame in [
+            "tests/example.py:12: in case-fail",
+            "test/widget_test.rb:8",
+            "spec/models/user_spec.rb:15",
+            "src/test/java/com/example/Foo.java:10",
+            "lib/my_app.rb",
+            "./tests/foo.rb",
+            r"src\test\java\com\example\Foo.java:10",
+        ] {
+            assert!(repo_relative_backtrace(frame), "{frame}");
+            let value = serde_json::json!({
+                "type": "test_case_result",
+                "data": {
+                    "id": "case-fail",
+                    "status": "failed",
+                    "failure_formatted_backtrace": [frame]
+                }
+            });
+            expect_result(&value, "case-fail", "failed").unwrap();
+        }
+        for frame in [
+            "",
+            "   ",
+            "/home/dev/proj/tests/foo.rb",
+            r"C:\proj\src\test\Foo.java:10",
+            "C:/proj/src/test/Foo.java:10",
+            r"\\server\share\tests\foo.rb",
+            "lib/python3.11/site-packages/foo.py",
+            "usr/lib/python3/dist-packages/foo.py",
+            "node_modules/leftpad/index.js",
+            "vendor/bundle/ruby/3.2.0/gems/foo/lib/foo.rb",
+            "vendor/gems/foo/lib/foo.rb",
+            "home/.gem/ruby/3.2.0/gems/foo/lib/foo.rb",
+            r"lib\site-packages\foo.py",
+            r"vendor\bundle/x",
+        ] {
+            assert!(!repo_relative_backtrace(frame), "{frame}");
+            let value = serde_json::json!({
+                "type": "test_case_result",
+                "data": {
+                    "id": "case-fail",
+                    "status": "failed",
+                    "failure_formatted_backtrace": [frame]
+                }
+            });
+            let err = expect_result(&value, "case-fail", "failed").unwrap_err();
+            assert!(err.to_string().contains("repo-relative"), "{frame}: {err}");
+        }
+        expect_result(
+            &serde_json::json!({
+                "type": "test_case_result",
+                "data": {"id": "case-pass", "status": "passed"}
+            }),
+            "case-pass",
+            "passed",
+        )
+        .unwrap();
     }
 }
