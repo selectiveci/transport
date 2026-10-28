@@ -134,3 +134,36 @@ async fn fifo_exits_when_connect_is_refused_while_the_input_pipe_stays_open() {
     let _ = std::fs::remove_file(&input);
     let _ = std::fs::remove_file(&output);
 }
+
+#[test]
+fn build_env_and_snapshot_commands() {
+    let dir = std::env::temp_dir().join(format!("transport-cli-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let output = std::process::Command::new(bin())
+        .arg("--build-env")
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("SELECTIVE_PLATFORM", "github_actions")
+        .env("SELECTIVE_GIT_REPO", "acme/widgets")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["platform"], "github_actions");
+    assert_eq!(json["git_repo_full_name"], "acme/widgets");
+    assert_eq!(json["host"], "wss://app.selective.ci");
+
+    let snap = std::process::Command::new(bin())
+        .arg("--snapshot")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(snap.status.code(), Some(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
