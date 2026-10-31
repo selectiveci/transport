@@ -10,7 +10,6 @@ use transport::upload::{
 
 const USAGE: &str = "\
 usage:
-  transport <websocket-url> <runner-id>
   transport --stdio
   transport --snapshot [dir]
   transport --upload-fragment [--run-id ID] [--run-attempt N] [--runner-id ID]
@@ -45,10 +44,9 @@ fn dispatch() -> Result<i32, transport::Error> {
             println!("{}", serde_json::to_string(&transport::detect_build_env())?);
             Ok(0)
         }
-        Some(url) => match args.next() {
-            Some(runner_id) => Ok(block_on(engine::run_fifo(url, &runner_id))),
-            None => Err(transport::Error::new(USAGE)),
-        },
+        Some(_) => Err(transport::Error::new(format!(
+            "FIFO mode was removed in 0.2.0. Use --stdio.\n{USAGE}"
+        ))),
     }
 }
 

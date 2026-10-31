@@ -15,16 +15,15 @@ const USAGE: &str = "\
 usage:
   transport-conformance list
   transport-conformance run [--scenario NAME]
-                            [--via direct|stdio|fifo|both|all]
+                            [--via direct|stdio|both|all]
                             [--client COMMAND] [--fixture-ids FILE]
                             [--transport PATH]
-  transport-conformance client [--via-stdio | --via-fifo]
+  transport-conformance client [--via-stdio]
 
 The transport binary is --transport, else SELECTIVE_TRANSPORT, else the
 transport next to this binary. A --client command gets it as
-SELECTIVE_TRANSPORT. With --client, --via fifo says the client talks to the
-transport over FIFO, so the keepalive scenarios are n/a; any other --via runs
-it as a direct client.
+SELECTIVE_TRANSPORT. With --client, --via is ignored and the client runs as
+a direct client.
 ";
 
 fn main() {
@@ -73,7 +72,6 @@ fn run_main(args: &[String]) -> Result<i32, Error> {
                 via = match value()? {
                     "direct" => SuiteVia::Direct,
                     "stdio" => SuiteVia::Stdio,
-                    "fifo" => SuiteVia::Fifo,
                     "both" => SuiteVia::Both,
                     "all" => SuiteVia::All,
                     other => return Err(Error::new(format!("unknown --via {other}"))),
@@ -107,9 +105,7 @@ fn run_main(args: &[String]) -> Result<i32, Error> {
 fn client_main(args: &[String]) -> Result<i32, Error> {
     let url = env_value("SELECTIVE_TRANSPORT_URL")
         .ok_or_else(|| Error::new("client requires SELECTIVE_TRANSPORT_URL"))?;
-    let via = if args.iter().any(|arg| arg == "--via-fifo") {
-        Via::Fifo
-    } else if args.iter().any(|arg| arg == "--via-stdio") {
+    let via = if args.iter().any(|arg| arg == "--via-stdio") {
         Via::Stdio
     } else {
         Via::Direct

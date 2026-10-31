@@ -1,7 +1,6 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -49,7 +48,6 @@ fn load_fixtures() -> Result<Vec<Fixture>, Error> {
 pub enum Via {
     Direct,
     Stdio,
-    Fifo,
 }
 
 pub struct RunOpts {
@@ -609,7 +607,6 @@ fn query_param(url: &str, key: &str) -> String {
 enum Link {
     Direct(Session),
     Stdio(StdioLink),
-    Fifo(FifoLink),
     Closed,
 }
 
@@ -623,12 +620,6 @@ impl Link {
                 })?;
                 Ok(Self::Stdio(StdioLink::spawn(url, transport)?))
             }
-            Via::Fifo => {
-                let transport = transport.ok_or_else(|| {
-                    Error::new("the FIFO link needs the transport binary (SELECTIVE_TRANSPORT)")
-                })?;
-                Ok(Self::Fifo(FifoLink::spawn(url, transport).await?))
-            }
         }
     }
 
@@ -636,7 +627,6 @@ impl Link {
         match self {
             Self::Direct(session) => session.send(frame).await,
             Self::Stdio(child) => child.send(frame),
-            Self::Fifo(link) => link.send(frame),
             Self::Closed => Err(Error::new("session closed")),
         }
     }
@@ -645,7 +635,6 @@ impl Link {
         match self {
             Self::Direct(session) => session.recv().await,
             Self::Stdio(child) => child.recv().await,
-            Self::Fifo(link) => recv_incoming(&mut link.incoming).await,
             Self::Closed => Ok(None),
         }
     }
@@ -654,7 +643,6 @@ impl Link {
         match self {
             Self::Direct(session) => session.poll(),
             Self::Stdio(child) => child.poll(),
-            Self::Fifo(link) => poll_frames(&mut link.incoming),
             Self::Closed => Ok(PollFrame::Closed),
         }
     }
@@ -664,10 +652,6 @@ impl Link {
             Self::Direct(session) => session.close().await,
             Self::Stdio(child) => {
                 child.close();
-                Ok(())
-            }
-            Self::Fifo(link) => {
-                link.close();
                 Ok(())
             }
             Self::Closed => Ok(()),
@@ -769,130 +753,6 @@ fn forward_lines(output: impl std::io::Read, tx: &UnboundedSender<Result<Option<
     }
 }
 
-static NEXT_PIPE: AtomicU32 = AtomicU32::new(0);
-const PIPE_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
-
-struct FifoLink {
-    child: Child,
-    input: Option<std::fs::File>,
-    closed: bool,
-    pipes: [PathBuf; 2],
-    incoming: UnboundedReceiver<Result<Option<String>, Error>>,
-}
-
-impl FifoLink {
-    async fn spawn(url: &str, transport: &Path) -> Result<Self, Error> {
-        let prefix = std::env::var("SELECTIVE_CONFORMANCE_FIFO_PREFIX")
-            .ok()
-            .filter(|prefix| !prefix.is_empty())
-            .unwrap_or_else(|| format!("conformance-{}", std::process::id()));
-        let id = format!("{prefix}-{}", NEXT_PIPE.fetch_add(1, Ordering::Relaxed));
-        let pipes = [
-            PathBuf::from(format!("/tmp/{id}_1")),
-            PathBuf::from(format!("/tmp/{id}_2")),
-        ];
-        let made = Command::new("mkfifo")
-            .args(["-m", "600"])
-            .args(&pipes)
-            .status();
-        if !made.is_ok_and(|status| status.success()) {
-            remove_pipes(&pipes);
-            return Err(Error::new("mkfifo failed: the FIFO link needs a unix host"));
-        }
-        let child = match Command::new(transport)
-            .arg(url)
-            .arg(&id)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(err) => {
-                remove_pipes(&pipes);
-                return Err(Error::from(err));
-            }
-        };
-        let (tx, incoming) = tokio::sync::mpsc::unbounded_channel();
-        let output = pipes[1].clone();
-        std::thread::spawn(move || match std::fs::File::open(&output) {
-            Ok(file) => forward_lines(file, &tx),
-            Err(err) => {
-                let _ = tx.send(Err(Error::from(err)));
-            }
-        });
-        let input = pipes[0].clone();
-        let mut link = Self {
-            child,
-            input: None,
-            closed: false,
-            pipes,
-            incoming,
-        };
-        let opener = tokio::task::spawn_blocking(move || {
-            std::fs::OpenOptions::new().write(true).open(input)
-        });
-        let deadline = tokio::time::Instant::now() + PIPE_OPEN_TIMEOUT;
-        while !opener.is_finished() {
-            let exited = link.child.try_wait().is_ok_and(|status| status.is_some());
-            if exited || tokio::time::Instant::now() >= deadline {
-                let _ = std::fs::File::open(&link.pipes[0]);
-                let _ = opener.await;
-                return Err(Error::new(if exited {
-                    "the FIFO transport exited before opening its input pipe"
-                } else {
-                    "the FIFO transport never opened its input pipe"
-                }));
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        match opener.await {
-            Ok(Ok(file)) => {
-                link.input = Some(file);
-                Ok(link)
-            }
-            _ => Err(Error::new("the FIFO transport never opened its input pipe")),
-        }
-    }
-
-    fn send(&mut self, frame: &str) -> Result<(), Error> {
-        use std::io::Write;
-        let input = self
-            .input
-            .as_mut()
-            .ok_or_else(|| Error::new("session closed"))?;
-        writeln!(input, "{frame}")?;
-        input.flush()?;
-        Ok(())
-    }
-
-    fn close(&mut self) {
-        use std::io::Write;
-        if let Some(mut input) = self.input.take() {
-            let _ = writeln!(input, "exit");
-            let _ = input.flush();
-        }
-        self.closed = true;
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for FifoLink {
-    fn drop(&mut self) {
-        if !self.closed {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
-        remove_pipes(&self.pipes);
-    }
-}
-
-fn remove_pipes(pipes: &[PathBuf]) {
-    for pipe in pipes {
-        let _ = std::fs::remove_file(pipe);
-    }
-}
-
 #[cfg(unix)]
 async fn wait_for_signal() -> Option<&'static str> {
     use tokio::signal::unix::{signal, SignalKind};
@@ -967,20 +827,6 @@ mod tests {
         assert_eq!(state.results["case-fail"], "failed");
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0]["test_case_id"], "case-fail");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_fifo_transport_that_exits_early_fails_the_link_fast() {
-        let started = std::time::Instant::now();
-        let link = FifoLink::spawn("ws://127.0.0.1:9/transport", Path::new("false")).await;
-        let err = link.err().expect("the link must fail");
-        assert!(err.to_string().contains("exited before"), "{err}");
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "{:?}",
-            started.elapsed()
-        );
     }
 
     #[test]
