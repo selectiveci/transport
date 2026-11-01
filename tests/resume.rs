@@ -1,9 +1,9 @@
 use futures_util::{SinkExt, StreamExt};
+use std::process::Stdio;
 use std::time::Duration;
-use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
@@ -16,61 +16,8 @@ const RESUME: &str = r#"{"command":"transport_reconnect","headers":{"x-test":"1"
 const RESUMED: &str = r#"{"command":"transport_resumed"}"#;
 const MOVING: &str = r#"{"type":"transport_moving"}"#;
 
-// The two named pipes the transport talks to the client library over.
-struct Pipes {
-    runner_id: String,
-}
-
-impl Pipes {
-    fn new(name: &str) -> Self {
-        let pipes = Pipes {
-            runner_id: format!("transport-test-{name}-{}", std::process::id()),
-        };
-
-        for path in [pipes.input_path(), pipes.output_path()] {
-            let _ = std::fs::remove_file(&path);
-            let status = std::process::Command::new("mkfifo")
-                .arg(&path)
-                .status()
-                .unwrap();
-            assert!(status.success(), "mkfifo {path} failed");
-        }
-
-        pipes
-    }
-
-    // Read by the transport, written by the client.
-    fn input_path(&self) -> String {
-        format!("/tmp/{}_1", self.runner_id)
-    }
-
-    // Written by the transport, read by the client.
-    fn output_path(&self) -> String {
-        format!("/tmp/{}_2", self.runner_id)
-    }
-
-    async fn open(&self) -> (BufReader<File>, File) {
-        let mut read = OpenOptions::new();
-        read.read(true);
-        let mut write = OpenOptions::new();
-        write.write(true);
-
-        let (output, input) = timeout(WAIT, async {
-            tokio::join!(read.open(self.output_path()), write.open(self.input_path()))
-        })
-        .await
-        .expect("timed out opening the pipes");
-
-        (BufReader::new(output.unwrap()), input.unwrap())
-    }
-}
-
-impl Drop for Pipes {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.input_path());
-        let _ = std::fs::remove_file(self.output_path());
-    }
-}
+type Output = BufReader<ChildStdout>;
+type Input = ChildStdin;
 
 struct Accepted {
     socket: WebSocketStream<TcpStream>,
@@ -78,19 +25,26 @@ struct Accepted {
     x_test: Option<String>,
 }
 
-fn spawn_transport(listener: &TcpListener, pipes: &Pipes) -> Child {
+fn spawn_transport(listener: &TcpListener) -> (Child, Output, Input) {
     let url = format!(
-        "ws://{}/transport/websocket?runner_id={}",
-        listener.local_addr().unwrap(),
-        pipes.runner_id
+        "ws://{}/transport/websocket",
+        listener.local_addr().unwrap()
     );
 
-    Command::new(env!("CARGO_BIN_EXE_transport"))
-        .arg(url)
-        .arg(&pipes.runner_id)
+    let mut child = Command::new(env!("CARGO_BIN_EXE_transport"))
+        .arg("--stdio")
+        .env("SELECTIVE_TRANSPORT_URL", url)
+        .env_remove("SELECTIVE_WS_PING_INTERVAL_MS")
+        .env_remove("SELECTIVE_WS_PONG_TIMEOUT_MS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .unwrap()
+        .unwrap();
+    let output = BufReader::new(child.stdout.take().unwrap());
+    let input = child.stdin.take().unwrap();
+    (child, output, input)
 }
 
 // The handshake callback's error type is fixed by tungstenite.
@@ -143,7 +97,7 @@ async fn next_text(socket: &mut WebSocketStream<TcpStream>) -> String {
     .expect("timed out waiting for a message from the transport")
 }
 
-async fn read_line(output: &mut BufReader<File>) -> String {
+async fn read_line(output: &mut Output) -> String {
     let mut line = String::new();
     timeout(WAIT, output.read_line(&mut line))
         .await
@@ -152,7 +106,7 @@ async fn read_line(output: &mut BufReader<File>) -> String {
     line.trim_end().to_string()
 }
 
-async fn write_line(input: &mut File, line: &str) {
+async fn write_line(input: &mut Input, line: &str) {
     input
         .write_all(format!("{line}\n").as_bytes())
         .await
@@ -206,19 +160,14 @@ async fn expect_exit(child: &mut Child, code: i32) {
 }
 
 // A transport connected to `listener` whose client has its greeting.
-async fn connected(
-    name: &str,
-    listener: &TcpListener,
-) -> (Pipes, Child, BufReader<File>, File, Accepted) {
-    let pipes = Pipes::new(name);
-    let child = spawn_transport(listener, &pipes);
-    let (mut output, input) = pipes.open().await;
+async fn connected(listener: &TcpListener) -> (Child, Output, Input, Accepted) {
+    let (child, mut output, input) = spawn_transport(listener);
 
     let mut first = accept(listener).await;
     send(&mut first.socket, CONNECTED).await;
     assert_eq!(read_line(&mut output).await, CONNECTED);
 
-    (pipes, child, output, input, first)
+    (child, output, input, first)
 }
 
 // Asks the transport to move, and takes the new connection as a server would.
@@ -234,9 +183,7 @@ async fn resume_onto(listener: &TcpListener, old: &mut Accepted) -> Accepted {
 #[tokio::test]
 async fn moves_to_a_new_connection_when_asked() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let pipes = Pipes::new("resume");
-    let mut child = spawn_transport(&listener, &pipes);
-    let (mut output, mut input) = pipes.open().await;
+    let (mut child, mut output, mut input) = spawn_transport(&listener);
 
     let mut first = accept(&listener).await;
     assert!(
@@ -279,7 +226,7 @@ async fn moves_to_a_new_connection_when_asked() {
 #[tokio::test]
 async fn exits_when_the_server_closes_the_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, mut output, _input, mut first) = connected("close", &listener).await;
+    let (mut child, mut output, _input, mut first) = connected(&listener).await;
 
     // What the server sent before closing still reaches the client.
     send(&mut first.socket, r#"{"command":"close","exit_status":0}"#).await;
@@ -298,8 +245,7 @@ async fn sends_every_line_before_acting_on_exit() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
     for trial in 0..50 {
-        let (_pipes, mut child, _output, mut input, mut first) =
-            connected(&format!("exit-{trial}"), &listener).await;
+        let (mut child, _output, mut input, mut first) = connected(&listener).await;
 
         // One write, so both lines are queued together.
         write_line(&mut input, "report\nexit").await;
@@ -317,7 +263,7 @@ async fn sends_every_line_before_acting_on_exit() {
 #[tokio::test]
 async fn closes_the_connection_when_the_pipe_closes() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, _output, input, mut first) = connected("eof", &listener).await;
+    let (mut child, _output, input, mut first) = connected(&listener).await;
 
     drop(input);
 
@@ -328,7 +274,7 @@ async fn closes_the_connection_when_the_pipe_closes() {
 #[tokio::test]
 async fn delivers_a_large_line_promptly() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, _output, mut input, mut first) = connected("large", &listener).await;
+    let (mut child, _output, mut input, mut first) = connected(&listener).await;
 
     let line = "x".repeat(10 * 1024 * 1024);
     let started = std::time::Instant::now();
@@ -347,7 +293,7 @@ async fn delivers_a_large_line_promptly() {
 #[tokio::test]
 async fn keeps_sending_while_the_client_is_not_reading() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, _output, mut input, mut first) = connected("busy", &listener).await;
+    let (mut child, _output, mut input, mut first) = connected(&listener).await;
 
     // Far more than a pipe holds, and the client reads none of it.
     let backlog = format!(
@@ -366,7 +312,7 @@ async fn keeps_sending_while_the_client_is_not_reading() {
 #[tokio::test]
 async fn holds_pipe_messages_until_the_server_confirms_the_move() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, mut output, mut input, mut first) = connected("hold", &listener).await;
+    let (mut child, mut output, mut input, mut first) = connected(&listener).await;
 
     send(&mut first.socket, RESUME).await;
     assert_eq!(next_text(&mut first.socket).await, MOVING);
@@ -393,8 +339,7 @@ async fn holds_pipe_messages_until_the_server_confirms_the_move() {
 #[tokio::test]
 async fn exit_during_a_move_sends_what_is_held_and_stops() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, _output, mut input, mut first) =
-        connected("exit-hold", &listener).await;
+    let (mut child, _output, mut input, mut first) = connected(&listener).await;
 
     send(&mut first.socket, RESUME).await;
     // The new connection never gets confirmed.
@@ -418,8 +363,7 @@ async fn exit_during_a_move_sends_what_is_held_and_stops() {
 #[tokio::test]
 async fn exits_when_the_server_declines_the_new_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, mut output, mut input, mut first) =
-        connected("declined", &listener).await;
+    let (mut child, mut output, mut input, mut first) = connected(&listener).await;
 
     send(&mut first.socket, RESUME).await;
     let mut second = accept(&listener).await;
@@ -445,7 +389,7 @@ async fn exits_when_the_server_declines_the_new_connection() {
 #[tokio::test]
 async fn reads_every_retired_connection_until_it_ends() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, mut output, _input, mut first) = connected("retired", &listener).await;
+    let (mut child, mut output, _input, mut first) = connected(&listener).await;
 
     let mut second = resume_onto(&listener, &mut first).await;
     let mut third = resume_onto(&listener, &mut second).await;
@@ -478,7 +422,7 @@ async fn expect_quiet_listener(listener: &TcpListener) {
 #[tokio::test]
 async fn moves_again_when_asked_before_the_first_move_is_confirmed() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, _output, mut input, mut first) = connected("again", &listener).await;
+    let (mut child, _output, mut input, mut first) = connected(&listener).await;
 
     send(&mut first.socket, RESUME).await;
     assert_eq!(next_text(&mut first.socket).await, MOVING);
@@ -502,8 +446,7 @@ async fn moves_again_when_asked_before_the_first_move_is_confirmed() {
 #[tokio::test]
 async fn exits_with_failure_when_declined_after_the_old_connection_closed() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, _output, mut input, mut first) =
-        connected("declined-closed", &listener).await;
+    let (mut child, _output, mut input, mut first) = connected(&listener).await;
 
     send(&mut first.socket, RESUME).await;
     assert_eq!(next_text(&mut first.socket).await, MOVING);
@@ -519,8 +462,7 @@ async fn exits_with_failure_when_declined_after_the_old_connection_closed() {
 #[tokio::test]
 async fn a_declined_move_delivers_everything_for_the_client_before_exiting() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, mut output, _input, mut first) =
-        connected("declined-output", &listener).await;
+    let (mut child, mut output, _input, mut first) = connected(&listener).await;
 
     // More than a pipe holds, sent while the client is busy and not reading.
     let big = format!(
@@ -542,8 +484,7 @@ async fn a_declined_move_delivers_everything_for_the_client_before_exiting() {
 #[tokio::test]
 async fn exit_with_no_open_connection_waits_for_the_move() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, _output, mut input, mut first) =
-        connected("exit-orphaned", &listener).await;
+    let (mut child, _output, mut input, mut first) = connected(&listener).await;
 
     send(&mut first.socket, RESUME).await;
     assert_eq!(next_text(&mut first.socket).await, MOVING);
@@ -563,8 +504,7 @@ async fn exit_with_no_open_connection_waits_for_the_move() {
 #[tokio::test]
 async fn answers_the_server_closing_a_replaced_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, _output, _input, mut first) =
-        connected("retire-close", &listener).await;
+    let (mut child, _output, _input, mut first) = connected(&listener).await;
 
     let _second = resume_onto(&listener, &mut first).await;
     first.socket.close(None).await.unwrap();
@@ -588,8 +528,7 @@ async fn expect_close_reply(socket: &mut WebSocketStream<TcpStream>) {
 #[tokio::test]
 async fn a_declined_move_passes_on_what_the_old_connection_already_sent() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, mut output, _input, mut first) =
-        connected("declined-queued", &listener).await;
+    let (mut child, mut output, _input, mut first) = connected(&listener).await;
 
     send(&mut first.socket, RESUME).await;
     let mut second = accept(&listener).await;
@@ -617,7 +556,7 @@ async fn a_declined_move_passes_on_what_the_old_connection_already_sent() {
 #[tokio::test]
 async fn exits_promptly_when_the_connection_drops_without_a_close() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_pipes, mut child, mut output, _input, mut first) = connected("dropped", &listener).await;
+    let (mut child, mut output, _input, mut first) = connected(&listener).await;
 
     send(&mut first.socket, RUN_TEST_CASES).await;
     drop(first);

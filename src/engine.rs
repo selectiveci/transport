@@ -6,7 +6,6 @@ use std::future::Future;
 use std::process::exit;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::fs::OpenOptions;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -53,26 +52,9 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 // The server closes a replaced connection once it has drained it; this is the backstop.
 const RETIRED_TIMEOUT: Duration = Duration::from_mins(1);
 
-pub async fn run_fifo(url: &str, runner_id: &str) -> i32 {
-    let url = with_params(&Url::parse(url).unwrap(), &[FEATURES_PARAM]);
-
-    let input_pipe_path = format!("/tmp/{runner_id}_1");
-    let output_pipe_path = format!("/tmp/{runner_id}_2");
-
-    let (pipe_tx, pipe_rx) = mpsc::unbounded_channel::<PipeItem>();
-    tokio::spawn(read_pipe(input_pipe_path, pipe_tx));
-
-    let out = OpenOptions::new()
-        .write(true)
-        .open(output_pipe_path)
-        .await
-        .unwrap();
-    drive(&url, pipe_rx, out, None, false).await
-}
-
 pub async fn run_stdio(keepalive: Option<Keepalive>) -> i32 {
     let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel::<PipeItem>();
-    tokio::spawn(read_lines(tokio::io::stdin(), pipe_tx, true));
+    tokio::spawn(read_lines(tokio::io::stdin(), pipe_tx));
     let url = match stdio_url(&mut pipe_rx).await {
         Ok(url) => with_params(&url, &[FEATURES_PARAM]),
         Err(message) => {
@@ -80,7 +62,7 @@ pub async fn run_stdio(keepalive: Option<Keepalive>) -> i32 {
             exit(1);
         }
     };
-    drive(&url, pipe_rx, tokio::io::stdout(), keepalive, true).await
+    drive(&url, pipe_rx, tokio::io::stdout(), keepalive).await
 }
 
 async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
@@ -88,18 +70,12 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
     mut pipe_rx: mpsc::UnboundedReceiver<PipeItem>,
     out: W,
     keepalive: Option<Keepalive>,
-    announce_endings: bool,
 ) -> i32 {
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let writer = tokio::spawn(write_pipe(out, out_rx));
 
-    let connecting = connect_async(url.as_str());
-    let connected = if announce_endings {
-        timeout(RESUME_ATTEMPT_TIMEOUT, connecting).await.ok()
-    } else {
-        Some(connecting.await)
-    };
-    let Some(Ok((socket, _))) = connected else {
+    let connected = timeout(RESUME_ATTEMPT_TIMEOUT, connect_async(url.as_str())).await;
+    let Ok(Ok((socket, _))) = connected else {
         eprintln!("Failed to connect to the WebSocket server. Exiting...");
         exit(1);
     };
@@ -121,7 +97,6 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
         events_tx,
         resume_tx,
         liveness: keepalive.map(Liveness::new),
-        announce_endings,
     };
     transport.adopt(socket);
 
@@ -182,7 +157,6 @@ struct Transport {
     events_tx: mpsc::UnboundedSender<ServerEvent>,
     resume_tx: mpsc::UnboundedSender<Option<Resumed>>,
     liveness: Option<Liveness>,
-    announce_endings: bool,
 }
 
 impl Transport {
@@ -247,9 +221,7 @@ impl Transport {
         }
 
         if !self.resuming {
-            if self.announce_endings {
-                eprintln!("{ending}");
-            }
+            eprintln!("{ending}");
             return Some(0);
         }
 
@@ -361,9 +333,7 @@ impl Transport {
             },
         };
         if sent.is_err() && !self.resuming {
-            if self.announce_endings {
-                eprintln!("websocket connection dropped");
-            }
+            eprintln!("websocket connection dropped");
             return Some(0);
         }
         None
@@ -672,16 +642,7 @@ fn resume_headers(text: &str) -> Option<Headers> {
     Some(headers)
 }
 
-async fn read_pipe(path: String, tx: mpsc::UnboundedSender<PipeItem>) {
-    let pipe = OpenOptions::new().read(true).open(path).await.unwrap();
-    read_lines(pipe, tx, false).await;
-}
-
-async fn read_lines<R: AsyncRead + Unpin>(
-    mut pipe: R,
-    tx: mpsc::UnboundedSender<PipeItem>,
-    redact_invalid_utf8: bool,
-) {
+async fn read_lines<R: AsyncRead + Unpin>(mut pipe: R, tx: mpsc::UnboundedSender<PipeItem>) {
     let mut buf: Vec<u8> = Vec::new();
     // Reused across iterations rather than reallocated per read. 64 KiB instead
     // of 1 KiB cuts the syscall count on large messages by 64x.
@@ -704,9 +665,8 @@ async fn read_lines<R: AsyncRead + Unpin>(
         while let Some(rel) = buf[from..].iter().position(|&b| b == b'\n') {
             let idx = from + rel;
             let line = buf.drain(..=idx).collect::<Vec<_>>();
-            let line_str = match String::from_utf8(line) {
-                Err(_) if redact_invalid_utf8 => return,
-                line => line.unwrap(),
+            let Ok(line_str) = String::from_utf8(line) else {
+                return;
             };
             if line_str.trim() == "exit" {
                 let _ = tx.send(PipeItem::Exit);
@@ -819,6 +779,17 @@ mod tests {
             resume_headers(r#"{"command":"transport_reconnect"}"#),
             Some(vec![])
         );
+    }
+
+    #[test]
+    fn resume_headers_keep_the_order_the_server_sent() {
+        let text = r#"{"command":"transport_reconnect","headers":{"x-z":"1","x-a":"2","x-m":"3"}}"#;
+        let names: Vec<String> = resume_headers(text)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["x-z", "x-a", "x-m"]);
     }
 
     #[test]

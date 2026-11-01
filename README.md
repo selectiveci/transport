@@ -41,17 +41,18 @@ To build a release version of this project:
 
 ## Usage
 
-The crate is the WebSocket session. Language bindings call it in-process or spawn the binary. Ruby keeps the FIFO invocation.
+The crate is the WebSocket session. Language bindings call it in-process or spawn the binary.
 
 ```text
-transport <websocket-url> <runner-id>
 SELECTIVE_TRANSPORT_URL=wss://... transport --stdio
 transport --snapshot [dir]
 transport --upload-fragment [--run-id ID] [--run-attempt N] [--runner-id ID]
 transport --build-env
 ```
 
-`--stdio` reads the URL from `SELECTIVE_TRANSPORT_URL` or, if that is unset, from the first stdin line. The API key is not an argument. Client messages are JSON lines on stdin. `exit` shuts the process down and is not forwarded. Server commands are JSON lines on stdout. `--stdio` and the FIFO command (newline-delimited JSON on `/tmp/<runner_id>_1` and `_2`) run the same transport: text frames include the trailing newline, WebSocket control frames are not written out, and the transport moves its own connection when the server asks.
+`--stdio` reads the URL from `SELECTIVE_TRANSPORT_URL` or, if that is unset, from the first stdin line. The API key is not an argument. Client messages are JSON lines on stdin. `exit` shuts the process down and is not forwarded. Server commands are JSON lines on stdout. Text frames include the trailing newline, WebSocket control frames are not written out, and the transport moves its own connection when the server asks.
+
+Version 0.2.0 removed the FIFO command (named pipes under `/tmp`). Any other first argument exits 1 and says to use `--stdio`.
 
 When a `--stdio` connection ends, stderr says how: `websocket closed by the server`, `websocket connection dropped`, or `websocket keepalive timeout: ...`.
 
@@ -60,8 +61,7 @@ In-process callers use `Session` on a Tokio runtime or `BlockingSession` from an
 | Binding | Use |
 | --- | --- |
 | Python, JavaScript | `BlockingSession` or `Session` when the wheel loads; otherwise `--stdio` |
-| Elixir, PHP, Java | `--stdio` |
-| Ruby | `<url> <runner_id>` until it moves |
+| Ruby, Elixir, PHP, Java | `--stdio` |
 
 ### Fragment upload
 
@@ -83,7 +83,7 @@ Pass the ids the WebSocket URL was opened with. A flag wins over the payload, an
 
 ### Websocket keepalive
 
-Keepalive is off unless the client sets `SELECTIVE_WS_PING_INTERVAL_MS`, and the FIFO transport never pings. When it is set, `--stdio`, `Session`, and `BlockingSession` send a WebSocket ping at that interval, and treat the connection as dead once nothing at all has arrived from the server for the interval plus `SELECTIVE_WS_PONG_TIMEOUT_MS` (default `45000`). With a `20000` interval that is 65s, longer than the 30s a busy server can take to read a test manifest. A send that is waiting on a server that has stopped reading fails only at that same deadline. The caller reconnects as it would after a dropped connection.
+Keepalive is off unless the client sets `SELECTIVE_WS_PING_INTERVAL_MS`. When it is set, `--stdio`, `Session`, and `BlockingSession` send a WebSocket ping at that interval, and treat the connection as dead once nothing at all has arrived from the server for the interval plus `SELECTIVE_WS_PONG_TIMEOUT_MS` (default `45000`). With a `20000` interval that is 65s, longer than the 30s a busy server can take to read a test manifest. A send that is waiting on a server that has stopped reading fails only at that same deadline. The caller reconnects as it would after a dropped connection.
 
 ### Conformance
 
@@ -93,7 +93,7 @@ The shared scenario suite is its own binary, `transport-conformance`, built next
 transport-conformance run --client 'COMMAND' --fixture-ids ids.json --transport /path/to/transport
 ```
 
-The transport is `--transport`, else `SELECTIVE_TRANSPORT`, else the `transport` next to `transport-conformance`. The client command gets it as `SELECTIVE_TRANSPORT`. Without `--client`, the built-in reference client (`transport-conformance client`) runs every scenario, and `--via direct|stdio|fifo|both|all` picks how it connects. `both` is direct and stdio; `all` (the default) adds FIFO, which is unix-only. A FIFO trial makes a `/tmp/conformance-<pid>-t<trial>-<n>_1` and `_2` pipe pair and runs `transport <url> <id>`. The harness removes the trial's pipes when it ends, even if it had to kill the client. FIFO mode has no keepalive, so the two keepalive scenarios are `n/a` over FIFO. With `--client`, `--via fifo` says the client reaches the transport over FIFO, so they are `n/a` for it too; any other `--via` runs the client as a direct client. On stdio and FIFO trials every frame the mock server receives must end in `\n`. `transport-conformance list` prints the scenario names.
+The transport is `--transport`, else `SELECTIVE_TRANSPORT`, else the `transport` next to `transport-conformance`. The client command gets it as `SELECTIVE_TRANSPORT`. Without `--client`, the built-in reference client (`transport-conformance client`) runs every scenario, and `--via direct|stdio|both|all` picks how it connects. `both` and `all` (the default) run direct and stdio. On stdio trials every frame the mock server receives must end in `\n`. With `--client`, `--via` is ignored and the client runs as a direct client. `transport-conformance list` prints the scenario names.
 
 Run the suite from inside a git checkout: a scenario that expects a `test_map_tree` fails, naming the checkout, when it isn't one.
 

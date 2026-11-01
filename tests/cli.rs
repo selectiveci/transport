@@ -58,7 +58,7 @@ async fn stdio_uses_the_env_url_and_does_not_forward_exit() {
     let mut line = String::new();
     within(stdout.read_line(&mut line)).await.unwrap();
     assert_eq!(line, "{\"command\":\"connected\"}\n");
-    stdin.write_all(b"exit\n").await.unwrap();
+    stdin.write_all(b"  exit  \n").await.unwrap();
     stdin.flush().await.unwrap();
     let extra = timeout(Duration::from_millis(300), ws.next()).await;
     if let Ok(Some(Ok(Message::Text(text)))) = extra {
@@ -299,155 +299,47 @@ async fn stdio_exits_1_when_the_handshake_is_never_answered() {
     assert!(started.elapsed() >= Duration::from_secs(9));
 }
 
-#[cfg(unix)]
 #[tokio::test]
-async fn fifo_round_trip_keeps_the_legacy_framing() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (id, input, output) = fifo_paths();
+async fn stdio_exits_when_connect_is_refused_while_stdin_stays_open() {
     let mut child = Command::new(bin())
-        .arg(format!("ws://{addr}"))
-        .arg(&id)
+        .arg("--stdio")
+        .env("SELECTIVE_TRANSPORT_URL", "ws://127.0.0.1:1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let (writer, reader) = open_fifos(&input, &output);
-    let (sock, _) = within(listener.accept()).await.unwrap();
-    let mut ws = accept_async(sock).await.unwrap();
-    let mut to_transport = writer.await.unwrap();
-    let mut from_transport = BufReader::new(reader.await.unwrap());
-    to_transport
-        .write_all(b"{\"type\":\"ping\"}\n")
-        .await
-        .unwrap();
-    to_transport.flush().await.unwrap();
-    let frame = within(ws.next()).await.unwrap().unwrap();
-    match frame {
-        Message::Text(text) => assert_eq!(text, "{\"type\":\"ping\"}\n"),
-        other => panic!("unexpected {other:?}"),
-    }
-    ws.send(Message::Text("{\"command\":\"connected\"}".into()))
-        .await
-        .unwrap();
-    let mut line = String::new();
-    within(from_transport.read_line(&mut line)).await.unwrap();
-    assert_eq!(line, "{\"command\":\"connected\"}\n");
-    to_transport.write_all(b"  exit  \n").await.unwrap();
-    to_transport.flush().await.unwrap();
-    let status = within(child.wait()).await.unwrap();
-    assert!(status.success());
-    let _ = std::fs::remove_file(&input);
-    let _ = std::fs::remove_file(&output);
-}
-
-#[cfg(unix)]
-fn open_fifos(
-    input: &str,
-    output: &str,
-) -> (
-    tokio::task::JoinHandle<tokio::fs::File>,
-    tokio::task::JoinHandle<tokio::fs::File>,
-) {
-    let input_path = input.to_owned();
-    let output_path = output.to_owned();
-    let writer = tokio::spawn(async move {
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(input_path)
-            .await
-            .unwrap()
-    });
-    let reader = tokio::spawn(async move {
-        tokio::fs::OpenOptions::new()
-            .read(true)
-            .open(output_path)
-            .await
-            .unwrap()
-    });
-    (writer, reader)
-}
-
-#[cfg(unix)]
-fn fifo_paths() -> (String, String, String) {
-    let id = format!(
-        "seltest{}{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let input = format!("/tmp/{id}_1");
-    let output = format!("/tmp/{id}_2");
-    let _ = std::fs::remove_file(&input);
-    let _ = std::fs::remove_file(&output);
-    assert!(std::process::Command::new("mkfifo")
-        .arg(&input)
-        .status()
-        .unwrap()
-        .success());
-    assert!(std::process::Command::new("mkfifo")
-        .arg(&output)
-        .status()
-        .unwrap()
-        .success());
-    (id, input, output)
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn fifo_exits_when_connect_is_refused_while_the_input_pipe_stays_open() {
-    let (id, input, output) = fifo_paths();
-    let mut child = Command::new(bin())
-        .arg("ws://127.0.0.1:1")
-        .arg(&id)
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let (writer, reader) = open_fifos(&input, &output);
-    let _held_input = within(writer).await.unwrap();
-    let _held_output = within(reader).await.unwrap();
+    let _held_stdin = child.stdin.take();
     let status = timeout(Duration::from_secs(3), child.wait())
         .await
-        .expect("fifo connect failure waited on the input pipe")
+        .expect("stdio connect failure waited on stdin")
         .unwrap();
     assert_eq!(status.code(), Some(1));
-    let _ = std::fs::remove_file(&input);
-    let _ = std::fs::remove_file(&output);
 }
 
-#[cfg(unix)]
 #[tokio::test]
-async fn fifo_never_pings_even_when_keepalive_is_configured() {
+async fn legacy_fifo_arguments_exit_1_naming_stdio_without_connecting() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let (id, input, output) = fifo_paths();
-    let mut child = Command::new(bin())
-        .arg(format!("ws://{addr}"))
-        .arg(&id)
-        .env("SELECTIVE_WS_PING_INTERVAL_MS", "100")
-        .env("SELECTIVE_WS_PONG_TIMEOUT_MS", "100")
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let (writer, reader) = open_fifos(&input, &output);
-    let (sock, _) = within(listener.accept()).await.unwrap();
-    let mut ws = accept_async(sock).await.unwrap();
-    let mut to_transport = writer.await.unwrap();
-    let _held_output = reader.await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "fifo exited while the server was silent"
-    );
-    to_transport
-        .write_all(b"{\"type\":\"after\"}\n")
+    let runner_id = format!("legacy{}", std::process::id());
+    for args in [
+        vec![format!("ws://{addr}"), runner_id.clone()],
+        vec!["--fifo".to_owned()],
+    ] {
+        let output = within(Command::new(bin()).args(&args).output())
+            .await
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(stderr.contains("0.2.0"), "{stderr}");
+        assert!(stderr.contains("--stdio"), "{stderr}");
+        assert!(!stderr.contains("<url> <runner_id>"), "{stderr}");
+    }
+    assert!(timeout(Duration::from_millis(200), listener.accept())
         .await
-        .unwrap();
-    let frame = within(ws.next()).await.unwrap().unwrap();
-    assert_eq!(frame, Message::Text("{\"type\":\"after\"}\n".into()));
-    let _ = std::fs::remove_file(&input);
-    let _ = std::fs::remove_file(&output);
+        .is_err());
+    assert!(!std::path::Path::new(&format!("/tmp/{runner_id}_1")).exists());
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -102,7 +102,6 @@ pub enum Step {
 pub enum SuiteVia {
     Direct,
     Stdio,
-    Fifo,
     Both,
     All,
 }
@@ -112,9 +111,7 @@ impl SuiteVia {
         match self {
             Self::Direct => vec![Via::Direct],
             Self::Stdio => vec![Via::Stdio],
-            Self::Fifo => vec![Via::Fifo],
-            Self::Both => vec![Via::Direct, Via::Stdio],
-            Self::All => vec![Via::Direct, Via::Stdio, Via::Fifo],
+            Self::Both | Self::All => vec![Via::Direct, Via::Stdio],
         }
     }
 }
@@ -193,19 +190,11 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
         let mut scenario = scenario;
         apply_fixtures(&mut scenario, &run.fixtures)?;
         let vias = if run.client.is_some() {
-            vec![if matches!(run.via, SuiteVia::Fifo) {
-                Via::Fifo
-            } else {
-                Via::Direct
-            }]
+            vec![Via::Direct]
         } else {
             run.via.list()
         };
         for via in vias {
-            if matches!(via, Via::Fifo) && !cfg!(unix) {
-                eprintln!("skip {} fifo (FIFO mode is unix-only)", scenario.name);
-                continue;
-            }
             let trial = Trial {
                 bin,
                 scenario: &scenario,
@@ -352,9 +341,6 @@ fn client_command(trial: &Trial<'_>) -> Result<Command, Error> {
         Via::Stdio => {
             command.arg("--via-stdio");
         }
-        Via::Fifo => {
-            command.arg("--via-fifo");
-        }
     }
     Ok(command)
 }
@@ -372,21 +358,10 @@ fn via_name(via: Via) -> &'static str {
     match via {
         Via::Direct => "direct",
         Via::Stdio => "stdio",
-        Via::Fifo => "fifo",
     }
-}
-
-fn uses_keepalive(scenario: &Scenario) -> bool {
-    scenario
-        .steps
-        .iter()
-        .any(|step| matches!(step, Step::Idle | Step::IgnorePongs))
 }
 
 fn not_applicable(trial: &Trial<'_>) -> Option<&'static str> {
-    if matches!(trial.via, Via::Fifo) && uses_keepalive(trial.scenario) {
-        return Some("the transport's FIFO mode has no keepalive");
-    }
     if trial.scenario.requires_hook_time && trial.before_all_seconds.is_none() {
         return Some("the fixture file declares no before_all_seconds");
     }
@@ -433,48 +408,6 @@ fn client_env(command: &mut Command, trial: &Trial<'_>, url: &str, host: &str) {
     command.envs(runner_env_defaults(|key| std::env::var(key).ok()));
 }
 
-static NEXT_TRIAL: AtomicU32 = AtomicU32::new(0);
-
-struct TrialPipes {
-    dir: std::path::PathBuf,
-    prefix: Option<String>,
-}
-
-impl TrialPipes {
-    fn new(trial: &Trial<'_>, dir: &Path) -> Self {
-        let fifo = trial.client.is_none() && matches!(trial.via, Via::Fifo);
-        Self {
-            dir: dir.to_path_buf(),
-            prefix: fifo.then(|| {
-                format!(
-                    "conformance-{}-t{}",
-                    std::process::id(),
-                    NEXT_TRIAL.fetch_add(1, Ordering::Relaxed)
-                )
-            }),
-        }
-    }
-}
-
-impl Drop for TrialPipes {
-    fn drop(&mut self) {
-        let Some(prefix) = &self.prefix else {
-            return;
-        };
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return;
-        };
-        let stem = format!("{prefix}-");
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with(&stem) && (name.ends_with("_1") || name.ends_with("_2")) {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-}
-
 async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
     if let Some(why) = not_applicable(trial) {
         return Ok(Played::NotApplicable(why.to_owned()));
@@ -496,10 +429,6 @@ async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
     let logs = Arc::new(Mutex::new(String::new()));
     let mut command = client_command(trial)?;
     client_env(&mut command, trial, &url, &format!("ws://{addr}"));
-    let pipes = TrialPipes::new(trial, Path::new("/tmp"));
-    if let Some(prefix) = &pipes.prefix {
-        command.env("SELECTIVE_CONFORMANCE_FIFO_PREFIX", prefix);
-    }
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1666,65 +1595,9 @@ mod tests {
     }
 
     #[test]
-    fn trial_pipes_removes_only_its_own_fifo_pair() {
-        let dir = std::env::temp_dir().join(format!("trial-pipes-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let scenario: Scenario = serde_json::from_str(include_str!(
-            "../../../conformance/scenarios/happy_two_batches.json"
-        ))
-        .unwrap();
-        let fixtures = FixtureIds::default();
-        let trial = |via| Trial {
-            bin: Path::new("transport-conformance"),
-            scenario: &scenario,
-            via,
-            client: None,
-            fixture_file: None,
-            fixtures: &fixtures,
-            before_all_seconds: None,
-            transport: None,
-            pace: conformance_pace(),
-        };
-        assert!(TrialPipes::new(&trial(Via::Stdio), &dir).prefix.is_none());
-        let pipes = TrialPipes::new(&trial(Via::Fifo), &dir);
-        let prefix = pipes.prefix.clone().unwrap();
-        let mine = [
-            format!("{prefix}-0_1"),
-            format!("{prefix}-0_2"),
-            format!("{prefix}-1_1"),
-        ];
-        let others = [
-            format!("{prefix}0-0_1"),
-            format!("{prefix}-0_3"),
-            "conformance-1-t1-0_1".to_owned(),
-        ];
-        for name in mine.iter().chain(&others) {
-            std::fs::write(dir.join(name), "").unwrap();
-        }
-        drop(pipes);
-        for name in &mine {
-            assert!(!dir.join(name).exists(), "{name}");
-        }
-        for name in &others {
-            assert!(dir.join(name).exists(), "{name}");
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn all_adds_fifo_and_keepalive_scenarios_are_known() {
-        assert_eq!(
-            SuiteVia::All.list(),
-            vec![Via::Direct, Via::Stdio, Via::Fifo]
-        );
+    fn all_runs_direct_and_stdio() {
+        assert_eq!(SuiteVia::All.list(), vec![Via::Direct, Via::Stdio]);
         assert_eq!(SuiteVia::Both.list(), vec![Via::Direct, Via::Stdio]);
-        let keepalive: Vec<String> = scenarios()
-            .unwrap()
-            .iter()
-            .filter(|scenario| uses_keepalive(scenario))
-            .map(|scenario| scenario.name.clone())
-            .collect();
-        assert_eq!(keepalive, vec!["idle_keepalive", "pong_timeout"]);
     }
 
     #[test]
@@ -1776,56 +1649,44 @@ mod tests {
     }
 
     #[test]
-    fn keepalive_is_not_applicable_to_a_fifo_client_whatever_runs_it() {
+    fn keepalive_applies_on_every_via() {
         let fixtures = FixtureIds::default();
-        let scenario_named = |name: &str| {
-            scenarios()
+        for name in ["idle_keepalive", "pong_timeout"] {
+            let scenario = scenarios()
                 .unwrap()
                 .into_iter()
                 .find(|scenario| scenario.name == name)
-                .unwrap()
-        };
-        let applies = |name: &str, via, client| {
-            let scenario = scenario_named(name);
-            let trial = Trial {
-                bin: Path::new("transport-conformance"),
-                scenario: &scenario,
-                via,
-                client,
-                fixture_file: None,
-                fixtures: &fixtures,
-                before_all_seconds: None,
-                transport: None,
-                pace: conformance_pace(),
-            };
-            not_applicable(&trial).is_none()
-        };
-        for name in ["idle_keepalive", "pong_timeout"] {
-            assert!(!applies(name, Via::Fifo, None), "{name} built-in fifo");
-            assert!(
-                !applies(name, Via::Fifo, Some("ruby client.rb")),
-                "{name} fifo client"
-            );
-            assert!(
-                applies(name, Via::Direct, Some("ruby client.rb")),
-                "{name} direct client"
-            );
-            assert!(applies(name, Via::Stdio, None), "{name} stdio");
+                .unwrap();
+            for (via, client) in [
+                (Via::Direct, None),
+                (Via::Stdio, None),
+                (Via::Direct, Some("ruby client.rb")),
+            ] {
+                let trial = Trial {
+                    bin: Path::new("transport-conformance"),
+                    scenario: &scenario,
+                    via,
+                    client,
+                    fixture_file: None,
+                    fixtures: &fixtures,
+                    before_all_seconds: None,
+                    transport: None,
+                    pace: conformance_pace(),
+                };
+                assert!(
+                    not_applicable(&trial).is_none(),
+                    "{name} {via:?} {client:?}"
+                );
+            }
         }
-        assert!(applies(
-            "happy_two_batches",
-            Via::Fifo,
-            Some("ruby client.rb")
-        ));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_run_where_every_trial_is_not_applicable_is_an_error() {
         let run = ConformanceRun {
-            filter: Some("idle_keepalive"),
-            via: SuiteVia::Fifo,
-            client: None,
+            filter: Some("group_hook_time"),
+            via: SuiteVia::Direct,
+            client: Some("true"),
             fixtures: FixtureIds::default(),
             fixture_file: None,
             transport: None,
