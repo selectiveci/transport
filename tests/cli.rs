@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -166,4 +166,161 @@ fn build_env_and_snapshot_commands() {
         .unwrap();
     assert_eq!(snap.status.code(), Some(1));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn upload_fragment_posts_the_stdin_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = transport::gzip_bytes(br#"{"version":1}"#).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = sock.read(&mut buf).await.unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]);
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: upload-key"));
+        assert!(request.contains("run_id=run-9"));
+        sock.write_all(
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    });
+    let mut child = Command::new(bin())
+        .arg("--upload-fragment")
+        .env("SELECTIVE_HOST", format!("ws://{addr}"))
+        .env("SELECTIVE_TEST_MAP_UPLOAD_KEY", "upload-key")
+        .env("SELECTIVE_RUN_ID", "run-9")
+        .env("SELECTIVE_RUN_ATTEMPT", "3")
+        .env("SELECTIVE_RUNNER_ID", "shard")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&body).await.unwrap();
+    let status = timeout(Duration::from_secs(10), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success(), "upload failed");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn upload_fragment_uses_detected_run_identity() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = transport::gzip_bytes(br#"{"version":1}"#).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = sock.read(&mut buf).await.unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]);
+        assert!(request.contains("run_id=999"));
+        assert!(request.contains("run_attempt=2"));
+        assert!(request.contains("runner_id=shard"));
+        sock.write_all(
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    });
+    let mut child = Command::new(bin())
+        .arg("--upload-fragment")
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("GITHUB_ACTIONS", "true")
+        .env("GITHUB_RUN_ID", "999")
+        .env("GITHUB_RUN_ATTEMPT", "2")
+        .env("SELECTIVE_RUNNER_ID", "shard")
+        .env("SELECTIVE_HOST", format!("ws://{addr}"))
+        .env("SELECTIVE_TEST_MAP_UPLOAD_KEY", "upload-key")
+        .env_remove("SELECTIVE_RUN_ID")
+        .env_remove("SELECTIVE_RUN_ATTEMPT")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&body).await.unwrap();
+    let status = timeout(Duration::from_secs(10), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success(), "upload failed");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn upload_fragment_flags_and_stdin_payload_override_detection() {
+    async fn post(args: &[&str], stdin: &[u8], expect: &str) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expect = expect.to_owned();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16384];
+            let n = sock.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            sock.write_all(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            assert!(
+                request.contains(&expect),
+                "request missing {expect}: {request}"
+            );
+            assert!(!request.contains("detected-run"), "{request}");
+        });
+        let mut child = Command::new(bin())
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("GITHUB_ACTIONS", "true")
+            .env("GITHUB_RUN_ID", "detected-run")
+            .env("GITHUB_RUN_ATTEMPT", "9")
+            .env("SELECTIVE_RUNNER_ID", "detected-runner")
+            .env("SELECTIVE_HOST", format!("ws://{addr}"))
+            .env("SELECTIVE_TEST_MAP_UPLOAD_KEY", "upload-key")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).await.unwrap();
+        let status = timeout(Duration::from_secs(10), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.success(), "upload failed");
+        server.await.unwrap();
+    }
+
+    let gzip = transport::gzip_bytes(br#"{"version":1}"#).unwrap();
+    post(
+        &[
+            "--upload-fragment",
+            "--run-id",
+            "session-run",
+            "--run-attempt",
+            "7",
+            "--runner-id",
+            "session-runner",
+        ],
+        &gzip,
+        "run_id=session-run",
+    )
+    .await;
+    let mut payload =
+        br#"{"run_id":"payload-run","run_attempt":4,"runner_id":"payload-runner"}"#.to_vec();
+    payload.push(b'\n');
+    payload.extend_from_slice(&gzip);
+    post(&["--upload-fragment"], &payload, "run_id=payload-run").await;
 }
