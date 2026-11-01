@@ -11,6 +11,7 @@ use transport::upload::{
 const USAGE: &str = "\
 usage:
   transport <websocket-url> <runner-id>
+  transport --stdio
   transport --snapshot [dir]
   transport --upload-fragment [--run-id ID] [--run-attempt N] [--runner-id ID]
   transport --build-env
@@ -35,6 +36,9 @@ fn dispatch() -> Result<i32, transport::Error> {
             eprintln!("{USAGE}");
             Ok(0)
         }
+        Some("--stdio") => Ok(block_on(
+            engine::run_stdio(transport::Keepalive::from_env()),
+        )),
         Some("--snapshot") => snapshot_main(args.next()),
         Some("--upload-fragment") => upload_main(&args.collect::<Vec<_>>()),
         Some("--build-env") => {

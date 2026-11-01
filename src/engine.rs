@@ -2,10 +2,12 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::process::exit;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::fs::OpenOptions;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -15,6 +17,7 @@ use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Request};
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
 };
+use transport::Keepalive;
 use url::Url;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -56,7 +59,7 @@ pub async fn run_fifo(url: &str, runner_id: &str) -> i32 {
     let input_pipe_path = format!("/tmp/{runner_id}_1");
     let output_pipe_path = format!("/tmp/{runner_id}_2");
 
-    let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel::<PipeItem>();
+    let (pipe_tx, pipe_rx) = mpsc::unbounded_channel::<PipeItem>();
     tokio::spawn(read_pipe(input_pipe_path, pipe_tx));
 
     let out = OpenOptions::new()
@@ -64,10 +67,39 @@ pub async fn run_fifo(url: &str, runner_id: &str) -> i32 {
         .open(output_pipe_path)
         .await
         .unwrap();
+    drive(&url, pipe_rx, out, None, false).await
+}
+
+pub async fn run_stdio(keepalive: Option<Keepalive>) -> i32 {
+    let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel::<PipeItem>();
+    tokio::spawn(read_lines(tokio::io::stdin(), pipe_tx, true));
+    let url = match stdio_url(&mut pipe_rx).await {
+        Ok(url) => with_params(&url, &[FEATURES_PARAM]),
+        Err(message) => {
+            eprintln!("{message}");
+            exit(1);
+        }
+    };
+    drive(&url, pipe_rx, tokio::io::stdout(), keepalive, true).await
+}
+
+async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
+    url: &Url,
+    mut pipe_rx: mpsc::UnboundedReceiver<PipeItem>,
+    out: W,
+    keepalive: Option<Keepalive>,
+    announce_endings: bool,
+) -> i32 {
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let writer = tokio::spawn(write_pipe(out, out_rx));
 
-    let Ok((socket, _)) = connect_async(url.as_str()).await else {
+    let connecting = connect_async(url.as_str());
+    let connected = if announce_endings {
+        timeout(RESUME_ATTEMPT_TIMEOUT, connecting).await.ok()
+    } else {
+        Some(connecting.await)
+    };
+    let Some(Ok((socket, _))) = connected else {
         eprintln!("Failed to connect to the WebSocket server. Exiting...");
         exit(1);
     };
@@ -78,7 +110,7 @@ pub async fn run_fifo(url: &str, runner_id: &str) -> i32 {
     let mut transport = Transport {
         out: Some(out_tx),
         writer: Some(writer),
-        resume_url: with_params(&url, &[("reconnect", "true"), ("resume", "true")]),
+        resume_url: with_params(url, &[("reconnect", "true"), ("resume", "true")]),
         current: None,
         retired: HashMap::new(),
         resuming: false,
@@ -88,6 +120,8 @@ pub async fn run_fifo(url: &str, runner_id: &str) -> i32 {
         next_id: 0,
         events_tx,
         resume_tx,
+        liveness: keepalive.map(Liveness::new),
+        announce_endings,
     };
     transport.adopt(socket);
 
@@ -95,6 +129,8 @@ pub async fn run_fifo(url: &str, runner_id: &str) -> i32 {
         let stop = tokio::select! {
             Some((id, message)) = events_rx.recv() => transport.on_server_event(id, message).await,
             Some(resumed) = resume_rx.recv() => transport.on_resume_finished(resumed).await,
+            () = sleep_until_some(transport.ping_due()) => transport.ping().await,
+            () = sleep_until_some(transport.liveness_deadline()) => transport.check_liveness().await,
             item = pipe_rx.recv(), if !transport.exit_requested => {
                 // A confirmed move that's already waiting decides which
                 // connection an exit closes.
@@ -145,6 +181,8 @@ struct Transport {
     next_id: u64,
     events_tx: mpsc::UnboundedSender<ServerEvent>,
     resume_tx: mpsc::UnboundedSender<Option<Resumed>>,
+    liveness: Option<Liveness>,
+    announce_endings: bool,
 }
 
 impl Transport {
@@ -158,7 +196,11 @@ impl Transport {
         self.next_id += 1;
 
         let (sink, stream) = socket.split();
-        spawn_reader(id, stream, self.events_tx.clone());
+        let heard = self.liveness.as_ref().map(|liveness| {
+            liveness.hear();
+            Arc::clone(&liveness.heard)
+        });
+        spawn_reader(id, stream, self.events_tx.clone(), heard);
         self.current.replace((id, sink))
     }
 
@@ -182,15 +224,19 @@ impl Transport {
                 self.write_line(data);
                 None
             }
-            Some(Message::Close(_)) | None => {
+            Some(Message::Close(_)) => {
                 self.ended.insert(id);
-                self.on_connection_ended(id)
+                self.on_connection_ended(id, "websocket closed by the server")
+            }
+            None => {
+                self.ended.insert(id);
+                self.on_connection_ended(id, "websocket connection dropped")
             }
             _ => None,
         }
     }
 
-    fn on_connection_ended(&mut self, id: u64) -> Option<i32> {
+    fn on_connection_ended(&mut self, id: u64, ending: &str) -> Option<i32> {
         if let Some(sink) = self.retired.remove(&id) {
             close_in_background(sink);
             return None;
@@ -201,6 +247,9 @@ impl Transport {
         }
 
         if !self.resuming {
+            if self.announce_endings {
+                eprintln!("{ending}");
+            }
             return Some(0);
         }
 
@@ -304,7 +353,54 @@ impl Transport {
 
     async fn send(&mut self, message: Message) -> Option<i32> {
         let (_, sink) = self.current.as_mut()?;
-        (sink.send(message).await.is_err() && !self.resuming).then_some(0)
+        let sent = match &self.liveness {
+            None => sink.send(message).await,
+            Some(liveness) => match liveness.race(sink.send(message)).await {
+                Ok(sent) => sent,
+                Err(budget) => return self.keepalive_timeout(budget).await,
+            },
+        };
+        if sent.is_err() && !self.resuming {
+            if self.announce_endings {
+                eprintln!("websocket connection dropped");
+            }
+            return Some(0);
+        }
+        None
+    }
+
+    fn ping_due(&self) -> Option<Instant> {
+        let liveness = self.liveness.as_ref()?;
+        (self.current.is_some() && !self.resuming).then_some(liveness.next_ping)
+    }
+
+    async fn ping(&mut self) -> Option<i32> {
+        let liveness = self.liveness.as_mut()?;
+        liveness.next_ping = Instant::now() + liveness.keepalive.ping_interval;
+        self.send(Message::Ping(b"selective".to_vec())).await
+    }
+
+    fn liveness_deadline(&self) -> Option<Instant> {
+        let liveness = self.liveness.as_ref()?;
+        (!self.resuming).then(|| liveness.deadline())
+    }
+
+    async fn check_liveness(&mut self) -> Option<i32> {
+        let budget = self
+            .liveness
+            .as_ref()
+            .filter(|liveness| liveness.expired())?
+            .budget();
+        self.keepalive_timeout(budget).await
+    }
+
+    async fn keepalive_timeout(&mut self, budget: Duration) -> Option<i32> {
+        eprintln!(
+            "websocket keepalive timeout: no frame from the server for {}s",
+            budget.as_secs_f64()
+        );
+        self.finish_output().await;
+        exit(0)
     }
 
     // Closes every connection, passes on what they still deliver (bounded by
@@ -375,7 +471,10 @@ fn close_in_background(mut sink: Sink) {
     });
 }
 
-async fn write_pipe(mut out: File, mut lines: mpsc::UnboundedReceiver<Vec<u8>>) {
+async fn write_pipe<W: AsyncWrite + Unpin>(
+    mut out: W,
+    mut lines: mpsc::UnboundedReceiver<Vec<u8>>,
+) {
     while let Some(line) = lines.recv().await {
         if let Err(e) = write_all(&mut out, &line).await {
             eprintln!("Failed to write to output pipe: {e}");
@@ -384,16 +483,24 @@ async fn write_pipe(mut out: File, mut lines: mpsc::UnboundedReceiver<Vec<u8>>) 
     }
 }
 
-async fn write_all(out: &mut File, line: &[u8]) -> std::io::Result<()> {
+async fn write_all<W: AsyncWrite + Unpin>(out: &mut W, line: &[u8]) -> std::io::Result<()> {
     out.write_all(line).await?;
     out.flush().await
 }
 
-fn spawn_reader(id: u64, mut stream: SplitStream<Socket>, tx: mpsc::UnboundedSender<ServerEvent>) {
+fn spawn_reader(
+    id: u64,
+    mut stream: SplitStream<Socket>,
+    tx: mpsc::UnboundedSender<ServerEvent>,
+    heard: Option<Arc<Mutex<Instant>>>,
+) {
     tokio::spawn(async move {
         while let Some(result) = stream.next().await {
             match result {
                 Ok(message) => {
+                    if let Some(heard) = &heard {
+                        *heard.lock().unwrap() = Instant::now();
+                    }
                     if cfg!(debug_assertions) {
                         log_message(&message);
                     }
@@ -418,12 +525,12 @@ fn spawn_reader(id: u64, mut stream: SplitStream<Socket>, tx: mpsc::UnboundedSen
 
 fn log_message(message: &Message) {
     match message {
-        Message::Text(_) => println!("Received Text message"),
-        Message::Binary(_) => println!("Received Binary message"),
-        Message::Ping(_) => println!("Received Ping message"),
-        Message::Pong(_) => println!("Received Pong message"),
-        Message::Close(_) => println!("Received Close message"),
-        Message::Frame(_) => println!("Received an unexpected type of message"),
+        Message::Text(_) => eprintln!("Received Text message"),
+        Message::Binary(_) => eprintln!("Received Binary message"),
+        Message::Ping(_) => eprintln!("Received Ping message"),
+        Message::Pong(_) => eprintln!("Received Pong message"),
+        Message::Close(_) => eprintln!("Received Close message"),
+        Message::Frame(_) => eprintln!("Received an unexpected type of message"),
     }
 }
 
@@ -566,7 +673,15 @@ fn resume_headers(text: &str) -> Option<Headers> {
 }
 
 async fn read_pipe(path: String, tx: mpsc::UnboundedSender<PipeItem>) {
-    let mut pipe = OpenOptions::new().read(true).open(path).await.unwrap();
+    let pipe = OpenOptions::new().read(true).open(path).await.unwrap();
+    read_lines(pipe, tx, false).await;
+}
+
+async fn read_lines<R: AsyncRead + Unpin>(
+    mut pipe: R,
+    tx: mpsc::UnboundedSender<PipeItem>,
+    redact_invalid_utf8: bool,
+) {
     let mut buf: Vec<u8> = Vec::new();
     // Reused across iterations rather than reallocated per read. 64 KiB instead
     // of 1 KiB cuts the syscall count on large messages by 64x.
@@ -589,7 +704,10 @@ async fn read_pipe(path: String, tx: mpsc::UnboundedSender<PipeItem>) {
         while let Some(rel) = buf[from..].iter().position(|&b| b == b'\n') {
             let idx = from + rel;
             let line = buf.drain(..=idx).collect::<Vec<_>>();
-            let line_str = String::from_utf8(line).unwrap();
+            let line_str = match String::from_utf8(line) {
+                Err(_) if redact_invalid_utf8 => return,
+                line => line.unwrap(),
+            };
             if line_str.trim() == "exit" {
                 let _ = tx.send(PipeItem::Exit);
                 return;
@@ -600,6 +718,82 @@ async fn read_pipe(path: String, tx: mpsc::UnboundedSender<PipeItem>) {
             from = 0;
         }
     }
+}
+
+struct Liveness {
+    keepalive: Keepalive,
+    heard: Arc<Mutex<Instant>>,
+    next_ping: Instant,
+}
+
+impl Liveness {
+    fn new(keepalive: Keepalive) -> Self {
+        let now = Instant::now();
+        Self {
+            keepalive,
+            heard: Arc::new(Mutex::new(now)),
+            next_ping: now + keepalive.ping_interval,
+        }
+    }
+
+    fn hear(&self) {
+        *self.heard.lock().unwrap() = Instant::now();
+    }
+
+    fn budget(&self) -> Duration {
+        self.keepalive.budget()
+    }
+
+    fn deadline(&self) -> Instant {
+        *self.heard.lock().unwrap() + self.budget()
+    }
+
+    fn expired(&self) -> bool {
+        Instant::now() >= self.deadline()
+    }
+
+    async fn race<F: Future>(&self, sending: F) -> Result<F::Output, Duration> {
+        tokio::pin!(sending);
+        loop {
+            tokio::select! {
+                sent = &mut sending => return Ok(sent),
+                () = sleep(self.deadline().saturating_duration_since(Instant::now())) => {
+                    if self.expired() {
+                        return Err(self.budget());
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn sleep_until_some(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep(deadline.saturating_duration_since(Instant::now())).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn stdio_url(lines: &mut mpsc::UnboundedReceiver<PipeItem>) -> Result<Url, String> {
+    let text = match std::env::var("SELECTIVE_TRANSPORT_URL") {
+        Ok(url) if !url.is_empty() => url,
+        _ => {
+            match timeout(Duration::from_secs(30), lines.recv()).await {
+                Ok(Some(PipeItem::Line(Message::Text(line)))) => {
+                    let line = line.trim().to_owned();
+                    if !(line.starts_with("ws://") || line.starts_with("wss://")) {
+                        return Err("the first stdin line must be a ws:// or wss:// url when SELECTIVE_TRANSPORT_URL is unset".to_owned());
+                    }
+                    line
+                }
+                _ => return Err(
+                    "SELECTIVE_TRANSPORT_URL is unset and stdin did not provide a websocket url"
+                        .to_owned(),
+                ),
+            }
+        }
+    };
+    Url::parse(&text).map_err(|err| format!("invalid websocket url: {err}"))
 }
 
 #[cfg(test)]

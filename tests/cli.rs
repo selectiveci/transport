@@ -18,6 +18,283 @@ async fn within<F: std::future::Future>(future: F) -> F::Output {
         .expect("timed out after 5s")
 }
 
+#[tokio::test]
+async fn stdio_uses_the_env_url_and_does_not_forward_exit() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut child = Command::new(bin())
+        .arg("--stdio")
+        .env(
+            "SELECTIVE_TRANSPORT_URL",
+            format!("ws://{addr}/transport/websocket?api_key=secret"),
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let (sock, _) = within(listener.accept()).await.unwrap();
+    let mut ws = accept_async(sock).await.unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(b"{\"type\":\"test_case_result\"}\n")
+        .await
+        .unwrap();
+    stdin.flush().await.unwrap();
+    let frame = within(ws.next()).await.unwrap().unwrap();
+    match frame {
+        Message::Text(text) => assert_eq!(text, "{\"type\":\"test_case_result\"}\n"),
+        other => panic!("unexpected {other:?}"),
+    }
+    ws.send(Message::Text("{\"command\":\"connected\"}".into()))
+        .await
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    within(stdout.read_line(&mut line)).await.unwrap();
+    assert_eq!(line, "{\"command\":\"connected\"}\n");
+    stdin.write_all(b"exit\n").await.unwrap();
+    stdin.flush().await.unwrap();
+    let extra = timeout(Duration::from_millis(300), ws.next()).await;
+    if let Ok(Some(Ok(Message::Text(text)))) = extra {
+        assert_ne!(text.trim(), "exit");
+    }
+    let status = within(child.wait()).await.unwrap();
+    assert!(status.success());
+}
+
+#[tokio::test]
+async fn stdio_reads_the_url_from_stdin_when_env_is_absent() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut child = Command::new(bin())
+        .arg("--stdio")
+        .env_remove("SELECTIVE_TRANSPORT_URL")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let url = format!("ws://{addr}/transport/websocket?api_key=from-stdin\n");
+    stdin.write_all(url.as_bytes()).await.unwrap();
+    stdin.write_all(b"{\"type\":\"hello\"}\n").await.unwrap();
+    stdin.flush().await.unwrap();
+    let (sock, _) = within(listener.accept()).await.unwrap();
+    let mut ws = accept_async(sock).await.unwrap();
+    let frame = within(ws.next()).await.unwrap().unwrap();
+    match frame {
+        Message::Text(text) => assert_eq!(text, "{\"type\":\"hello\"}\n"),
+        other => panic!("unexpected {other:?}"),
+    }
+    stdin.write_all(b"exit\n").await.unwrap();
+    let status = within(child.wait()).await.unwrap();
+    assert!(status.success());
+}
+
+async fn stdio_ending(
+    env: &[(&str, &str)],
+    server: impl FnOnce(
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> tokio::task::JoinHandle<()>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut command = Command::new(bin());
+    command
+        .arg("--stdio")
+        .env("SELECTIVE_TRANSPORT_URL", format!("ws://{addr}"))
+        .env_remove("SELECTIVE_WS_PING_INTERVAL_MS")
+        .env_remove("SELECTIVE_WS_PONG_TIMEOUT_MS")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().unwrap();
+    let _stdin = child.stdin.take();
+    let (sock, _) = within(listener.accept()).await.unwrap();
+    let handle = server(accept_async(sock).await.unwrap());
+    let status = timeout(Duration::from_secs(3), child.wait())
+        .await
+        .expect("the transport did not exit")
+        .unwrap();
+    handle.abort();
+    assert_eq!(status.code(), Some(0));
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .await
+        .unwrap();
+    stderr
+}
+
+#[tokio::test]
+async fn stdio_reports_each_way_a_connection_ends() {
+    let closed = stdio_ending(&[], |mut ws| {
+        tokio::spawn(async move {
+            ws.send(Message::Close(None)).await.unwrap();
+            let _ = ws.next().await;
+        })
+    })
+    .await;
+    assert!(
+        closed.contains("websocket closed by the server"),
+        "{closed}"
+    );
+
+    let dropped = stdio_ending(&[], |ws| tokio::spawn(async move { drop(ws) })).await;
+    assert!(
+        dropped.contains("websocket connection dropped"),
+        "{dropped}"
+    );
+
+    let silent = stdio_ending(
+        &[
+            ("SELECTIVE_WS_PING_INTERVAL_MS", "100"),
+            ("SELECTIVE_WS_PONG_TIMEOUT_MS", "100"),
+        ],
+        |ws| {
+            tokio::spawn(async move {
+                let _held = ws;
+                std::future::pending::<()>().await;
+            })
+        },
+    )
+    .await;
+    assert!(silent.contains("websocket keepalive timeout"), "{silent}");
+}
+
+#[tokio::test]
+async fn stdio_sends_no_ping_unless_the_client_asks() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut child = Command::new(bin())
+        .arg("--stdio")
+        .env("SELECTIVE_TRANSPORT_URL", format!("ws://{addr}"))
+        .env_remove("SELECTIVE_WS_PING_INTERVAL_MS")
+        .env_remove("SELECTIVE_WS_PONG_TIMEOUT_MS")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let (sock, _) = within(listener.accept()).await.unwrap();
+    let mut ws = accept_async(sock).await.unwrap();
+    let early = timeout(Duration::from_secs(1), ws.next()).await;
+    assert!(early.is_err(), "expected nothing, got {early:?}");
+    assert!(child.try_wait().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn missing_stdio_url_exits_1() {
+    let mut child = Command::new(bin())
+        .arg("--stdio")
+        .env_remove("SELECTIVE_TRANSPORT_URL")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    drop(child.stdin.take());
+    let status = within(child.wait()).await.unwrap();
+    assert_eq!(status.code(), Some(1));
+}
+
+async fn stdio_failure(env_url: Option<&str>, stdin: &[u8]) -> (Option<i32>, String) {
+    let mut command = Command::new(bin());
+    command
+        .arg("--stdio")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    match env_url {
+        Some(url) => command.env("SELECTIVE_TRANSPORT_URL", url),
+        None => command.env_remove("SELECTIVE_TRANSPORT_URL"),
+    };
+    let mut child = command.spawn().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(stdin).await.unwrap();
+    drop(input);
+    let output = within(child.wait_with_output()).await.unwrap();
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[tokio::test]
+async fn stdio_never_prints_the_api_key_when_the_url_is_unusable() {
+    let key = "KEY-5f3c9a17";
+    let bad_port = format!("ws://127.0.0.1:${{PORT}}/transport/websocket?api_key={key}");
+    let mut invalid_utf8 = format!("ws://127.0.0.1:1/?api_key={key}").into_bytes();
+    invalid_utf8.extend_from_slice(&[0xff, b'\n']);
+
+    let cases = [
+        ("env bad port", stdio_failure(Some(&bad_port), b"").await),
+        (
+            "stdin bad port",
+            stdio_failure(None, format!("{bad_port}\n").as_bytes()).await,
+        ),
+        (
+            "stdin invalid utf-8",
+            stdio_failure(None, &invalid_utf8).await,
+        ),
+    ];
+    let mut problems = Vec::new();
+    for (name, (code, stderr)) in cases {
+        if code != Some(1) || stderr.trim().is_empty() {
+            problems.push(format!("{name}: exit {code:?}, stderr {stderr:?}"));
+        }
+        if stderr.contains(key) || stderr.contains("[119") {
+            problems.push(format!("{name} leaked the key: {stderr}"));
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+#[tokio::test]
+async fn stdio_exits_1_when_the_handshake_is_never_answered() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let held = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            sockets.push(socket);
+        }
+    });
+    let mut child = Command::new(bin())
+        .arg("--stdio")
+        .env(
+            "SELECTIVE_TRANSPORT_URL",
+            format!("ws://{addr}/?api_key=secret"),
+        )
+        .env_remove("SELECTIVE_WS_PING_INTERVAL_MS")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take();
+    let started = Instant::now();
+    let status = timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("the transport is still waiting for the handshake")
+        .unwrap();
+    held.abort();
+    assert_eq!(status.code(), Some(1));
+    assert!(started.elapsed() >= Duration::from_secs(9));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn fifo_round_trip_keeps_the_legacy_framing() {
@@ -131,6 +408,40 @@ async fn fifo_exits_when_connect_is_refused_while_the_input_pipe_stays_open() {
         .expect("fifo connect failure waited on the input pipe")
         .unwrap();
     assert_eq!(status.code(), Some(1));
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fifo_never_pings_even_when_keepalive_is_configured() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (id, input, output) = fifo_paths();
+    let mut child = Command::new(bin())
+        .arg(format!("ws://{addr}"))
+        .arg(&id)
+        .env("SELECTIVE_WS_PING_INTERVAL_MS", "100")
+        .env("SELECTIVE_WS_PONG_TIMEOUT_MS", "100")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let (writer, reader) = open_fifos(&input, &output);
+    let (sock, _) = within(listener.accept()).await.unwrap();
+    let mut ws = accept_async(sock).await.unwrap();
+    let mut to_transport = writer.await.unwrap();
+    let _held_output = reader.await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "fifo exited while the server was silent"
+    );
+    to_transport
+        .write_all(b"{\"type\":\"after\"}\n")
+        .await
+        .unwrap();
+    let frame = within(ws.next()).await.unwrap().unwrap();
+    assert_eq!(frame, Message::Text("{\"type\":\"after\"}\n".into()));
     let _ = std::fs::remove_file(&input);
     let _ = std::fs::remove_file(&output);
 }
