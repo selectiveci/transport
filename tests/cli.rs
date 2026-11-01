@@ -12,6 +12,10 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_transport")
 }
 
+fn conformance_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_transport-conformance")
+}
+
 async fn within<F: std::future::Future>(future: F) -> F::Output {
     timeout(Duration::from_secs(5), future)
         .await
@@ -676,6 +680,139 @@ async fn blocking_session_drop_returns_when_the_peer_stops_reading() {
     server.abort();
 }
 
+fn temp_dir(label: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "transport-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn write_executable(path: &std::path::Path, body: &str) {
+    std::fs::write(path, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn conformance_unknown_scenario_exits_nonzero() {
+    for args in [
+        vec!["run", "--scenario", "no_such_scenario"],
+        vec![
+            "run",
+            "--scenario",
+            "no_such_scenario",
+            "--client",
+            "/bin/false",
+        ],
+    ] {
+        let output = Command::new(conformance_bin())
+            .args(&args)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "args {args:?} stdout {}\nstderr {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("no conformance scenarios ran") && stderr.contains("no_such_scenario"),
+            "args {args:?} stderr {stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn conformance_run_client_drives_an_external_command() {
+    let dir = temp_dir("external-client");
+    let marker = dir.join("marker");
+    let script = dir.join("client.sh");
+    write_executable(
+        &script,
+        "#!/bin/sh\nprintf '%s\\n' invoked >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_TRANSPORT_URL\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_API_KEY\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_HOST\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUN_ID\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUN_ATTEMPT\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_RUNNER_ID\" >> \"$1\"\nprintf '%s\\n' \"$SELECTIVE_TEST_MAP_UPLOAD_KEY\" >> \"$1\"\nexec \"$2\" client\n",
+    );
+    let command = format!(
+        "{} {} {}",
+        script.display(),
+        marker.display(),
+        conformance_bin()
+    );
+    let output = Command::new(conformance_bin())
+        .args([
+            "run",
+            "--scenario",
+            "happy_two_batches",
+            "--via",
+            "both",
+            "--client",
+            &command,
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout {}\nstderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let marker_text = std::fs::read_to_string(&marker).unwrap();
+    let lines: Vec<&str> = marker_text.lines().collect();
+    assert_eq!(lines.iter().filter(|line| **line == "invoked").count(), 1);
+    assert!(lines
+        .iter()
+        .any(|line| line.starts_with("ws://") && line.contains("api_key=conformance-key")));
+    assert!(lines.contains(&"conformance-key"));
+    assert!(lines.contains(&"run-1"));
+    assert!(lines.contains(&"1"));
+    assert!(lines.contains(&"runner-1"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn conformance_fixture_ids_round_trip_through_the_builtin_client() {
+    let dir = temp_dir("fixture-ids");
+    let map = dir.join("ids.json");
+    std::fs::write(
+        &map,
+        r#"{"pass":"spec.ok","fail":"spec.bad","pending":"spec.skip","flaky":"spec.flake"}"#,
+    )
+    .unwrap();
+    let output = Command::new(conformance_bin())
+        .args([
+            "run",
+            "--scenario",
+            "happy_two_batches",
+            "--via",
+            "direct",
+            "--fixture-ids",
+            map.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout {}\nstderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn upload_fragment_flags_and_stdin_payload_override_detection() {
     async fn post(args: &[&str], stdin: &[u8], expect: &str) {
@@ -887,4 +1024,37 @@ async fn an_early_pong_does_not_stretch_the_dead_peer_timeout() {
         "dead peer took {elapsed:?}"
     );
     server.abort();
+}
+
+#[test]
+fn scenario_and_via_require_a_value() {
+    let help = std::process::Command::new(bin())
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert_eq!(help.status.code(), Some(0));
+    let bare = std::process::Command::new(bin()).output().unwrap();
+    assert_eq!(bare.status.code(), Some(1));
+    assert_eq!(bare.stderr, help.stderr);
+
+    let cases = [
+        (vec!["run", "--scenario"], "missing value for --scenario\n"),
+        (vec!["run", "--via"], "missing value for --via\n"),
+        (vec!["run", "--client"], "missing value for --client\n"),
+        (
+            vec!["run", "--fixture-ids"],
+            "missing value for --fixture-ids\n",
+        ),
+        (vec!["run", "--via", "sideways"], "unknown --via sideways\n"),
+        (vec!["client"], "client requires SELECTIVE_TRANSPORT_URL\n"),
+    ];
+    for (args, stderr) in cases {
+        let output = std::process::Command::new(conformance_bin())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), stderr, "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
 }
