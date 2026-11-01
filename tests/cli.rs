@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -257,6 +257,115 @@ async fn upload_fragment_uses_detected_run_identity() {
 }
 
 #[tokio::test]
+async fn blocking_session_round_trip() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(sock).await.unwrap();
+        let frame = ws.next().await.unwrap().unwrap();
+        match frame {
+            Message::Text(text) => assert_eq!(text, "hello"),
+            other => panic!("{other:?}"),
+        }
+        ws.send(Message::Ping(b"xyz".to_vec())).await.unwrap();
+        let pong = ws.next().await.unwrap().unwrap();
+        match pong {
+            Message::Pong(payload) => assert_eq!(payload, b"xyz"),
+            other => panic!("{other:?}"),
+        }
+        ws.send(Message::Text("{\"command\":\"connected\"}".into()))
+            .await
+            .unwrap();
+        let _ = ws.next().await;
+    });
+    let session = tokio::task::spawn_blocking(move || {
+        let session = transport::BlockingSession::connect(&format!("ws://{addr}")).unwrap();
+        session.send("hello").unwrap();
+        let frame = session
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame, "{\"command\":\"connected\"}");
+        session.close().unwrap();
+    });
+    session.await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn blocking_session_connect_returns_when_the_handshake_stalls() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        drop(sock);
+    });
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        transport::BlockingSession::connect(&format!("ws://{addr}"))
+    })
+    .await
+    .unwrap();
+    match result {
+        Ok(_) => panic!("connect returned a session"),
+        Err(err) => assert!(err.to_string().contains("timed out"), "{err}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "connect blocked for {:?}",
+        started.elapsed()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn blocking_session_drop_returns_when_the_peer_stops_reading() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let ws = accept_async(sock).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(ws);
+    });
+    let client = tokio::task::spawn_blocking(move || {
+        let session = transport::BlockingSession::connect(&format!("ws://{addr}")).unwrap();
+        let chunk = "x".repeat(256 * 1024);
+        let send_started = Instant::now();
+        let mut blocked_send = false;
+        for _ in 0..64 {
+            if session.send(&chunk).is_err() {
+                blocked_send = true;
+                break;
+            }
+        }
+        let send_elapsed = send_started.elapsed();
+        let drop_started = Instant::now();
+        drop(session);
+        (blocked_send, send_elapsed, drop_started.elapsed())
+    });
+    let (blocked_send, send_elapsed, drop_elapsed) = timeout(Duration::from_secs(45), client)
+        .await
+        .expect("drop did not return")
+        .unwrap();
+    assert!(
+        blocked_send,
+        "peer never filled the socket window ({send_elapsed:?})"
+    );
+    assert!(
+        send_elapsed < Duration::from_secs(20),
+        "send blocked for {send_elapsed:?}"
+    );
+    assert!(
+        drop_elapsed < Duration::from_secs(20),
+        "drop blocked for {drop_elapsed:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn upload_fragment_flags_and_stdin_payload_override_detection() {
     async fn post(args: &[&str], stdin: &[u8], expect: &str) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -323,4 +432,148 @@ async fn upload_fragment_flags_and_stdin_payload_override_detection() {
     payload.push(b'\n');
     payload.extend_from_slice(&gzip);
     post(&["--upload-fragment"], &payload, "run_id=payload-run").await;
+}
+
+#[tokio::test]
+async fn session_pings_while_idle_and_closes_without_a_pong() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(sock).await.unwrap();
+        let mut pings = 0u32;
+        let deadline = Instant::now() + Duration::from_millis(700);
+        while Instant::now() < deadline {
+            match timeout(Duration::from_millis(300), ws.next()).await {
+                Ok(Some(Ok(Message::Ping(payload)))) => {
+                    pings += 1;
+                    ws.send(Message::Pong(payload)).await.unwrap();
+                }
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                _ => {}
+            }
+        }
+        ws.send(Message::Text("still-open".into())).await.unwrap();
+        let _ = ws.next().await;
+        pings
+    });
+    let mut session = transport::Session::connect_with(
+        &format!("ws://{addr}"),
+        Some(transport::Keepalive {
+            ping_interval: Duration::from_millis(150),
+            pong_timeout: Duration::from_millis(500),
+        }),
+    )
+    .await
+    .unwrap();
+    let frame = timeout(Duration::from_secs(3), session.recv())
+        .await
+        .expect("session closed before the idle text frame")
+        .unwrap();
+    assert_eq!(frame.as_deref(), Some("still-open"));
+    let pings = server.await.unwrap();
+    assert!(pings >= 1, "pings {pings}");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let ws = accept_async(sock).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        drop(ws);
+    });
+    let started = Instant::now();
+    let mut session = transport::Session::connect_with(
+        &format!("ws://{addr}"),
+        Some(transport::Keepalive {
+            ping_interval: Duration::from_millis(80),
+            pong_timeout: Duration::from_millis(200),
+        }),
+    )
+    .await
+    .unwrap();
+    let frame = timeout(Duration::from_secs(2), session.recv())
+        .await
+        .expect("pong timeout did not close the session")
+        .unwrap();
+    assert!(frame.is_none());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    server.abort();
+}
+
+#[tokio::test]
+async fn session_stays_open_while_the_server_sends_without_ponging() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(sock).await.unwrap();
+        for index in 0..10 {
+            ws.send(Message::Text(format!("frame-{index}")))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        std::future::pending::<()>().await;
+    });
+    let mut session = transport::Session::connect_with(
+        &format!("ws://{addr}"),
+        Some(transport::Keepalive {
+            ping_interval: Duration::from_millis(80),
+            pong_timeout: Duration::from_millis(200),
+        }),
+    )
+    .await
+    .unwrap();
+    for index in 0..10 {
+        let frame = within(session.recv()).await.unwrap();
+        assert_eq!(frame, Some(format!("frame-{index}")));
+    }
+    let ended = within(session.recv()).await.unwrap();
+    assert_eq!(ended, None);
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_early_pong_does_not_stretch_the_dead_peer_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(sock).await.unwrap();
+        let mut answered = false;
+        while !answered {
+            match timeout(Duration::from_secs(2), ws.next()).await {
+                Ok(Some(Ok(Message::Ping(payload)))) => {
+                    ws.send(Message::Pong(payload.clone())).await.unwrap();
+                    ws.send(Message::Pong(payload)).await.unwrap();
+                    answered = true;
+                }
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => return,
+                _ => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+    let started = Instant::now();
+    let mut session = transport::Session::connect_with(
+        &format!("ws://{addr}"),
+        Some(transport::Keepalive {
+            ping_interval: Duration::from_millis(500),
+            pong_timeout: Duration::from_millis(200),
+        }),
+    )
+    .await
+    .unwrap();
+    let frame = timeout(Duration::from_millis(1450), session.recv())
+        .await
+        .expect("stray pong stretched the dead-peer timeout")
+        .unwrap();
+    assert!(frame.is_none());
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(1450),
+        "dead peer took {elapsed:?}"
+    );
+    server.abort();
 }
