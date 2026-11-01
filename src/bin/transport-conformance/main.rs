@@ -22,7 +22,9 @@ usage:
 
 The transport binary is --transport, else SELECTIVE_TRANSPORT, else the
 transport next to this binary. A --client command gets it as
-SELECTIVE_TRANSPORT.
+SELECTIVE_TRANSPORT. With --client, --via fifo says the client talks to the
+transport over FIFO, so the keepalive scenarios are n/a; any other --via runs
+it as a direct client.
 ";
 
 fn main() {

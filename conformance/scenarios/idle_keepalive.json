@@ -1,0 +1,49 @@
+{
+  "name": "idle_keepalive",
+  "steps": [
+    {
+      "op": "send",
+      "message": {
+        "command": "connected"
+      }
+    },
+    {
+      "op": "idle"
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "test_manifest"
+      }
+    },
+    {
+      "op": "expect_manifest",
+      "tree": false
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "run_test_cases",
+        "test_case_ids": [
+          "case-pass"
+        ]
+      }
+    },
+    {
+      "op": "expect_result",
+      "id": "case-pass",
+      "status": "passed"
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "close",
+        "exit_status": 0
+      }
+    },
+    {
+      "op": "expect_exit",
+      "code": 0
+    }
+  ]
+}
