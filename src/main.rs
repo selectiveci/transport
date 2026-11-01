@@ -8,6 +8,7 @@ const USAGE: &str = "\
 usage:
   transport <websocket-url> <runner-id>
   transport --snapshot [dir]
+  transport --build-env
 ";
 
 fn main() {
@@ -30,6 +31,10 @@ fn dispatch() -> Result<i32, transport::Error> {
             Ok(0)
         }
         Some("--snapshot") => snapshot_main(args.next()),
+        Some("--build-env") => {
+            println!("{}", serde_json::to_string(&transport::detect_build_env())?);
+            Ok(0)
+        }
         Some(url) => match args.next() {
             Some(runner_id) => Ok(block_on(engine::run_fifo(url, &runner_id))),
             None => Err(transport::Error::new(USAGE)),
