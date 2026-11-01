@@ -1,0 +1,58 @@
+{
+  "name": "print_commands",
+  "steps": [
+    {
+      "op": "send",
+      "message": {
+        "command": "connected"
+      }
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "print_notice",
+        "message": "conformance notice: the client prints this"
+      }
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "print_message",
+        "message": "conformance message: the client prints this too"
+      }
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "test_manifest"
+      }
+    },
+    {
+      "op": "expect_manifest",
+      "tree": false
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "close",
+        "exit_status": null
+      }
+    },
+    {
+      "op": "expect_report",
+      "connection_retries": 0
+    },
+    {
+      "op": "expect_exit",
+      "code": 0
+    },
+    {
+      "op": "expect_output",
+      "text": "conformance notice: the client prints this"
+    },
+    {
+      "op": "expect_output",
+      "text": "conformance message: the client prints this too"
+    }
+  ]
+}
