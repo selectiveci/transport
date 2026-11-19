@@ -2,6 +2,7 @@
 
 pub mod build_env;
 pub mod error;
+pub mod manifest_upload;
 pub mod session;
 pub mod snapshot;
 pub mod upload;
