@@ -30,15 +30,15 @@ type Headers = Vec<(String, String)>;
 
 // A new connection the server has confirmed, and the headers of any further
 // move it asked for before confirming.
+struct Resumed {
+    socket: Socket,
+    again: Option<Headers>,
+}
+
 struct Upload {
     task: JoinHandle<()>,
     line: Arc<String>,
     next_ping: Instant,
-}
-
-struct Resumed {
-    socket: Socket,
-    again: Option<Headers>,
 }
 
 // Sent by a server that wants this runner on a new connection. The client only
@@ -57,6 +57,7 @@ const RESUME_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const RESUME_MAX_BACKOFF: Duration = Duration::from_secs(4);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const UPLOAD_PING_INTERVAL: Duration = Duration::from_secs(30);
+const UPLOAD_GRACE: Duration = Duration::from_secs(10);
 // The server closes a replaced connection once it has drained it; this is the backstop.
 const RETIRED_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -110,6 +111,7 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
         upload_target: Target::from_ws_url(url),
         armed: None,
         uploading: None,
+        winding: None,
         upload_tx,
         upload_ping: upload_ping_interval(),
     };
@@ -121,6 +123,7 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
             Some(resumed) = resume_rx.recv() => transport.on_resume_finished(resumed).await,
             Some(outcome) = upload_rx.recv() => transport.on_upload_finished(outcome).await,
             () = sleep_until_some(transport.upload_ping_due()) => transport.upload_ping().await,
+            () = sleep_until_some(transport.winding.map(|(_, at)| at)) => transport.grace_ended().await,
             () = sleep_until_some(transport.ping_due()) => transport.ping().await,
             () = sleep_until_some(transport.liveness_deadline()) => transport.check_liveness().await,
             item = pipe_rx.recv(), if !transport.exit_requested => {
@@ -178,6 +181,7 @@ struct Transport {
     upload_target: Option<Target>,
     armed: Option<UploadBlock>,
     uploading: Option<Upload>,
+    winding: Option<(i32, Instant)>,
     upload_tx: mpsc::UnboundedSender<Outcome>,
     upload_ping: Duration,
 }
@@ -245,8 +249,7 @@ impl Transport {
         }
 
         if !self.resuming {
-            eprintln!("{ending}");
-            return Some(0);
+            return self.connection_lost(ending);
         }
 
         // Asked to move and the old connection went first: wait for the
@@ -255,6 +258,26 @@ impl Transport {
             close_in_background(sink);
         }
         None
+    }
+
+    fn connection_lost(&mut self, ending: &str) -> Option<i32> {
+        eprintln!("{ending}");
+        if self.uploading.is_none() {
+            return Some(0);
+        }
+        if let Some((_, sink)) = self.current.take() {
+            close_in_background(sink);
+        }
+        self.winding
+            .get_or_insert((0, Instant::now() + UPLOAD_GRACE));
+        None
+    }
+
+    async fn grace_ended(&mut self) -> Option<i32> {
+        let (code, _) = self.winding.take()?;
+        self.abort_upload();
+        self.send_held().await;
+        Some(code)
     }
 
     async fn start_resume(&mut self, headers: Headers) {
@@ -289,6 +312,10 @@ impl Transport {
                 self.close_current().await;
                 exit(1);
             }
+            if self.uploading.is_some() {
+                self.winding = Some((1, Instant::now() + UPLOAD_GRACE));
+                return None;
+            }
             return Some(1);
         };
 
@@ -316,7 +343,9 @@ impl Transport {
 
     async fn on_pipe_item(&mut self, item: Option<PipeItem>) -> Option<i32> {
         match item {
-            Some(PipeItem::Line(message)) if self.resuming || self.uploading.is_some() => {
+            Some(PipeItem::Line(message))
+                if self.resuming || !self.held.is_empty() || self.must_wait(&message) =>
+            {
                 self.held.push_back(message);
                 None
             }
@@ -329,11 +358,11 @@ impl Transport {
             // connection still open.
             Some(PipeItem::Exit) | None => {
                 self.abort_upload();
+                self.armed = None;
                 if self.resuming && self.current.is_none() {
                     self.exit_requested = true;
                     return None;
                 }
-                self.armed = None;
                 self.send_held().await;
                 self.close_current().await;
                 exit(0);
@@ -352,10 +381,11 @@ impl Transport {
                 return;
             }
         }
-        while self.uploading.is_none() {
-            let Some(message) = self.held.pop_front() else {
+        while let Some(message) = self.held.pop_front() {
+            if self.must_wait(&message) {
+                self.held.push_front(message);
                 return;
-            };
+            }
             let Err(message) = self.start_upload(message) else {
                 continue;
             };
@@ -377,6 +407,13 @@ impl Transport {
         };
         self.armed = block;
         forwarded
+    }
+
+    fn must_wait(&self, message: &Message) -> bool {
+        let Message::Text(line) = message else {
+            return false;
+        };
+        self.uploading.is_some() && self.armed.is_some() && is_manifest_line(line)
     }
 
     fn start_upload(&mut self, message: Message) -> Result<(), Message> {
@@ -424,7 +461,7 @@ impl Transport {
             }
             self.send_held().await;
         }
-        None
+        self.winding.take().map(|(code, _)| code)
     }
 
     fn upload_ping_due(&self) -> Option<Instant> {
@@ -451,8 +488,7 @@ impl Transport {
             },
         };
         if sent.is_err() && !self.resuming {
-            eprintln!("websocket connection dropped");
-            return Some(0);
+            return self.connection_lost("websocket connection dropped");
         }
         None
     }
