@@ -317,6 +317,23 @@ impl Run {
         .expect("timed out waiting for upload requests")
     }
 
+    async fn wait_commit(&self) -> Vec<Seen> {
+        timeout(WAIT, async {
+            loop {
+                let seen = self.server.requests();
+                if seen
+                    .last()
+                    .is_some_and(|last| last.path.ends_with("/commit"))
+                {
+                    return seen;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for the commit request")
+    }
+
     async fn expect_exit(&mut self, code: i32) {
         let status = timeout(WAIT, self.child.wait())
             .await
@@ -363,7 +380,7 @@ async fn the_client_sees_no_upload_block_and_the_manifest_goes_over_http() {
     run.write_line("after").await;
     assert_eq!(run.socket.next_text().await, "after");
 
-    let requests = run.server.requests();
+    let requests = run.wait_commit().await;
     assert!(requests.iter().all(|seen| seen.token == "t1"));
     assert!(requests.len() > 3, "{} requests", requests.len());
     assert_eq!(requests.last().unwrap().path, "/manifest_uploads/commit");
@@ -387,14 +404,14 @@ async fn commands_without_an_upload_block_are_forwarded_byte_for_byte() {
 }
 
 #[tokio::test]
-async fn a_413_falls_back_to_the_websocket_ahead_of_later_lines() {
+async fn a_413_falls_back_to_the_websocket_while_later_lines_go_straight_out() {
     let mut run = Run::start(status(413), &[]).await;
     run.ask(&manifest_command("t1", 1_000_000)).await;
     let manifest = manifest_line("m");
     run.write_line(&manifest).await;
     run.write_line("after").await;
-    assert_eq!(run.socket.next_text().await, manifest);
     assert_eq!(run.socket.next_text().await, "after");
+    assert_eq!(run.socket.next_text().await, manifest);
     assert_eq!(run.server.requests().len(), 1);
 }
 
@@ -409,6 +426,8 @@ async fn a_410_stops_that_upload_and_a_later_ask_uploads_again() {
     run.write_line(&manifest_line("first")).await;
     run.write_line("after").await;
     assert_eq!(run.socket.next_text().await, "after");
+    run.wait_requests(1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(run.server.requests().len(), 1);
 
     run.ask(&manifest_command("fresh", 1_000_000)).await;
@@ -416,7 +435,7 @@ async fn a_410_stops_that_upload_and_a_later_ask_uploads_again() {
     run.write_line(&second).await;
     run.write_line("after-2").await;
     assert_eq!(run.socket.next_text().await, "after-2");
-    let requests = run.server.requests();
+    let requests = run.wait_requests(3).await;
     assert_eq!(requests.len(), 3);
     assert!(requests[1..].iter().all(|seen| seen.token == "fresh"));
     assert_eq!(reassemble(&requests[1..]), second);
@@ -466,8 +485,8 @@ async fn an_exit_written_mid_upload_aborts_it_and_sends_the_manifest_over_the_we
     run.write_line("after").await;
     let started = std::time::Instant::now();
     run.write_line("exit").await;
-    assert_eq!(run.socket.next_text().await, manifest);
     assert_eq!(run.socket.next_text().await, "after");
+    assert_eq!(run.socket.next_text().await, manifest);
     run.expect_exit(0).await;
     assert!(started.elapsed() < Duration::from_millis(1500));
 }
@@ -491,19 +510,19 @@ async fn a_second_manifest_line_written_mid_upload_is_uploaded_with_its_own_toke
 }
 
 #[tokio::test]
-async fn a_resume_during_the_upload_puts_the_fallback_first_on_the_new_connection() {
+async fn a_resume_during_the_upload_puts_the_fallback_on_the_new_connection() {
     let mut run = Run::start(delayed(413, 800), &[]).await;
     run.ask(&manifest_command("t1", 1_000_000)).await;
     let manifest = manifest_line("m");
     run.write_line(&manifest).await;
     run.wait_requests(1).await;
     run.write_line("after").await;
+    assert_eq!(run.socket.next_text().await, "after");
     run.socket.send(RESUME).await;
     let mut new = run.server.next_socket().await;
     new.send(CONNECTED).await;
     new.send(RESUMED).await;
     assert_eq!(new.next_text().await, manifest);
-    assert_eq!(new.next_text().await, "after");
     assert!(new.uri.contains("resume=true"), "{}", new.uri);
 }
 
@@ -535,20 +554,20 @@ async fn a_fallback_line_is_not_uploaded_again_under_a_newer_ask() {
 }
 
 #[tokio::test]
-async fn a_fallback_that_settles_mid_resume_goes_out_first_once_the_move_completes() {
+async fn a_fallback_that_settles_mid_resume_goes_out_once_the_move_completes() {
     let mut run = Run::start(delayed(413, 300), &[]).await;
     run.ask(&manifest_command("t1", 1_000_000)).await;
     let manifest = manifest_line("m");
     run.write_line(&manifest).await;
     run.wait_requests(1).await;
     run.write_line("after").await;
+    assert_eq!(run.socket.next_text().await, "after");
     run.socket.send(RESUME).await;
     let mut new = run.server.next_socket().await;
     new.send(CONNECTED).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
     new.send(RESUMED).await;
     assert_eq!(new.next_text().await, manifest);
-    assert_eq!(new.next_text().await, "after");
 }
 
 #[tokio::test]
@@ -616,9 +635,9 @@ async fn a_stalled_upload_falls_back_at_its_deadline_and_releases_the_held_lines
     let started = std::time::Instant::now();
     run.write_line(&manifest).await;
     run.write_line("after").await;
+    assert_eq!(run.socket.next_text().await, "after");
     assert_eq!(run.socket.next_text().await, manifest);
     let waited = started.elapsed();
-    assert_eq!(run.socket.next_text().await, "after");
     assert!(waited >= Duration::from_millis(600), "{waited:?}");
     assert!(waited < Duration::from_secs(4), "{waited:?}");
     assert_eq!(run.server.requests().len(), 1);
@@ -716,4 +735,115 @@ async fn an_exit_with_an_upload_in_flight_and_no_connection_sends_the_manifest_o
     new.send(RESUMED).await;
     assert_eq!(new.next_text().await, manifest);
     run.expect_exit(0).await;
+}
+
+async fn collect_texts(socket: &mut Socket, quiet: Duration) -> Vec<String> {
+    let mut texts = Vec::new();
+    while let Ok(Some(text)) = timeout(quiet, socket.texts.recv()).await {
+        texts.push(text.trim_end().to_owned());
+    }
+    texts
+}
+
+fn commit_delayed(millis: u64) -> Script {
+    Arc::new(move |seen, _| {
+        let wait = if seen.path.ends_with("/commit") {
+            millis
+        } else {
+            0
+        };
+        (200, String::new(), wait)
+    })
+}
+
+#[tokio::test]
+async fn results_written_behind_an_upload_reach_the_socket_before_a_declined_move() {
+    let mut run = Run::start(commit_delayed(2500), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    run.write_line(&manifest_line("m")).await;
+    run.write_line("r0").await;
+    run.write_line("r1").await;
+    run.wait_requests(1).await;
+    run.socket.send(RESUME).await;
+    let mut new = run.server.next_socket().await;
+    run.socket.sink.send(Message::Close(None)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    new.send(r#"{"command":"close","exit_status":1}"#).await;
+    let seen = collect_texts(&mut run.socket, Duration::from_secs(1)).await;
+    assert_eq!(seen, ["r0", "r1", r#"{"type":"transport_moving"}"#]);
+    run.expect_exit(1).await;
+    assert!(run
+        .server
+        .requests()
+        .last()
+        .unwrap()
+        .path
+        .ends_with("/commit"));
+}
+
+#[tokio::test]
+async fn a_websocket_that_dies_mid_upload_does_not_stop_the_upload_or_lose_the_results() {
+    let mut run = Run::start(commit_delayed(1000), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    run.write_line(&manifest_line("m")).await;
+    run.write_line("r0").await;
+    run.write_line("r1").await;
+    run.wait_requests(1).await;
+    run.socket.sink.send(Message::Close(None)).await.unwrap();
+    let seen = collect_texts(&mut run.socket, Duration::from_secs(1)).await;
+    assert_eq!(seen, ["r0", "r1"]);
+    let requests = run.wait_requests(2).await;
+    assert!(requests[1].path.ends_with("/commit"));
+    run.expect_exit(0).await;
+}
+
+#[tokio::test]
+async fn stdin_closing_while_the_resume_gap_holds_a_manifest_exits_with_it_on_the_new_socket() {
+    let mut run = Run::start(ok(), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    run.socket.send(RESUME).await;
+    let mut new = run.server.next_socket().await;
+    new.send(CONNECTED).await;
+    run.socket.sink.send(Message::Close(None)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let manifest = manifest_line("m");
+    run.write_line(&manifest).await;
+    run.write_line("exit").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let released = std::time::Instant::now();
+    new.send(RESUMED).await;
+    assert_eq!(new.next_text().await, manifest);
+    run.expect_exit(0).await;
+    assert!(released.elapsed() < Duration::from_secs(5));
+    assert!(run.server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_fallback_with_no_websocket_left_cannot_be_delivered_and_the_transport_exits() {
+    let mut run = Run::start(delayed(403, 500), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    run.write_line(&manifest_line("m")).await;
+    run.wait_requests(1).await;
+    run.socket.sink.send(Message::Close(None)).await.unwrap();
+    assert!(collect_texts(&mut run.socket, Duration::from_secs(1))
+        .await
+        .is_empty());
+    run.expect_exit(0).await;
+    assert_eq!(run.server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn an_upload_that_outlives_a_dead_websocket_is_cut_off_after_the_grace_period() {
+    let mut run = Run::start(delayed(200, 60_000), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    run.write_line(&manifest_line("m")).await;
+    run.wait_requests(1).await;
+    let killed = std::time::Instant::now();
+    run.socket.sink.send(Message::Close(None)).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert!(run.child.try_wait().unwrap().is_none());
+    run.expect_exit(0).await;
+    let lived = killed.elapsed();
+    assert!(lived >= Duration::from_secs(9), "{lived:?}");
+    assert!(lived < Duration::from_secs(13), "{lived:?}");
 }
