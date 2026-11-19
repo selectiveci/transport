@@ -11,7 +11,7 @@ use crate::upload::gzip_bytes;
 const RETRIES: u32 = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_CAP: usize = 65_536;
-const MANIFEST_COMMAND: &str = "test_manifest";
+pub const MANIFEST_COMMAND: &str = "test_manifest";
 const UPLOAD_KEY: &str = "upload";
 
 #[derive(Clone, PartialEq, Eq)]

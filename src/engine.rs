@@ -1,8 +1,9 @@
 use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::process::exit;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,6 +16,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Request};
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
+};
+use transport::manifest_upload::{
+    intercept, is_manifest_line, upload, Outcome, Policy, Target, UploadBlock, MANIFEST_COMMAND,
 };
 use transport::Keepalive;
 use url::Url;
@@ -31,8 +35,12 @@ struct Resumed {
     again: Option<Headers>,
 }
 
-// Tells the server this transport can move its own connection when asked to.
-const FEATURES_PARAM: (&str, &str) = ("transport_features", "resume");
+struct Upload {
+    id: u64,
+    task: JoinHandle<()>,
+    line: Arc<String>,
+    next_ping: Instant,
+}
 
 // Sent by a server that wants this runner on a new connection. The client only
 // reads the pipe between tests, so the transport moves the connection itself.
@@ -49,6 +57,8 @@ const RESUMED_TIMEOUT: Duration = Duration::from_secs(15);
 const RESUME_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const RESUME_MAX_BACKOFF: Duration = Duration::from_secs(4);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const UPLOAD_PING_INTERVAL: Duration = Duration::from_secs(30);
+const UPLOAD_GRACE: Duration = Duration::from_secs(10);
 // The server closes a replaced connection once it has drained it; this is the backstop.
 const RETIRED_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -56,7 +66,7 @@ pub async fn run_stdio(keepalive: Option<Keepalive>) -> i32 {
     let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel::<PipeItem>();
     tokio::spawn(read_lines(tokio::io::stdin(), pipe_tx));
     let url = match stdio_url(&mut pipe_rx).await {
-        Ok(url) => with_params(&url, &[FEATURES_PARAM]),
+        Ok(url) => with_params(&url, &[features_param(&url)]),
         Err(message) => {
             eprintln!("{message}");
             exit(1);
@@ -82,6 +92,7 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ServerEvent>();
     let (resume_tx, mut resume_rx) = mpsc::unbounded_channel::<Option<Resumed>>();
+    let (upload_tx, mut upload_rx) = mpsc::unbounded_channel::<(u64, Outcome)>();
 
     let mut transport = Transport {
         out: Some(out_tx),
@@ -93,10 +104,18 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
         exit_requested: false,
         ended: HashSet::new(),
         held: VecDeque::new(),
+        fallback: None,
         next_id: 0,
         events_tx,
         resume_tx,
         liveness: keepalive.map(Liveness::new),
+        upload_target: Target::from_ws_url(url),
+        armed: None,
+        uploading: None,
+        winding: None,
+        upload_tx,
+        next_upload: 0,
+        upload_ping: upload_ping_interval(),
     };
     transport.adopt(socket);
 
@@ -104,6 +123,9 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
         let stop = tokio::select! {
             Some((id, message)) = events_rx.recv() => transport.on_server_event(id, message).await,
             Some(resumed) = resume_rx.recv() => transport.on_resume_finished(resumed).await,
+            Some((id, outcome)) = upload_rx.recv() => transport.on_upload_finished(id, outcome).await,
+            () = sleep_until_some(transport.upload_ping_due()) => transport.upload_ping().await,
+            () = sleep_until_some(transport.winding.map(|(_, at)| at)) => transport.grace_ended().await,
             () = sleep_until_some(transport.ping_due()) => transport.ping().await,
             () = sleep_until_some(transport.liveness_deadline()) => transport.check_liveness().await,
             item = pipe_rx.recv(), if !transport.exit_requested => {
@@ -153,10 +175,18 @@ struct Transport {
     // Connections whose reader has reported their end.
     ended: HashSet<u64>,
     held: VecDeque<Message>,
+    fallback: Option<Message>,
     next_id: u64,
     events_tx: mpsc::UnboundedSender<ServerEvent>,
     resume_tx: mpsc::UnboundedSender<Option<Resumed>>,
     liveness: Option<Liveness>,
+    upload_target: Option<Target>,
+    armed: Option<UploadBlock>,
+    uploading: Option<Upload>,
+    winding: Option<(i32, Instant)>,
+    upload_tx: mpsc::UnboundedSender<(u64, Outcome)>,
+    next_upload: u64,
+    upload_ping: Duration,
 }
 
 impl Transport {
@@ -191,6 +221,7 @@ impl Transport {
                     return None;
                 }
 
+                let text = self.rewrite_command(text);
                 self.write_line(text.into_bytes());
                 None
             }
@@ -221,8 +252,7 @@ impl Transport {
         }
 
         if !self.resuming {
-            eprintln!("{ending}");
-            return Some(0);
+            return self.connection_lost(ending);
         }
 
         // Asked to move and the old connection went first: wait for the
@@ -231,6 +261,26 @@ impl Transport {
             close_in_background(sink);
         }
         None
+    }
+
+    fn connection_lost(&mut self, ending: &str) -> Option<i32> {
+        eprintln!("{ending}");
+        if self.uploading.is_none() {
+            return Some(0);
+        }
+        if let Some((_, sink)) = self.current.take() {
+            close_in_background(sink);
+        }
+        self.winding
+            .get_or_insert((0, Instant::now() + UPLOAD_GRACE));
+        None
+    }
+
+    async fn grace_ended(&mut self) -> Option<i32> {
+        let (code, _) = self.winding.take()?;
+        self.abort_upload();
+        self.send_held().await;
+        Some(code)
     }
 
     async fn start_resume(&mut self, headers: Headers) {
@@ -259,10 +309,15 @@ impl Transport {
         // old connection could lose results. The client reconnects in full.
         let Some(Resumed { socket, again }) = resumed else {
             eprintln!("Failed to move to a new connection. Exiting...");
+            self.armed = None;
             self.send_held().await;
             if self.exit_requested {
                 self.close_current().await;
                 exit(1);
+            }
+            if self.uploading.is_some() {
+                self.winding = Some((1, Instant::now() + UPLOAD_GRACE));
+                return None;
             }
             return Some(1);
         };
@@ -278,7 +333,7 @@ impl Transport {
 
         self.send_held().await;
 
-        if self.exit_requested {
+        if self.exit_requested && self.uploading.is_none() {
             self.close_current().await;
             exit(0);
         }
@@ -295,15 +350,20 @@ impl Transport {
                 self.held.push_back(message);
                 None
             }
-            Some(PipeItem::Line(message)) => self.send(message).await,
+            Some(PipeItem::Line(message)) => match self.start_upload(message) {
+                Ok(()) => None,
+                Err(message) => self.send(message).await,
+            },
             // The client stops the transport a few seconds after asking, so an
             // exit doesn't wait for a resume: what's held goes out on the
             // connection still open.
-            Some(PipeItem::Exit) | None if self.resuming && self.current.is_none() => {
-                self.exit_requested = true;
-                None
-            }
             Some(PipeItem::Exit) | None => {
+                self.abort_upload();
+                self.armed = None;
+                if self.resuming && self.current.is_none() {
+                    self.exit_requested = true;
+                    return None;
+                }
                 self.send_held().await;
                 self.close_current().await;
                 exit(0);
@@ -313,7 +373,19 @@ impl Transport {
 
     // Best effort: a connection that has gone is reported by its reader.
     async fn send_held(&mut self) {
+        if let Some(message) = self.fallback.take() {
+            let Some((_, sink)) = self.current.as_mut() else {
+                self.fallback = Some(message);
+                return;
+            };
+            if sink.send(message).await.is_err() {
+                return;
+            }
+        }
         while let Some(message) = self.held.pop_front() {
+            let Err(message) = self.start_upload(message) else {
+                continue;
+            };
             let Some((_, sink)) = self.current.as_mut() else {
                 return;
             };
@@ -321,6 +393,94 @@ impl Transport {
                 return;
             }
         }
+    }
+
+    fn rewrite_command(&mut self, text: String) -> String {
+        if is_command(&text, MANIFEST_COMMAND) {
+            self.armed = None;
+        }
+        let Some((forwarded, block)) = intercept(&text) else {
+            return text;
+        };
+        if block.is_some() {
+            self.supersede_upload();
+        }
+        self.armed = block;
+        forwarded
+    }
+
+    fn supersede_upload(&mut self) {
+        if let Some(upload) = self.uploading.take() {
+            upload.task.abort();
+        }
+    }
+
+    fn start_upload(&mut self, message: Message) -> Result<(), Message> {
+        let Message::Text(line) = message else {
+            return Err(message);
+        };
+        if self.armed.is_none() || !is_manifest_line(&line) {
+            return Err(Message::Text(line));
+        }
+        let (Some(target), Some(block)) = (self.upload_target.clone(), self.armed.take()) else {
+            return Err(Message::Text(line));
+        };
+        let id = self.next_upload;
+        self.next_upload += 1;
+        let line = Arc::new(line);
+        let done = self.upload_tx.clone();
+        let sent = Arc::clone(&line);
+        let task = tokio::spawn(async move {
+            let outcome = guarded(upload(&target, &block, &sent, upload_policy())).await;
+            let _ = done.send((id, outcome));
+        });
+        self.uploading = Some(Upload {
+            id,
+            task,
+            line,
+            next_ping: Instant::now() + self.upload_ping,
+        });
+        Ok(())
+    }
+
+    fn abort_upload(&mut self) {
+        if let Some(upload) = self.uploading.take() {
+            upload.task.abort();
+            self.fallback = Some(upload.into_message());
+        }
+    }
+
+    async fn on_upload_finished(&mut self, id: u64, outcome: Outcome) -> Option<i32> {
+        if self.uploading.as_ref().map(|upload| upload.id) != Some(id) {
+            return None;
+        }
+        let upload = self.uploading.take()?;
+        if outcome == Outcome::Fallback {
+            self.fallback = Some(upload.into_message());
+        }
+        if !self.resuming {
+            if let Some(message) = self.fallback.take() {
+                if let Some(code) = self.send(message).await {
+                    return Some(code);
+                }
+            }
+            self.send_held().await;
+        }
+        self.winding.take().map(|(code, _)| code)
+    }
+
+    fn upload_ping_due(&self) -> Option<Instant> {
+        self.uploading
+            .as_ref()
+            .map(|upload| upload.next_ping)
+            .filter(|_| self.current.is_some() && !self.resuming)
+    }
+
+    async fn upload_ping(&mut self) -> Option<i32> {
+        if let Some(upload) = self.uploading.as_mut() {
+            upload.next_ping = Instant::now() + self.upload_ping;
+        }
+        self.send(Message::Ping(b"selective".to_vec())).await
     }
 
     async fn send(&mut self, message: Message) -> Option<i32> {
@@ -333,8 +493,7 @@ impl Transport {
             },
         };
         if sent.is_err() && !self.resuming {
-            eprintln!("websocket connection dropped");
-            return Some(0);
+            return self.connection_lost("websocket connection dropped");
         }
         None
     }
@@ -394,6 +553,7 @@ impl Transport {
             match timeout_at(deadline, events.recv()).await {
                 Ok(Some((id, Some(Message::Text(text))))) if open.contains(&id) => {
                     if resume_headers(&text).is_none() {
+                        let text = intercept(&text).map_or(text, |(forwarded, _)| forwarded);
                         self.write_line(text.into_bytes());
                     }
                 }
@@ -610,6 +770,48 @@ fn with_params(url: &Url, params: &[(&str, &str)]) -> Url {
     url
 }
 
+fn features_param(url: &Url) -> (&'static str, &'static str) {
+    let features = if Target::from_ws_url(url).is_some() {
+        "resume,manifest_http"
+    } else {
+        "resume"
+    };
+    ("transport_features", features)
+}
+
+fn upload_policy() -> Policy {
+    let deadline = std::env::var("SELECTIVE_UPLOAD_DEADLINE_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|millis| *millis > 0)
+        .map_or(Policy::default().deadline, Duration::from_millis);
+    Policy {
+        deadline,
+        ..Policy::default()
+    }
+}
+
+async fn guarded(work: impl Future<Output = Outcome>) -> Outcome {
+    AssertUnwindSafe(work)
+        .catch_unwind()
+        .await
+        .unwrap_or(Outcome::Fallback)
+}
+
+impl Upload {
+    fn into_message(self) -> Message {
+        Message::text(Arc::try_unwrap(self.line).unwrap_or_else(|shared| (*shared).clone()))
+    }
+}
+
+fn upload_ping_interval() -> Duration {
+    std::env::var("SELECTIVE_UPLOAD_PING_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|millis| *millis > 0)
+        .map_or(UPLOAD_PING_INTERVAL, Duration::from_millis)
+}
+
 fn parse_command(text: &str) -> Option<Value> {
     serde_json::from_str::<Value>(text)
         .ok()
@@ -759,6 +961,71 @@ async fn stdio_url(lines: &mut mpsc::UnboundedReceiver<PipeItem>) -> Result<Url,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_panicking_upload_task_settles_as_a_fallback() {
+        fn explode() -> Outcome {
+            panic!("upload task panics")
+        }
+        assert_eq!(guarded(async { explode() }).await, Outcome::Fallback);
+        assert_eq!(
+            guarded(async { Outcome::Delivered }).await,
+            Outcome::Delivered
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_upload_outcome_does_not_settle_the_current_upload() {
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (resume_tx, _resume_rx) = mpsc::unbounded_channel();
+        let (upload_tx, _upload_rx) = mpsc::unbounded_channel();
+        let mut transport = Transport {
+            out: None,
+            writer: None,
+            resume_url: Url::parse("ws://127.0.0.1:1/transport/websocket").unwrap(),
+            current: None,
+            retired: HashMap::new(),
+            resuming: false,
+            exit_requested: false,
+            ended: HashSet::new(),
+            held: VecDeque::new(),
+            fallback: None,
+            next_id: 0,
+            events_tx,
+            resume_tx,
+            liveness: None,
+            upload_target: None,
+            armed: None,
+            uploading: Some(Upload {
+                id: 7,
+                task: tokio::spawn(std::future::pending()),
+                line: Arc::new("manifest".to_owned()),
+                next_ping: Instant::now(),
+            }),
+            winding: None,
+            upload_tx,
+            next_upload: 8,
+            upload_ping: Duration::from_secs(30),
+        };
+        assert_eq!(
+            transport.on_upload_finished(6, Outcome::Fallback).await,
+            None
+        );
+        assert!(transport.uploading.is_some());
+        assert!(transport.fallback.is_none());
+        transport.on_upload_finished(7, Outcome::Fallback).await;
+        assert!(transport.uploading.is_none());
+    }
+
+    #[test]
+    fn manifest_http_needs_an_api_key_in_the_url() {
+        let features = |url: &str| features_param(&Url::parse(url).unwrap()).1;
+        assert_eq!(
+            features("ws://h/p?api_key=k&run_id=1"),
+            "resume,manifest_http"
+        );
+        assert_eq!(features("ws://h/p?run_id=1"), "resume");
+    }
 
     #[test]
     fn with_params_replaces_existing_values_and_keeps_the_rest() {
