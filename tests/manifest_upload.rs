@@ -541,3 +541,19 @@ async fn a_fallback_that_settles_mid_resume_goes_out_first_once_the_move_complet
     assert_eq!(new.next_text().await, manifest);
     assert_eq!(new.next_text().await, "after");
 }
+
+#[tokio::test]
+async fn a_command_written_while_the_transport_winds_down_has_no_upload_block() {
+    let mut run = Run::start(ok(), &[]).await;
+    run.socket.send(RESUME).await;
+    let mut new = run.server.next_socket().await;
+    new.send(CONNECTED).await;
+    new.send(RESUMED).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let command = manifest_command("t1", 1_000_000);
+    new.sink.send(Message::Close(None)).await.unwrap();
+    run.socket.send(&command).await;
+    assert_eq!(run.read_line().await, without_upload(&command));
+    let _ = run.socket.sink.send(Message::Close(None)).await;
+    run.expect_exit(0).await;
+}
