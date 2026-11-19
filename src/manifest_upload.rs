@@ -707,6 +707,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_server_that_closes_every_connection_costs_one_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = target_for(listener.local_addr().unwrap().port());
+        let accepted = Arc::new(Mutex::new(0_usize));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                *counter.lock().unwrap() += 1;
+                drop(stream);
+            }
+        });
+        let policy = Policy {
+            chunk_timeout: Duration::from_millis(300),
+            ..fast()
+        };
+        let started = Instant::now();
+        let outcome = upload(&target, &block(1_000_000), &manifest_line(50), policy).await;
+        assert_eq!(outcome, Outcome::Fallback);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(
+            *accepted.lock().unwrap() <= 2,
+            "{} connections",
+            *accepted.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn a_request_that_spends_three_retries_falls_back_after_four_attempts() {
         let base = Duration::from_millis(40);
         let policy = Policy {
