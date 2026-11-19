@@ -249,12 +249,12 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
                     eprintln!("ok {} {label}", scenario.name);
                 }
                 Ok(Played::NotApplicable(why)) => {
-                    if scenario
+                    if let Some(feature) = scenario
                         .requires_transport_features
                         .iter()
-                        .any(|feature| run.require_features.contains(feature))
+                        .find(|feature| run.require_features.contains(feature))
                     {
-                        unexercised.push((scenario.name.clone(), why.clone()));
+                        unexercised.push((scenario.name.clone(), feature.clone(), why.clone()));
                     }
                     eprintln!("n/a {} {label}: {why}", scenario.name);
                 }
@@ -265,20 +265,20 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
             }
         }
     }
-    if trials == 0 {
+    for (name, feature, why) in unexercised {
+        if !passed.contains(&name) {
+            failures.push(format!(
+                "{name}: required transport feature {feature} never exercised ({why})"
+            ));
+        }
+    }
+    if trials == 0 && failures.is_empty() {
         return Err(match run.filter {
             Some(name) => Error::new(format!(
                 "no conformance scenarios ran for --scenario {name}"
             )),
             None => Error::new("no conformance scenarios ran"),
         });
-    }
-    for (name, why) in unexercised {
-        if !passed.contains(&name) {
-            failures.push(format!(
-                "{name}: required transport feature never exercised ({why})"
-            ));
-        }
     }
     if failures.is_empty() {
         Ok(())

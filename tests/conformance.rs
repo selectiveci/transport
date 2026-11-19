@@ -45,9 +45,33 @@ fn a_required_feature_that_no_trial_exercised_fails_the_run() {
     ] {
         assert!(
             stderr.contains(&format!(
-                "{name}: required transport feature never exercised"
+                "{name}: required transport feature manifest_http never exercised"
             )),
             "{stderr}"
         );
     }
+}
+
+#[test]
+fn a_single_scenario_run_still_names_the_required_feature_it_could_not_exercise() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_transport-conformance"))
+        .args([
+            "run",
+            "--via",
+            "direct",
+            "--transport",
+            env!("CARGO_BIN_EXE_transport"),
+            "--scenario",
+            "manifest_http_upload",
+            "--require-features",
+            "manifest_http",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("required transport feature manifest_http never exercised"),
+        "{stderr}"
+    );
 }
