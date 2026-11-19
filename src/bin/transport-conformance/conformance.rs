@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +27,7 @@ const API_KEY: &str = "conformance-key";
 const RUN_ID: &str = "run-1";
 const RUN_ATTEMPT: &str = "1";
 const RUNNER_ID: &str = "runner-1";
+const MANIFEST_UPLOADS: &str = "/manifest_uploads";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Scenario {
@@ -37,6 +40,8 @@ pub struct Scenario {
     pub requires_hook_time: bool,
     #[serde(default)]
     pub no_keepalive_env: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_transport_features: Vec<String>,
     pub steps: Vec<Step>,
 }
 
@@ -67,6 +72,17 @@ pub enum Step {
     ExpectFragment {
         ids: Vec<String>,
     },
+    ReplyUploads {
+        replies: Vec<UploadReply>,
+    },
+    ExpectManifestUpload {
+        tree: bool,
+        token: String,
+        max_chunk_bytes: usize,
+    },
+    ExpectUploadRequests {
+        count: usize,
+    },
     ExpectReport {
         connection_retries: u64,
         #[serde(default)]
@@ -96,6 +112,15 @@ pub enum Step {
         #[serde(default)]
         code: Option<u16>,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UploadReply {
+    pub status: u16,
+    #[serde(default)]
+    pub body: Value,
+    #[serde(default)]
+    pub delay_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -144,6 +169,9 @@ fn scenarios() -> Result<Vec<Scenario>, Error> {
         include_str!("../../../conformance/scenarios/retries_after_rejected_connects.json"),
         include_str!("../../../conformance/scenarios/group_hook_time.json"),
         include_str!("../../../conformance/scenarios/unparseable_frame.json"),
+        include_str!("../../../conformance/scenarios/manifest_http_upload.json"),
+        include_str!("../../../conformance/scenarios/manifest_http_fallback.json"),
+        include_str!("../../../conformance/scenarios/manifest_http_stop.json"),
     ];
     RAW.iter()
         .map(|raw| serde_json::from_str(raw).map_err(Error::from))
@@ -425,6 +453,7 @@ async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
         hold_uploads: AtomicBool::new(false),
         upload_held: AtomicBool::new(false),
         upload_notify: Notify::new(),
+        upload_replies: Mutex::new(VecDeque::new()),
     });
     let logs = Arc::new(Mutex::new(String::new()));
     let mut command = client_command(trial)?;
@@ -454,6 +483,8 @@ async fn run_one(trial: &Trial<'_>) -> Result<Played, Error> {
         incoming: rx,
         current: None,
         fragments: Vec::new(),
+        manifest_uploads: Vec::new(),
+        features: None,
         child: Some(child),
         logs: Arc::clone(&logs),
         saw_connection: false,
@@ -520,6 +551,7 @@ struct CapturedHttp {
 enum Incoming {
     Socket(Box<Live>),
     Fragment(CapturedHttp),
+    ManifestUpload(CapturedHttp),
     Rejected(String),
     Failed(Error),
 }
@@ -529,6 +561,7 @@ struct Gate {
     hold_uploads: AtomicBool,
     upload_held: AtomicBool,
     upload_notify: Notify,
+    upload_replies: Mutex<VecDeque<UploadReply>>,
 }
 
 enum Played {
@@ -546,6 +579,8 @@ struct Player {
     incoming: tokio::sync::mpsc::UnboundedReceiver<Incoming>,
     current: Option<Live>,
     fragments: Vec<CapturedHttp>,
+    manifest_uploads: Vec<CapturedHttp>,
+    features: Option<String>,
     child: Option<Child>,
     logs: Arc<Mutex<String>>,
     saw_connection: bool,
@@ -571,6 +606,20 @@ impl Player {
             if advertised != "record" {
                 return Ok(Played::NotApplicable(format!(
                     "client advertises test_map={advertised}"
+                )));
+            }
+        }
+        if !scenario.requires_transport_features.is_empty() {
+            self.ensure_connection().await?;
+            let advertised = self.features.as_deref().unwrap_or("");
+            let offered: Vec<&str> = advertised.split(',').collect();
+            if !scenario
+                .requires_transport_features
+                .iter()
+                .all(|feature| offered.contains(&feature.as_str()))
+            {
+                return Ok(Played::NotApplicable(format!(
+                    "client advertises transport_features={advertised}"
                 )));
             }
         }
@@ -639,27 +688,40 @@ impl Player {
                 let frame = self.next_frame().await?;
                 expect_uncollected(&frame, id)
             }
-            Step::ExpectTerminating { signal } => {
-                let frame = self.next_frame().await?;
-                let got_type = frame.get("type").and_then(Value::as_str).unwrap_or("");
-                let got_signal = frame
-                    .pointer("/data/signal")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if got_type == "terminating" && got_signal == signal {
-                    Ok(())
-                } else {
-                    Err(Error::new(format!(
-                        "expected terminating {signal}, got {frame}"
-                    )))
-                }
-            }
+            Step::ExpectTerminating { signal } => self.expect_terminating(signal).await,
             Step::Drop => {
                 self.current = None;
                 Ok(())
             }
             Step::ExpectReconnect => self.expect_reconnect().await,
             Step::ExpectFragment { ids } => self.expect_fragment(ids).await,
+            Step::ReplyUploads { replies } => {
+                self.gate
+                    .upload_replies
+                    .lock()
+                    .expect("upload replies")
+                    .extend(replies.iter().cloned());
+                Ok(())
+            }
+            Step::ExpectManifestUpload {
+                tree,
+                token,
+                max_chunk_bytes,
+            } => {
+                self.expect_manifest_upload(*tree, token, *max_chunk_bytes)
+                    .await
+            }
+            Step::ExpectUploadRequests { count } => {
+                let seen = self.manifest_uploads.len();
+                self.manifest_uploads.clear();
+                if seen == *count {
+                    Ok(())
+                } else {
+                    Err(Error::new(format!(
+                        "expected {count} manifest upload requests, saw {seen}"
+                    )))
+                }
+            }
             Step::ExpectReport {
                 connection_retries,
                 hook_time,
@@ -688,6 +750,22 @@ impl Player {
             Step::ExpectOutput { text } => self.expect_output(text).await,
             Step::Busy { ms } => self.busy_for(*ms).await,
             Step::CloseSocket { code } => self.close_socket(*code).await,
+        }
+    }
+
+    async fn expect_terminating(&mut self, signal: &str) -> Result<(), Error> {
+        let frame = self.next_frame().await?;
+        let got_type = frame.get("type").and_then(Value::as_str).unwrap_or("");
+        let got_signal = frame
+            .pointer("/data/signal")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if got_type == "terminating" && got_signal == signal {
+            Ok(())
+        } else {
+            Err(Error::new(format!(
+                "expected terminating {signal}, got {frame}"
+            )))
         }
     }
 
@@ -843,6 +921,10 @@ impl Player {
                 self.fragments.push(fragment);
                 Ok(None)
             }
+            Event::Accepted(Some(Incoming::ManifestUpload(request))) => {
+                self.manifest_uploads.push(request);
+                Ok(None)
+            }
             Event::Accepted(Some(Incoming::Rejected(_))) => Err(Error::new(
                 "handshake was refused outside reject_connections",
             )),
@@ -893,6 +975,7 @@ impl Player {
             self.saw_connection = true;
             self.test_map = query_value(&socket.uri, "test_map");
             self.language = query_value(&socket.uri, "language");
+            self.features = query_value(&socket.uri, "transport_features");
         }
         self.connections += 1;
         self.current = Some(socket);
@@ -925,6 +1008,26 @@ impl Player {
             }
             let _ = tokio::time::timeout(remaining, self.gate.upload_notify.notified()).await;
         }
+    }
+
+    async fn expect_manifest_upload(
+        &mut self,
+        tree: bool,
+        token: &str,
+        max_chunk_bytes: usize,
+    ) -> Result<(), Error> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.manifest_uploads.iter().any(is_commit) && Instant::now() < deadline {
+            self.pump(deadline).await?;
+        }
+        let commit = self
+            .manifest_uploads
+            .iter()
+            .position(is_commit)
+            .ok_or_else(|| Error::new("missing manifest upload commit"))?;
+        let requests: Vec<CapturedHttp> = self.manifest_uploads.drain(..=commit).collect();
+        let frame = assemble_manifest_upload(&requests, token, max_chunk_bytes)?;
+        expect_manifest(&frame, tree, &self.fixtures.manifest_ids())
     }
 
     async fn expect_fragment(&mut self, ids: &[String]) -> Result<(), Error> {
@@ -1085,13 +1188,29 @@ async fn classify(mut stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, E
     let mut peeked = [0u8; 4];
     let n = stream.peek(&mut peeked).await.unwrap_or(0);
     if n >= 4 && &peeked == b"POST" {
+        let request = read_http_request(&mut stream).await?;
+        if request_path(&request).starts_with(MANIFEST_UPLOADS) {
+            let reply = gate
+                .upload_replies
+                .lock()
+                .expect("upload replies")
+                .pop_front()
+                .unwrap_or(UploadReply {
+                    status: 200,
+                    body: Value::Null,
+                    delay_ms: 0,
+                });
+            tokio::time::sleep(Duration::from_millis(reply.delay_ms)).await;
+            respond(&mut stream, reply.status, &reply.body).await?;
+            return Ok(Incoming::ManifestUpload(request));
+        }
         if gate.hold_uploads.load(Ordering::SeqCst) {
-            let _held = read_http_request(&mut stream).await?;
             gate.upload_held.store(true, Ordering::SeqCst);
             gate.upload_notify.notify_waiters();
             return std::future::pending().await;
         }
-        return Ok(Incoming::Fragment(read_http(stream).await?));
+        respond(&mut stream, 200, &Value::Null).await?;
+        return Ok(Incoming::Fragment(request));
     }
     let mut uri = String::new();
     let mut rejected = false;
@@ -1364,12 +1483,102 @@ fn query_value(uri: &str, key: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
-async fn read_http(mut stream: TcpStream) -> Result<CapturedHttp, Error> {
-    let captured = read_http_request(&mut stream).await?;
-    stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        .await?;
-    Ok(captured)
+async fn respond(stream: &mut TcpStream, status: u16, body: &Value) -> Result<(), Error> {
+    let body = if body.is_null() {
+        String::new()
+    } else {
+        body.to_string()
+    };
+    let response = format!(
+        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    Ok(())
+}
+
+fn request_path(request: &CapturedHttp) -> &str {
+    request
+        .header
+        .lines()
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .unwrap_or("")
+}
+
+fn is_commit(request: &CapturedHttp) -> bool {
+    request_path(request) == format!("{MANIFEST_UPLOADS}/commit")
+}
+
+fn header_value<'a>(request: &'a CapturedHttp, name: &str) -> Option<&'a str> {
+    request.header.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+fn assemble_manifest_upload(
+    requests: &[CapturedHttp],
+    token: &str,
+    max_chunk_bytes: usize,
+) -> Result<Value, Error> {
+    let (commit, chunks) = requests
+        .split_last()
+        .filter(|(commit, _)| is_commit(commit))
+        .ok_or_else(|| Error::new("manifest upload did not end with a commit"))?;
+    for request in requests {
+        if header_value(request, "authorization") != Some(API_KEY) {
+            return Err(Error::new(
+                "manifest upload authorization is not the suite key",
+            ));
+        }
+        if header_value(request, "x-selective-upload-token") != Some(token) {
+            return Err(Error::new(format!(
+                "manifest upload token is not {token:?}"
+            )));
+        }
+    }
+    if header_value(commit, "content-type") != Some("application/json") {
+        return Err(Error::new(
+            "manifest commit content-type is not application/json",
+        ));
+    }
+    let mut joined = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        if request_path(chunk) != format!("{MANIFEST_UPLOADS}/chunks/{index}") {
+            return Err(Error::new(format!(
+                "manifest chunk {index} was posted to {}",
+                request_path(chunk)
+            )));
+        }
+        if header_value(chunk, "content-type") != Some("application/octet-stream") {
+            return Err(Error::new(
+                "manifest chunk content-type is not application/octet-stream",
+            ));
+        }
+        let last = index + 1 == chunks.len();
+        if chunk.body.is_empty()
+            || chunk.body.len() > max_chunk_bytes
+            || (!last && chunk.body.len() != max_chunk_bytes)
+        {
+            return Err(Error::new(format!(
+                "manifest chunk {index} has {} bytes for a {max_chunk_bytes} byte limit",
+                chunk.body.len()
+            )));
+        }
+        joined.extend_from_slice(&chunk.body);
+    }
+    let declared: Value = serde_json::from_slice(&commit.body)?;
+    if declared != serde_json::json!({"chunks": chunks.len(), "bytes": joined.len()}) {
+        return Err(Error::new(format!("manifest commit body {declared}")));
+    }
+    let mut rest = joined.as_slice();
+    let mut text = String::new();
+    flate2::bufread::GzDecoder::new(&mut rest).read_to_string(&mut text)?;
+    if !rest.is_empty() {
+        return Err(Error::new("manifest chunks are more than one gzip stream"));
+    }
+    Ok(serde_json::from_str(&text)?)
 }
 
 async fn read_http_request(stream: &mut TcpStream) -> Result<CapturedHttp, Error> {
@@ -1416,6 +1625,120 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<CapturedHttp, Error
 mod tests {
     use super::*;
 
+    fn upload_request(path: &str, content_type: &str, token: &str, body: &[u8]) -> CapturedHttp {
+        CapturedHttp {
+            header: format!(
+                "POST {MANIFEST_UPLOADS}{path} HTTP/1.1\r\nauthorization: {API_KEY}\r\nx-selective-upload-token: {token}\r\ncontent-type: {content_type}"
+            ),
+            body: body.to_vec(),
+        }
+    }
+
+    fn upload_of(gzipped: &[u8], slice: usize, token: &str) -> Vec<CapturedHttp> {
+        let mut requests: Vec<CapturedHttp> = gzipped
+            .chunks(slice)
+            .enumerate()
+            .map(|(index, chunk)| {
+                upload_request(
+                    &format!("/chunks/{index}"),
+                    "application/octet-stream",
+                    token,
+                    chunk,
+                )
+            })
+            .collect();
+        let commit = serde_json::json!({"chunks": requests.len(), "bytes": gzipped.len()});
+        requests.push(upload_request(
+            "/commit",
+            "application/json",
+            token,
+            commit.to_string().as_bytes(),
+        ));
+        requests
+    }
+
+    fn gzipped_manifest() -> Vec<u8> {
+        let manifest = br#"{"type":"test_manifest","data":{"test_cases":[{"id":"a"}]}}"#;
+        transport::gzip_bytes(manifest).unwrap()
+    }
+
+    #[test]
+    fn a_well_formed_manifest_upload_is_reassembled() {
+        let gzipped = gzipped_manifest();
+        let requests = upload_of(&gzipped, 20, "tok");
+        assert!(requests.len() > 3);
+        let frame = assemble_manifest_upload(&requests, "tok", 20).unwrap();
+        assert_eq!(frame["type"], "test_manifest");
+    }
+
+    #[test]
+    fn a_malformed_manifest_upload_is_refused() {
+        let gzipped = gzipped_manifest();
+        let good = || upload_of(&gzipped, 20, "tok");
+        let refused = |requests: &[CapturedHttp], max: usize| {
+            assemble_manifest_upload(requests, "tok", max)
+                .unwrap_err()
+                .to_string()
+        };
+
+        assert!(refused(&good(), 19).contains("limit"));
+        assert!(refused(&good(), 40).contains("limit"));
+        assert!(refused(&good()[..good().len() - 1], 20).contains("commit"));
+        assert!(refused(&[], 20).contains("commit"));
+
+        let mut wrong_token = good();
+        wrong_token[1].header = wrong_token[1].header.replace("tok", "other");
+        assert!(refused(&wrong_token, 20).contains("token"));
+
+        let mut no_key = good();
+        no_key[0].header = no_key[0].header.replace(API_KEY, "nope");
+        assert!(refused(&no_key, 20).contains("authorization"));
+
+        let mut out_of_order = good();
+        out_of_order.swap(0, 1);
+        assert!(refused(&out_of_order, 20).contains("posted to"));
+
+        let mut bad_type = good();
+        bad_type[0].header = bad_type[0].header.replace("octet-stream", "gzip");
+        assert!(refused(&bad_type, 20).contains("content-type"));
+
+        let mut wrong_commit = good();
+        let last = wrong_commit.len() - 1;
+        wrong_commit[last].body = br#"{"chunks":1,"bytes":1}"#.to_vec();
+        assert!(refused(&wrong_commit, 20).contains("commit body"));
+
+        let mut oversize_last = good();
+        let commit = oversize_last.pop().unwrap();
+        let tail = oversize_last.pop().unwrap();
+        let before = oversize_last.last_mut().unwrap();
+        before.body.extend_from_slice(&tail.body);
+        let merged = oversize_last.len();
+        oversize_last.push(CapturedHttp {
+            body: serde_json::json!({"chunks": merged, "bytes": gzipped.len()})
+                .to_string()
+                .into_bytes(),
+            ..commit
+        });
+        assert!(refused(&oversize_last, 20).contains("limit"));
+
+        let twice = [gzipped.clone(), gzipped.clone()].concat();
+        assert!(refused(&upload_of(&twice, 20, "tok"), 20).contains("more than one gzip"));
+    }
+
+    #[test]
+    fn upload_requests_are_told_from_fragments_by_path() {
+        let commit = upload_request("/commit", "application/json", "t", b"{}");
+        assert!(is_commit(&commit));
+        let chunk = upload_request("/chunks/0", "application/octet-stream", "t", b"x");
+        assert!(!is_commit(&chunk));
+        assert!(request_path(&chunk).starts_with(MANIFEST_UPLOADS));
+        let fragment = CapturedHttp {
+            header: "POST /test_maps/fragments?run_id=1 HTTP/1.1".to_owned(),
+            body: Vec::new(),
+        };
+        assert!(!request_path(&fragment).starts_with(MANIFEST_UPLOADS));
+    }
+
     #[tokio::test]
     async fn a_broken_handshake_is_reported() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1425,6 +1748,7 @@ mod tests {
             hold_uploads: AtomicBool::new(false),
             upload_held: AtomicBool::new(false),
             upload_notify: Notify::new(),
+            upload_replies: Mutex::new(VecDeque::new()),
         });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let client = tokio::spawn(async move {
