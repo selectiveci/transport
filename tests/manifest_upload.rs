@@ -745,20 +745,13 @@ async fn collect_texts(socket: &mut Socket, quiet: Duration) -> Vec<String> {
     texts
 }
 
-fn commit_delayed(millis: u64) -> Script {
-    Arc::new(move |seen, _| {
-        let wait = if seen.path.ends_with("/commit") {
-            millis
-        } else {
-            0
-        };
-        (200, String::new(), wait)
-    })
+fn slow_first_chunk(millis: u64) -> Script {
+    Arc::new(move |_, index| (200, String::new(), if index == 0 { millis } else { 0 }))
 }
 
 #[tokio::test]
 async fn results_written_behind_an_upload_reach_the_socket_before_a_declined_move() {
-    let mut run = Run::start(commit_delayed(2500), &[]).await;
+    let mut run = Run::start(slow_first_chunk(2500), &[]).await;
     run.ask(&manifest_command("t1", 1_000_000)).await;
     run.write_line(&manifest_line("m")).await;
     run.write_line("r0").await;
@@ -769,9 +762,11 @@ async fn results_written_behind_an_upload_reach_the_socket_before_a_declined_mov
     run.socket.sink.send(Message::Close(None)).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     new.send(r#"{"command":"close","exit_status":1}"#).await;
-    let seen = collect_texts(&mut run.socket, Duration::from_secs(1)).await;
+    let declined = std::time::Instant::now();
+    let seen = collect_texts(&mut run.socket, Duration::from_millis(300)).await;
     assert_eq!(seen, ["r0", "r1", r#"{"type":"transport_moving"}"#]);
     run.expect_exit(1).await;
+    assert!(declined.elapsed() < Duration::from_secs(6));
     assert!(run
         .server
         .requests()
@@ -783,18 +778,20 @@ async fn results_written_behind_an_upload_reach_the_socket_before_a_declined_mov
 
 #[tokio::test]
 async fn a_websocket_that_dies_mid_upload_does_not_stop_the_upload_or_lose_the_results() {
-    let mut run = Run::start(commit_delayed(1000), &[]).await;
+    let mut run = Run::start(slow_first_chunk(1000), &[]).await;
     run.ask(&manifest_command("t1", 1_000_000)).await;
     run.write_line(&manifest_line("m")).await;
     run.write_line("r0").await;
     run.write_line("r1").await;
     run.wait_requests(1).await;
+    let killed = std::time::Instant::now();
     run.socket.sink.send(Message::Close(None)).await.unwrap();
-    let seen = collect_texts(&mut run.socket, Duration::from_secs(1)).await;
+    let seen = collect_texts(&mut run.socket, Duration::from_millis(300)).await;
     assert_eq!(seen, ["r0", "r1"]);
-    let requests = run.wait_requests(2).await;
+    let requests = run.wait_commit().await;
     assert!(requests[1].path.ends_with("/commit"));
     run.expect_exit(0).await;
+    assert!(killed.elapsed() < Duration::from_secs(5));
 }
 
 #[tokio::test]
