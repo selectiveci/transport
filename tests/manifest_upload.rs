@@ -135,6 +135,11 @@ async fn serve_http(mut stream: TcpStream, script: Script, log: Log) {
     };
     let (code, body, delay) = script(&seen, index);
     tokio::time::sleep(Duration::from_millis(delay)).await;
+    let body = if code == 200 && body.is_empty() {
+        r#"{"status":"applied"}"#.to_owned()
+    } else {
+        body
+    };
     let response = format!(
         "HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -239,6 +244,10 @@ impl Socket {
 
 impl Run {
     async fn start(script: Script, env: &[(&str, &str)]) -> Self {
+        Self::start_with_query(script, env, "api_key=suite-key&run_id=1").await
+    }
+
+    async fn start_with_query(script: Script, env: &[(&str, &str)], query: &str) -> Self {
         let mut server = Server::start(script).await;
         let binary = std::env::var("TRANSPORT_UNDER_TEST")
             .unwrap_or_else(|_| env!("CARGO_BIN_EXE_transport").to_owned());
@@ -247,10 +256,7 @@ impl Run {
             .arg("--stdio")
             .env(
                 "SELECTIVE_TRANSPORT_URL",
-                format!(
-                    "ws://{}/transport/websocket?api_key=suite-key&run_id=1",
-                    server.addr
-                ),
+                format!("ws://{}/transport/websocket?{query}", server.addr),
             )
             .env_remove("SELECTIVE_WS_PING_INTERVAL_MS")
             .env_remove("SELECTIVE_WS_PONG_TIMEOUT_MS")
@@ -556,4 +562,78 @@ async fn a_command_written_while_the_transport_winds_down_has_no_upload_block() 
     assert_eq!(run.read_line().await, without_upload(&command));
     let _ = run.socket.sink.send(Message::Close(None)).await;
     run.expect_exit(0).await;
+}
+
+#[tokio::test]
+async fn an_exit_during_a_resume_sends_a_held_manifest_on_the_old_socket() {
+    let mut run = Run::start(ok(), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    run.socket.send(RESUME).await;
+    assert_eq!(
+        run.socket.next_text().await,
+        r#"{"type":"transport_moving"}"#
+    );
+    let _new = run.server.next_socket().await;
+    let manifest = manifest_line("m");
+    run.write_line(&manifest).await;
+    run.write_line("exit").await;
+    assert_eq!(run.socket.next_text().await, manifest);
+    run.expect_exit(0).await;
+    assert!(run.server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_declined_move_sends_a_held_manifest_on_the_old_socket() {
+    let mut run = Run::start(ok(), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    run.socket.send(RESUME).await;
+    assert_eq!(
+        run.socket.next_text().await,
+        r#"{"type":"transport_moving"}"#
+    );
+    let mut new = run.server.next_socket().await;
+    let manifest = manifest_line("m");
+    run.write_line(&manifest).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    new.send(r#"{"command":"close","exit_status":1}"#).await;
+    assert_eq!(run.socket.next_text().await, manifest);
+    run.expect_exit(1).await;
+    assert!(run.server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_stalled_upload_falls_back_at_its_deadline_and_releases_the_held_lines() {
+    let mut run = Run::start(
+        delayed(200, 30_000),
+        &[("SELECTIVE_UPLOAD_DEADLINE_MS", "700")],
+    )
+    .await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    let manifest = manifest_line("m");
+    let started = std::time::Instant::now();
+    run.write_line(&manifest).await;
+    run.write_line("after").await;
+    assert_eq!(run.socket.next_text().await, manifest);
+    let waited = started.elapsed();
+    assert_eq!(run.socket.next_text().await, "after");
+    assert!(waited >= Duration::from_millis(600), "{waited:?}");
+    assert!(waited < Duration::from_secs(4), "{waited:?}");
+    assert_eq!(run.server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn manifest_http_is_advertised_only_when_there_is_an_api_key_to_upload_with() {
+    let with_key = Run::start(ok(), &[]).await;
+    assert!(
+        with_key.socket.uri.contains("manifest_http"),
+        "{}",
+        with_key.socket.uri
+    );
+    let without_key = Run::start_with_query(ok(), &[], "run_id=1").await;
+    assert!(without_key.socket.uri.contains("transport_features=resume"));
+    assert!(
+        !without_key.socket.uri.contains("manifest_http"),
+        "{}",
+        without_key.socket.uri
+    );
 }
