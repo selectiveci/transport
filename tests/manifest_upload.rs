@@ -508,3 +508,36 @@ async fn a_later_ask_without_a_block_goes_over_the_websocket() {
     assert_eq!(run.socket.next_text().await, manifest);
     assert!(run.server.requests().is_empty());
 }
+
+#[tokio::test]
+async fn a_fallback_line_is_not_uploaded_again_under_a_newer_ask() {
+    let mut run = Run::start(delayed(413, 600), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    let manifest = manifest_line("m");
+    run.write_line(&manifest).await;
+    run.wait_requests(1).await;
+    run.ask(&manifest_command("t2", 1_000_000)).await;
+    assert_eq!(run.socket.next_text().await, manifest);
+    let requests = run.server.requests();
+    assert!(
+        requests.iter().all(|seen| seen.token == "t1"),
+        "{requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_fallback_that_settles_mid_resume_goes_out_first_once_the_move_completes() {
+    let mut run = Run::start(delayed(413, 300), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    let manifest = manifest_line("m");
+    run.write_line(&manifest).await;
+    run.wait_requests(1).await;
+    run.write_line("after").await;
+    run.socket.send(RESUME).await;
+    let mut new = run.server.next_socket().await;
+    new.send(CONNECTED).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    new.send(RESUMED).await;
+    assert_eq!(new.next_text().await, manifest);
+    assert_eq!(new.next_text().await, "after");
+}
