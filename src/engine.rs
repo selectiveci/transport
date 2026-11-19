@@ -974,6 +974,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_stale_upload_outcome_does_not_settle_the_current_upload() {
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (resume_tx, _resume_rx) = mpsc::unbounded_channel();
+        let (upload_tx, _upload_rx) = mpsc::unbounded_channel();
+        let mut transport = Transport {
+            out: None,
+            writer: None,
+            resume_url: Url::parse("ws://127.0.0.1:1/transport/websocket").unwrap(),
+            current: None,
+            retired: HashMap::new(),
+            resuming: false,
+            exit_requested: false,
+            ended: HashSet::new(),
+            held: VecDeque::new(),
+            fallback: None,
+            next_id: 0,
+            events_tx,
+            resume_tx,
+            liveness: None,
+            upload_target: None,
+            armed: None,
+            uploading: Some(Upload {
+                id: 7,
+                task: tokio::spawn(std::future::pending()),
+                line: Arc::new("manifest".to_owned()),
+                next_ping: Instant::now(),
+            }),
+            winding: None,
+            upload_tx,
+            next_upload: 8,
+            upload_ping: Duration::from_secs(30),
+        };
+        assert_eq!(
+            transport.on_upload_finished(6, Outcome::Fallback).await,
+            None
+        );
+        assert!(transport.uploading.is_some());
+        assert!(transport.fallback.is_none());
+        transport.on_upload_finished(7, Outcome::Fallback).await;
+        assert!(transport.uploading.is_none());
+    }
+
     #[test]
     fn manifest_http_needs_an_api_key_in_the_url() {
         let features = |url: &str| features_param(&Url::parse(url).unwrap()).1;
