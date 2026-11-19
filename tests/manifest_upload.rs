@@ -457,16 +457,19 @@ async fn no_pings_are_sent_when_no_upload_is_running() {
 }
 
 #[tokio::test]
-async fn an_exit_written_mid_upload_waits_for_it_and_still_sends_the_fallback() {
-    let mut run = Run::start(delayed(413, 600), &[]).await;
+async fn an_exit_written_mid_upload_aborts_it_and_sends_the_manifest_over_the_websocket() {
+    let mut run = Run::start(delayed(413, 2000), &[]).await;
     run.ask(&manifest_command("t1", 1_000_000)).await;
     let manifest = manifest_line("m");
     run.write_line(&manifest).await;
+    run.wait_requests(1).await;
     run.write_line("after").await;
+    let started = std::time::Instant::now();
     run.write_line("exit").await;
     assert_eq!(run.socket.next_text().await, manifest);
     assert_eq!(run.socket.next_text().await, "after");
     run.expect_exit(0).await;
+    assert!(started.elapsed() < Duration::from_millis(1500));
 }
 
 #[tokio::test]
@@ -636,4 +639,81 @@ async fn manifest_http_is_advertised_only_when_there_is_an_api_key_to_upload_wit
         "{}",
         without_key.socket.uri
     );
+}
+
+#[tokio::test]
+async fn a_fallback_and_held_lines_survive_a_resume_whose_old_socket_closed_first() {
+    let mut run = Run::start(delayed(413, 700), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    let manifest = manifest_line("m");
+    run.write_line(&manifest).await;
+    run.wait_requests(1).await;
+    run.socket.send(RESUME).await;
+    let mut new = run.server.next_socket().await;
+    new.send(CONNECTED).await;
+    run.socket.sink.send(Message::Close(None)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    run.write_line("held-one").await;
+    run.write_line("held-two").await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    new.send(RESUMED).await;
+    assert_eq!(new.next_text().await, manifest);
+    assert_eq!(new.next_text().await, "held-one");
+    assert_eq!(new.next_text().await, "held-two");
+}
+
+#[tokio::test]
+async fn an_ask_that_arrives_on_a_retired_socket_still_lets_the_reply_upload() {
+    let mut run = Run::start(ok(), &[]).await;
+    run.socket.send(RESUME).await;
+    let mut new = run.server.next_socket().await;
+    new.send(CONNECTED).await;
+    new.send(RESUMED).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let command = manifest_command("late", 1_000_000);
+    run.socket.send(&command).await;
+    assert_eq!(run.read_line().await, without_upload(&command));
+    run.write_line(&manifest_line("m")).await;
+    let seen = run.wait_requests(2).await;
+    assert!(seen.iter().all(|request| request.token == "late"));
+}
+
+#[tokio::test]
+async fn an_unanswered_ask_leaves_its_block_for_a_late_reply() {
+    let mut run = Run::start(ok(), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    let notice = r#"{"command":"print_notice","message":"hi"}"#;
+    assert_eq!(run.ask(notice).await, notice);
+    run.write_line(&manifest_line("m")).await;
+    let seen = run.wait_requests(2).await;
+    assert!(seen.iter().all(|request| request.token == "t1"));
+}
+
+#[tokio::test]
+async fn a_reply_ending_in_a_carriage_return_still_uploads() {
+    let mut run = Run::start(ok(), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    let manifest = manifest_line("m");
+    run.write_line(&format!("{manifest}\r")).await;
+    let seen = run.wait_requests(2).await;
+    assert_eq!(reassemble(&seen), manifest);
+}
+
+#[tokio::test]
+async fn an_exit_with_an_upload_in_flight_and_no_connection_sends_the_manifest_on_the_new_one() {
+    let mut run = Run::start(delayed(200, 30_000), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    let manifest = manifest_line("m");
+    run.write_line(&manifest).await;
+    run.wait_requests(1).await;
+    run.socket.send(RESUME).await;
+    let mut new = run.server.next_socket().await;
+    new.send(CONNECTED).await;
+    run.socket.sink.send(Message::Close(None)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    run.write_line("exit").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    new.send(RESUMED).await;
+    assert_eq!(new.next_text().await, manifest);
+    run.expect_exit(0).await;
 }
