@@ -99,6 +99,7 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
         exit_requested: false,
         ended: HashSet::new(),
         held: VecDeque::new(),
+        fallback: None,
         next_id: 0,
         events_tx,
         resume_tx,
@@ -166,6 +167,7 @@ struct Transport {
     // Connections whose reader has reported their end.
     ended: HashSet<u64>,
     held: VecDeque<Message>,
+    fallback: Option<Message>,
     next_id: u64,
     events_tx: mpsc::UnboundedSender<ServerEvent>,
     resume_tx: mpsc::UnboundedSender<Option<Resumed>>,
@@ -337,6 +339,15 @@ impl Transport {
 
     // Best effort: a connection that has gone is reported by its reader.
     async fn send_held(&mut self) {
+        if let Some(message) = self.fallback.take() {
+            let Some((_, sink)) = self.current.as_mut() else {
+                self.fallback = Some(message);
+                return;
+            };
+            if sink.send(message).await.is_err() {
+                return;
+            }
+        }
         while self.uploading.is_none() {
             let Some(message) = self.held.pop_front() else {
                 return;
@@ -388,9 +399,14 @@ impl Transport {
     async fn on_upload_finished(&mut self, outcome: Outcome, line: String) -> Option<i32> {
         self.uploading = None;
         if outcome == Outcome::Fallback {
-            self.held.push_front(Message::text(line));
+            self.fallback = Some(Message::text(line));
         }
         if !self.resuming {
+            if let Some(message) = self.fallback.take() {
+                if let Some(code) = self.send(message).await {
+                    return Some(code);
+                }
+            }
             self.send_held().await;
             if self.exit_requested && self.uploading.is_none() {
                 self.close_current().await;
