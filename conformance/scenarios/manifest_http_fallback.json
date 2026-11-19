@@ -11,7 +11,8 @@
           "status": 413,
           "body": {
             "error": "chunk_too_large"
-          }
+          },
+          "delay_ms": 300
         }
       ]
     },

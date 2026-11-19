@@ -711,17 +711,7 @@ impl Player {
                 self.expect_manifest_upload(*tree, token, *max_chunk_bytes)
                     .await
             }
-            Step::ExpectUploadRequests { count } => {
-                let seen = self.manifest_uploads.len();
-                self.manifest_uploads.clear();
-                if seen == *count {
-                    Ok(())
-                } else {
-                    Err(Error::new(format!(
-                        "expected {count} manifest upload requests, saw {seen}"
-                    )))
-                }
-            }
+            Step::ExpectUploadRequests { count } => self.expect_upload_requests(*count).await,
             Step::ExpectReport {
                 connection_retries,
                 hook_time,
@@ -1007,6 +997,26 @@ impl Player {
                 return Err(Error::new("timed out waiting for the stalled upload"));
             }
             let _ = tokio::time::timeout(remaining, self.gate.upload_notify.notified()).await;
+        }
+    }
+
+    async fn expect_upload_requests(&mut self, count: usize) -> Result<(), Error> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.manifest_uploads.len() < count && Instant::now() < deadline {
+            if let Some(frame) = self.pump(deadline).await? {
+                return Err(Error::new(format!(
+                    "frame while waiting for upload requests: {frame}"
+                )));
+            }
+        }
+        let seen = self.manifest_uploads.len();
+        self.manifest_uploads.clear();
+        if seen == count {
+            Ok(())
+        } else {
+            Err(Error::new(format!(
+                "expected {count} manifest upload requests, saw {seen}"
+            )))
         }
     }
 

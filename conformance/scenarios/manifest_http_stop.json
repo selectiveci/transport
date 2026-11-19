@@ -11,7 +11,8 @@
           "status": 410,
           "body": {
             "error": "not_asked"
-          }
+          },
+          "delay_ms": 900
         }
       ]
     },
@@ -35,12 +36,12 @@
       }
     },
     {
-      "op": "expect_no_frame",
-      "ms": 700
-    },
-    {
       "op": "expect_upload_requests",
       "count": 1
+    },
+    {
+      "op": "expect_no_frame",
+      "ms": 500
     },
     {
       "op": "send",
