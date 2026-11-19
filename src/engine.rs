@@ -36,6 +36,7 @@ struct Resumed {
 }
 
 struct Upload {
+    id: u64,
     task: JoinHandle<()>,
     line: Arc<String>,
     next_ping: Instant,
@@ -91,7 +92,7 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ServerEvent>();
     let (resume_tx, mut resume_rx) = mpsc::unbounded_channel::<Option<Resumed>>();
-    let (upload_tx, mut upload_rx) = mpsc::unbounded_channel::<Outcome>();
+    let (upload_tx, mut upload_rx) = mpsc::unbounded_channel::<(u64, Outcome)>();
 
     let mut transport = Transport {
         out: Some(out_tx),
@@ -113,6 +114,7 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
         uploading: None,
         winding: None,
         upload_tx,
+        next_upload: 0,
         upload_ping: upload_ping_interval(),
     };
     transport.adopt(socket);
@@ -121,7 +123,7 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
         let stop = tokio::select! {
             Some((id, message)) = events_rx.recv() => transport.on_server_event(id, message).await,
             Some(resumed) = resume_rx.recv() => transport.on_resume_finished(resumed).await,
-            Some(outcome) = upload_rx.recv() => transport.on_upload_finished(outcome).await,
+            Some((id, outcome)) = upload_rx.recv() => transport.on_upload_finished(id, outcome).await,
             () = sleep_until_some(transport.upload_ping_due()) => transport.upload_ping().await,
             () = sleep_until_some(transport.winding.map(|(_, at)| at)) => transport.grace_ended().await,
             () = sleep_until_some(transport.ping_due()) => transport.ping().await,
@@ -182,7 +184,8 @@ struct Transport {
     armed: Option<UploadBlock>,
     uploading: Option<Upload>,
     winding: Option<(i32, Instant)>,
-    upload_tx: mpsc::UnboundedSender<Outcome>,
+    upload_tx: mpsc::UnboundedSender<(u64, Outcome)>,
+    next_upload: u64,
     upload_ping: Duration,
 }
 
@@ -343,9 +346,7 @@ impl Transport {
 
     async fn on_pipe_item(&mut self, item: Option<PipeItem>) -> Option<i32> {
         match item {
-            Some(PipeItem::Line(message))
-                if self.resuming || !self.held.is_empty() || self.must_wait(&message) =>
-            {
+            Some(PipeItem::Line(message)) if self.resuming => {
                 self.held.push_back(message);
                 None
             }
@@ -382,10 +383,6 @@ impl Transport {
             }
         }
         while let Some(message) = self.held.pop_front() {
-            if self.must_wait(&message) {
-                self.held.push_front(message);
-                return;
-            }
             let Err(message) = self.start_upload(message) else {
                 continue;
             };
@@ -405,15 +402,17 @@ impl Transport {
         let Some((forwarded, block)) = intercept(&text) else {
             return text;
         };
+        if block.is_some() {
+            self.supersede_upload();
+        }
         self.armed = block;
         forwarded
     }
 
-    fn must_wait(&self, message: &Message) -> bool {
-        let Message::Text(line) = message else {
-            return false;
-        };
-        self.uploading.is_some() && self.armed.is_some() && is_manifest_line(line)
+    fn supersede_upload(&mut self) {
+        if let Some(upload) = self.uploading.take() {
+            upload.task.abort();
+        }
     }
 
     fn start_upload(&mut self, message: Message) -> Result<(), Message> {
@@ -426,14 +425,17 @@ impl Transport {
         let (Some(target), Some(block)) = (self.upload_target.clone(), self.armed.take()) else {
             return Err(Message::Text(line));
         };
+        let id = self.next_upload;
+        self.next_upload += 1;
         let line = Arc::new(line);
         let done = self.upload_tx.clone();
         let sent = Arc::clone(&line);
         let task = tokio::spawn(async move {
             let outcome = guarded(upload(&target, &block, &sent, upload_policy())).await;
-            let _ = done.send(outcome);
+            let _ = done.send((id, outcome));
         });
         self.uploading = Some(Upload {
+            id,
             task,
             line,
             next_ping: Instant::now() + self.upload_ping,
@@ -448,7 +450,10 @@ impl Transport {
         }
     }
 
-    async fn on_upload_finished(&mut self, outcome: Outcome) -> Option<i32> {
+    async fn on_upload_finished(&mut self, id: u64, outcome: Outcome) -> Option<i32> {
+        if self.uploading.as_ref().map(|upload| upload.id) != Some(id) {
+            return None;
+        }
         let upload = self.uploading.take()?;
         if outcome == Outcome::Fallback {
             self.fallback = Some(upload.into_message());

@@ -492,7 +492,7 @@ async fn an_exit_written_mid_upload_aborts_it_and_sends_the_manifest_over_the_we
 }
 
 #[tokio::test]
-async fn a_second_manifest_line_written_mid_upload_is_uploaded_with_its_own_token() {
+async fn a_new_ask_supersedes_the_running_upload_and_the_next_manifest_uploads_under_its_token() {
     let mut run = Run::start(delayed(200, 500), &[]).await;
     run.ask(&manifest_command("t1", 1_000_000)).await;
     let first = manifest_line("first");
@@ -501,11 +501,12 @@ async fn a_second_manifest_line_written_mid_upload_is_uploaded_with_its_own_toke
     run.ask(&manifest_command("t2", 1_000_000)).await;
     let second = manifest_line("second");
     run.write_line(&second).await;
-    let requests = run.wait_requests(4).await;
+    run.wait_requests(3).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let requests = run.server.requests();
     let tokens: Vec<&str> = requests.iter().map(|seen| seen.token.as_str()).collect();
-    assert_eq!(tokens, ["t1", "t1", "t2", "t2"]);
-    assert_eq!(reassemble(&requests[..2]), first);
-    assert_eq!(reassemble(&requests[2..]), second);
+    assert_eq!(tokens, ["t1", "t2", "t2"]);
+    assert_eq!(reassemble(&requests[1..]), second);
     run.socket.expect_quiet().await;
 }
 
@@ -538,19 +539,50 @@ async fn a_later_ask_without_a_block_goes_over_the_websocket() {
 }
 
 #[tokio::test]
-async fn a_fallback_line_is_not_uploaded_again_under_a_newer_ask() {
+async fn a_newer_ask_drops_the_running_upload_instead_of_falling_back() {
     let mut run = Run::start(delayed(413, 600), &[]).await;
     run.ask(&manifest_command("t1", 1_000_000)).await;
     let manifest = manifest_line("m");
     run.write_line(&manifest).await;
     run.wait_requests(1).await;
     run.ask(&manifest_command("t2", 1_000_000)).await;
-    assert_eq!(run.socket.next_text().await, manifest);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    run.socket.expect_quiet().await;
     let requests = run.server.requests();
-    assert!(
-        requests.iter().all(|seen| seen.token == "t1"),
-        "{requests:?}"
-    );
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].token, "t1");
+}
+
+#[tokio::test]
+async fn an_ask_without_a_block_leaves_the_running_upload_alone() {
+    let mut run = Run::start(delayed(200, 300), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    let manifest = manifest_line("m");
+    run.write_line(&manifest).await;
+    run.wait_requests(1).await;
+    run.ask(r#"{"command":"test_manifest"}"#).await;
+    let requests = run.wait_commit().await;
+    assert!(requests.iter().all(|seen| seen.token == "t1"));
+    assert_eq!(reassemble(&requests), manifest);
+}
+
+#[tokio::test]
+async fn a_second_ask_mid_upload_keeps_the_manifest_and_later_lines_when_the_websocket_dies() {
+    let mut run = Run::start(slow_first_chunk(1500), &[]).await;
+    run.ask(&manifest_command("t1", 1_000_000)).await;
+    run.write_line(&manifest_line("first")).await;
+    run.wait_requests(1).await;
+    run.ask(&manifest_command("t2", 1_000_000)).await;
+    let second = manifest_line("second");
+    run.write_line(&second).await;
+    run.write_line("r9").await;
+    assert_eq!(run.socket.next_text().await, "r9");
+    run.socket.sink.send(Message::Close(None)).await.unwrap();
+    let requests = run.wait_commit().await;
+    let tokens: Vec<&str> = requests.iter().map(|seen| seen.token.as_str()).collect();
+    assert_eq!(tokens, ["t1", "t2", "t2"]);
+    assert_eq!(reassemble(&requests[1..]), second);
+    run.expect_exit(0).await;
 }
 
 #[tokio::test]
