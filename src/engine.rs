@@ -1,8 +1,9 @@
 use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::process::exit;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,6 +30,12 @@ type Headers = Vec<(String, String)>;
 
 // A new connection the server has confirmed, and the headers of any further
 // move it asked for before confirming.
+struct Upload {
+    task: JoinHandle<()>,
+    line: Arc<String>,
+    next_ping: Instant,
+}
+
 struct Resumed {
     socket: Socket,
     again: Option<Headers>,
@@ -83,7 +90,7 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ServerEvent>();
     let (resume_tx, mut resume_rx) = mpsc::unbounded_channel::<Option<Resumed>>();
-    let (upload_tx, mut upload_rx) = mpsc::unbounded_channel::<(Outcome, String)>();
+    let (upload_tx, mut upload_rx) = mpsc::unbounded_channel::<Outcome>();
 
     let mut transport = Transport {
         out: Some(out_tx),
@@ -112,7 +119,7 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
         let stop = tokio::select! {
             Some((id, message)) = events_rx.recv() => transport.on_server_event(id, message).await,
             Some(resumed) = resume_rx.recv() => transport.on_resume_finished(resumed).await,
-            Some((outcome, line)) = upload_rx.recv() => transport.on_upload_finished(outcome, line).await,
+            Some(outcome) = upload_rx.recv() => transport.on_upload_finished(outcome).await,
             () = sleep_until_some(transport.upload_ping_due()) => transport.upload_ping().await,
             () = sleep_until_some(transport.ping_due()) => transport.ping().await,
             () = sleep_until_some(transport.liveness_deadline()) => transport.check_liveness().await,
@@ -170,8 +177,8 @@ struct Transport {
     liveness: Option<Liveness>,
     upload_target: Option<Target>,
     armed: Option<UploadBlock>,
-    uploading: Option<Instant>,
-    upload_tx: mpsc::UnboundedSender<(Outcome, String)>,
+    uploading: Option<Upload>,
+    upload_tx: mpsc::UnboundedSender<Outcome>,
     upload_ping: Duration,
 }
 
@@ -207,7 +214,7 @@ impl Transport {
                     return None;
                 }
 
-                let text = self.rewrite_command(text, Some(id) == self.current_id());
+                let text = self.rewrite_command(text);
                 self.write_line(text.into_bytes());
                 None
             }
@@ -320,13 +327,12 @@ impl Transport {
             // The client stops the transport a few seconds after asking, so an
             // exit doesn't wait for a resume: what's held goes out on the
             // connection still open.
-            Some(PipeItem::Exit) | None
-                if (self.resuming && self.current.is_none()) || self.uploading.is_some() =>
-            {
-                self.exit_requested = true;
-                None
-            }
             Some(PipeItem::Exit) | None => {
+                self.abort_upload();
+                if self.resuming && self.current.is_none() {
+                    self.exit_requested = true;
+                    return None;
+                }
                 self.armed = None;
                 self.send_held().await;
                 self.close_current().await;
@@ -362,16 +368,14 @@ impl Transport {
         }
     }
 
-    fn rewrite_command(&mut self, text: String, current: bool) -> String {
-        if current && is_command(&text, MANIFEST_COMMAND) {
+    fn rewrite_command(&mut self, text: String) -> String {
+        if is_command(&text, MANIFEST_COMMAND) {
             self.armed = None;
         }
         let Some((forwarded, block)) = intercept(&text) else {
             return text;
         };
-        if current {
-            self.armed = block;
-        }
+        self.armed = block;
         forwarded
     }
 
@@ -385,22 +389,32 @@ impl Transport {
         let (Some(target), Some(block)) = (self.upload_target.clone(), self.armed.take()) else {
             return Err(Message::Text(line));
         };
-        self.uploading = Some(Instant::now() + self.upload_ping);
+        let line = Arc::new(line);
         let done = self.upload_tx.clone();
-        tokio::spawn(async move {
-            let work = tokio::spawn({
-                let line = line.clone();
-                async move { upload(&target, &block, &line, upload_policy()).await }
-            });
-            let _ = done.send((settled(work).await, line));
+        let sent = Arc::clone(&line);
+        let task = tokio::spawn(async move {
+            let outcome = guarded(upload(&target, &block, &sent, upload_policy())).await;
+            let _ = done.send(outcome);
+        });
+        self.uploading = Some(Upload {
+            task,
+            line,
+            next_ping: Instant::now() + self.upload_ping,
         });
         Ok(())
     }
 
-    async fn on_upload_finished(&mut self, outcome: Outcome, line: String) -> Option<i32> {
-        self.uploading = None;
+    fn abort_upload(&mut self) {
+        if let Some(upload) = self.uploading.take() {
+            upload.task.abort();
+            self.fallback = Some(upload.into_message());
+        }
+    }
+
+    async fn on_upload_finished(&mut self, outcome: Outcome) -> Option<i32> {
+        let upload = self.uploading.take()?;
         if outcome == Outcome::Fallback {
-            self.fallback = Some(Message::text(line));
+            self.fallback = Some(upload.into_message());
         }
         if !self.resuming {
             if let Some(message) = self.fallback.take() {
@@ -409,21 +423,21 @@ impl Transport {
                 }
             }
             self.send_held().await;
-            if self.exit_requested && self.uploading.is_none() {
-                self.close_current().await;
-                exit(0);
-            }
         }
         None
     }
 
     fn upload_ping_due(&self) -> Option<Instant> {
         self.uploading
+            .as_ref()
+            .map(|upload| upload.next_ping)
             .filter(|_| self.current.is_some() && !self.resuming)
     }
 
     async fn upload_ping(&mut self) -> Option<i32> {
-        self.uploading = Some(Instant::now() + self.upload_ping);
+        if let Some(upload) = self.uploading.as_mut() {
+            upload.next_ping = Instant::now() + self.upload_ping;
+        }
         self.send(Message::Ping(b"selective".to_vec())).await
     }
 
@@ -736,8 +750,17 @@ fn upload_policy() -> Policy {
     }
 }
 
-async fn settled(work: JoinHandle<Outcome>) -> Outcome {
-    work.await.unwrap_or(Outcome::Fallback)
+async fn guarded(work: impl Future<Output = Outcome>) -> Outcome {
+    AssertUnwindSafe(work)
+        .catch_unwind()
+        .await
+        .unwrap_or(Outcome::Fallback)
+}
+
+impl Upload {
+    fn into_message(self) -> Message {
+        Message::text(Arc::try_unwrap(self.line).unwrap_or_else(|shared| (*shared).clone()))
+    }
 }
 
 fn upload_ping_interval() -> Duration {
@@ -900,10 +923,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_panicking_upload_task_settles_as_a_fallback() {
-        let work: JoinHandle<Outcome> = tokio::spawn(async { panic!("upload task panics") });
-        assert_eq!(settled(work).await, Outcome::Fallback);
-        let work = tokio::spawn(async { Outcome::Delivered });
-        assert_eq!(settled(work).await, Outcome::Delivered);
+        fn explode() -> Outcome {
+            panic!("upload task panics")
+        }
+        assert_eq!(guarded(async { explode() }).await, Outcome::Fallback);
+        assert_eq!(
+            guarded(async { Outcome::Delivered }).await,
+            Outcome::Delivered
+        );
     }
 
     #[test]
