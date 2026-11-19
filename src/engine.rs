@@ -16,6 +16,9 @@ use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Request};
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
 };
+use transport::manifest_upload::{
+    intercept, is_manifest_line, upload, Outcome, Policy, Target, UploadBlock,
+};
 use transport::Keepalive;
 use url::Url;
 
@@ -32,7 +35,7 @@ struct Resumed {
 }
 
 // Tells the server this transport can move its own connection when asked to.
-const FEATURES_PARAM: (&str, &str) = ("transport_features", "resume");
+const FEATURES_PARAM: (&str, &str) = ("transport_features", "resume,manifest_http");
 
 // Sent by a server that wants this runner on a new connection. The client only
 // reads the pipe between tests, so the transport moves the connection itself.
@@ -49,6 +52,8 @@ const RESUMED_TIMEOUT: Duration = Duration::from_secs(15);
 const RESUME_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const RESUME_MAX_BACKOFF: Duration = Duration::from_secs(4);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const UPLOAD_PING_INTERVAL: Duration = Duration::from_secs(30);
+const MANIFEST_COMMAND: &str = "test_manifest";
 // The server closes a replaced connection once it has drained it; this is the backstop.
 const RETIRED_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -82,6 +87,7 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ServerEvent>();
     let (resume_tx, mut resume_rx) = mpsc::unbounded_channel::<Option<Resumed>>();
+    let (upload_tx, mut upload_rx) = mpsc::unbounded_channel::<(Outcome, String)>();
 
     let mut transport = Transport {
         out: Some(out_tx),
@@ -97,6 +103,11 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
         events_tx,
         resume_tx,
         liveness: keepalive.map(Liveness::new),
+        upload_target: Target::from_ws_url(url),
+        armed: None,
+        uploading: None,
+        upload_tx,
+        upload_ping: upload_ping_interval(),
     };
     transport.adopt(socket);
 
@@ -104,6 +115,8 @@ async fn drive<W: AsyncWrite + Unpin + Send + 'static>(
         let stop = tokio::select! {
             Some((id, message)) = events_rx.recv() => transport.on_server_event(id, message).await,
             Some(resumed) = resume_rx.recv() => transport.on_resume_finished(resumed).await,
+            Some((outcome, line)) = upload_rx.recv() => transport.on_upload_finished(outcome, line).await,
+            () = sleep_until_some(transport.upload_ping_due()) => transport.upload_ping().await,
             () = sleep_until_some(transport.ping_due()) => transport.ping().await,
             () = sleep_until_some(transport.liveness_deadline()) => transport.check_liveness().await,
             item = pipe_rx.recv(), if !transport.exit_requested => {
@@ -157,6 +170,11 @@ struct Transport {
     events_tx: mpsc::UnboundedSender<ServerEvent>,
     resume_tx: mpsc::UnboundedSender<Option<Resumed>>,
     liveness: Option<Liveness>,
+    upload_target: Option<Target>,
+    armed: Option<UploadBlock>,
+    uploading: Option<Instant>,
+    upload_tx: mpsc::UnboundedSender<(Outcome, String)>,
+    upload_ping: Duration,
 }
 
 impl Transport {
@@ -191,6 +209,7 @@ impl Transport {
                     return None;
                 }
 
+                let text = self.rewrite_command(text, Some(id) == self.current_id());
                 self.write_line(text.into_bytes());
                 None
             }
@@ -278,7 +297,7 @@ impl Transport {
 
         self.send_held().await;
 
-        if self.exit_requested {
+        if self.exit_requested && self.uploading.is_none() {
             self.close_current().await;
             exit(0);
         }
@@ -291,15 +310,20 @@ impl Transport {
 
     async fn on_pipe_item(&mut self, item: Option<PipeItem>) -> Option<i32> {
         match item {
-            Some(PipeItem::Line(message)) if self.resuming => {
+            Some(PipeItem::Line(message)) if self.resuming || self.uploading.is_some() => {
                 self.held.push_back(message);
                 None
             }
-            Some(PipeItem::Line(message)) => self.send(message).await,
+            Some(PipeItem::Line(message)) => match self.start_upload(message) {
+                Ok(()) => None,
+                Err(message) => self.send(message).await,
+            },
             // The client stops the transport a few seconds after asking, so an
             // exit doesn't wait for a resume: what's held goes out on the
             // connection still open.
-            Some(PipeItem::Exit) | None if self.resuming && self.current.is_none() => {
+            Some(PipeItem::Exit) | None
+                if (self.resuming && self.current.is_none()) || self.uploading.is_some() =>
+            {
                 self.exit_requested = true;
                 None
             }
@@ -313,7 +337,13 @@ impl Transport {
 
     // Best effort: a connection that has gone is reported by its reader.
     async fn send_held(&mut self) {
-        while let Some(message) = self.held.pop_front() {
+        while self.uploading.is_none() {
+            let Some(message) = self.held.pop_front() else {
+                return;
+            };
+            let Err(message) = self.start_upload(message) else {
+                continue;
+            };
             let Some((_, sink)) = self.current.as_mut() else {
                 return;
             };
@@ -321,6 +351,63 @@ impl Transport {
                 return;
             }
         }
+    }
+
+    fn rewrite_command(&mut self, text: String, current: bool) -> String {
+        if current && is_command(&text, MANIFEST_COMMAND) {
+            self.armed = None;
+        }
+        let Some((forwarded, block)) = intercept(&text) else {
+            return text;
+        };
+        if current {
+            self.armed = block;
+        }
+        forwarded
+    }
+
+    fn start_upload(&mut self, message: Message) -> Result<(), Message> {
+        let Message::Text(line) = message else {
+            return Err(message);
+        };
+        if self.armed.is_none() || !is_manifest_line(&line) {
+            return Err(Message::Text(line));
+        }
+        let (Some(target), Some(block)) = (self.upload_target.clone(), self.armed.take()) else {
+            return Err(Message::Text(line));
+        };
+        self.uploading = Some(Instant::now() + self.upload_ping);
+        let done = self.upload_tx.clone();
+        tokio::spawn(async move {
+            let outcome = upload(&target, &block, &line, Policy::default()).await;
+            let _ = done.send((outcome, line));
+        });
+        Ok(())
+    }
+
+    async fn on_upload_finished(&mut self, outcome: Outcome, line: String) -> Option<i32> {
+        self.uploading = None;
+        if outcome == Outcome::Fallback {
+            self.held.push_front(Message::text(line));
+        }
+        if !self.resuming {
+            self.send_held().await;
+            if self.exit_requested && self.uploading.is_none() {
+                self.close_current().await;
+                exit(0);
+            }
+        }
+        None
+    }
+
+    fn upload_ping_due(&self) -> Option<Instant> {
+        self.uploading
+            .filter(|_| self.current.is_some() && !self.resuming)
+    }
+
+    async fn upload_ping(&mut self) -> Option<i32> {
+        self.uploading = Some(Instant::now() + self.upload_ping);
+        self.send(Message::Ping(b"selective".to_vec())).await
     }
 
     async fn send(&mut self, message: Message) -> Option<i32> {
@@ -394,6 +481,7 @@ impl Transport {
             match timeout_at(deadline, events.recv()).await {
                 Ok(Some((id, Some(Message::Text(text))))) if open.contains(&id) => {
                     if resume_headers(&text).is_none() {
+                        let text = intercept(&text).map_or(text, |(forwarded, _)| forwarded);
                         self.write_line(text.into_bytes());
                     }
                 }
@@ -608,6 +696,14 @@ fn with_params(url: &Url, params: &[(&str, &str)]) -> Url {
         .extend_pairs(kept)
         .extend_pairs(params.iter().copied());
     url
+}
+
+fn upload_ping_interval() -> Duration {
+    std::env::var("SELECTIVE_UPLOAD_PING_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|millis| *millis > 0)
+        .map_or(UPLOAD_PING_INTERVAL, Duration::from_millis)
 }
 
 fn parse_command(text: &str) -> Option<Value> {
