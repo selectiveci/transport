@@ -17,7 +17,7 @@ use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
 };
 use transport::manifest_upload::{
-    intercept, is_manifest_line, upload, Outcome, Policy, Target, UploadBlock,
+    intercept, is_manifest_line, upload, Outcome, Policy, Target, UploadBlock, MANIFEST_COMMAND,
 };
 use transport::Keepalive;
 use url::Url;
@@ -33,9 +33,6 @@ struct Resumed {
     socket: Socket,
     again: Option<Headers>,
 }
-
-// Tells the server this transport can move its own connection when asked to.
-const FEATURES_PARAM: (&str, &str) = ("transport_features", "resume,manifest_http");
 
 // Sent by a server that wants this runner on a new connection. The client only
 // reads the pipe between tests, so the transport moves the connection itself.
@@ -53,7 +50,6 @@ const RESUME_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const RESUME_MAX_BACKOFF: Duration = Duration::from_secs(4);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const UPLOAD_PING_INTERVAL: Duration = Duration::from_secs(30);
-const MANIFEST_COMMAND: &str = "test_manifest";
 // The server closes a replaced connection once it has drained it; this is the backstop.
 const RETIRED_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -61,7 +57,7 @@ pub async fn run_stdio(keepalive: Option<Keepalive>) -> i32 {
     let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel::<PipeItem>();
     tokio::spawn(read_lines(tokio::io::stdin(), pipe_tx));
     let url = match stdio_url(&mut pipe_rx).await {
-        Ok(url) => with_params(&url, &[FEATURES_PARAM]),
+        Ok(url) => with_params(&url, &[features_param(&url)]),
         Err(message) => {
             eprintln!("{message}");
             exit(1);
@@ -280,6 +276,7 @@ impl Transport {
         // old connection could lose results. The client reconnects in full.
         let Some(Resumed { socket, again }) = resumed else {
             eprintln!("Failed to move to a new connection. Exiting...");
+            self.armed = None;
             self.send_held().await;
             if self.exit_requested {
                 self.close_current().await;
@@ -330,6 +327,7 @@ impl Transport {
                 None
             }
             Some(PipeItem::Exit) | None => {
+                self.armed = None;
                 self.send_held().await;
                 self.close_current().await;
                 exit(0);
@@ -390,8 +388,11 @@ impl Transport {
         self.uploading = Some(Instant::now() + self.upload_ping);
         let done = self.upload_tx.clone();
         tokio::spawn(async move {
-            let outcome = upload(&target, &block, &line, Policy::default()).await;
-            let _ = done.send((outcome, line));
+            let work = tokio::spawn({
+                let line = line.clone();
+                async move { upload(&target, &block, &line, upload_policy()).await }
+            });
+            let _ = done.send((settled(work).await, line));
         });
         Ok(())
     }
@@ -714,6 +715,31 @@ fn with_params(url: &Url, params: &[(&str, &str)]) -> Url {
     url
 }
 
+fn features_param(url: &Url) -> (&'static str, &'static str) {
+    let features = if Target::from_ws_url(url).is_some() {
+        "resume,manifest_http"
+    } else {
+        "resume"
+    };
+    ("transport_features", features)
+}
+
+fn upload_policy() -> Policy {
+    let deadline = std::env::var("SELECTIVE_UPLOAD_DEADLINE_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|millis| *millis > 0)
+        .map_or(Policy::default().deadline, Duration::from_millis);
+    Policy {
+        deadline,
+        ..Policy::default()
+    }
+}
+
+async fn settled(work: JoinHandle<Outcome>) -> Outcome {
+    work.await.unwrap_or(Outcome::Fallback)
+}
+
 fn upload_ping_interval() -> Duration {
     std::env::var("SELECTIVE_UPLOAD_PING_INTERVAL_MS")
         .ok()
@@ -871,6 +897,24 @@ async fn stdio_url(lines: &mut mpsc::UnboundedReceiver<PipeItem>) -> Result<Url,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_panicking_upload_task_settles_as_a_fallback() {
+        let work: JoinHandle<Outcome> = tokio::spawn(async { panic!("upload task panics") });
+        assert_eq!(settled(work).await, Outcome::Fallback);
+        let work = tokio::spawn(async { Outcome::Delivered });
+        assert_eq!(settled(work).await, Outcome::Delivered);
+    }
+
+    #[test]
+    fn manifest_http_needs_an_api_key_in_the_url() {
+        let features = |url: &str| features_param(&Url::parse(url).unwrap()).1;
+        assert_eq!(
+            features("ws://h/p?api_key=k&run_id=1"),
+            "resume,manifest_http"
+        );
+        assert_eq!(features("ws://h/p?run_id=1"), "resume");
+    }
 
     #[test]
     fn with_params_replaces_existing_values_and_keeps_the_rest() {

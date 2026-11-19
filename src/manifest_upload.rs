@@ -9,7 +9,7 @@ use crate::upload::gzip_bytes;
 
 const RETRIES: u32 = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const MANIFEST_COMMAND: &str = "test_manifest";
+pub const MANIFEST_COMMAND: &str = "test_manifest";
 const UPLOAD_KEY: &str = "upload";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +17,7 @@ pub struct UploadBlock {
     pub url: String,
     pub token: String,
     pub max_chunk_bytes: usize,
+    pub max_total_bytes: usize,
     pub max_inflated_bytes: usize,
 }
 
@@ -32,6 +33,7 @@ impl UploadBlock {
             url: text("url").filter(|url| url.starts_with('/') && !url.starts_with("//"))?,
             token: text("token")?,
             max_chunk_bytes: size("max_chunk_bytes")?,
+            max_total_bytes: size("max_total_bytes")?,
             max_inflated_bytes: size("max_inflated_bytes")?,
         })
     }
@@ -97,6 +99,7 @@ pub struct Policy {
     pub backoff: Duration,
     pub chunk_timeout: Duration,
     pub commit_timeout: Duration,
+    pub deadline: Duration,
 }
 
 impl Default for Policy {
@@ -105,6 +108,7 @@ impl Default for Policy {
             backoff: Duration::from_secs(1),
             chunk_timeout: Duration::from_secs(60),
             commit_timeout: Duration::from_secs(75),
+            deadline: Duration::from_secs(180),
         }
     }
 }
@@ -134,14 +138,22 @@ impl Reply {
     }
 }
 
-fn classify(status: u16, body: &[u8]) -> Reply {
+fn classify(status: u16, body: &[u8], accepted: &[&str]) -> Reply {
     match status {
-        200 => Reply::Done,
+        200 if accepted.is_empty() || has_status(body, accepted) => Reply::Done,
         408 | 500 | 503 => Reply::Retry,
         410 => Reply::Stop,
         422 => missing_chunks(body).map_or(Reply::Fallback, Reply::Missing),
         _ => Reply::Fallback,
     }
+}
+
+fn has_status(body: &[u8], accepted: &[&str]) -> bool {
+    serde_json::from_slice::<Value>(body).ok().and_then(|body| {
+        body.get("status")?
+            .as_str()
+            .map(|status| accepted.contains(&status))
+    }) == Some(true)
 }
 
 fn missing_chunks(body: &[u8]) -> Option<Vec<usize>> {
@@ -170,6 +182,7 @@ impl Request<'_> {
         content_type: &str,
         body: &[u8],
         timeout: Duration,
+        accepted: &[&str],
     ) -> Reply {
         let url = format!("{}{}{path}", self.target.origin, self.block.url);
         let mut backoff = self.policy.backoff;
@@ -188,12 +201,12 @@ impl Request<'_> {
             let reply = match sent {
                 Ok(response) => {
                     let status = response.status().as_u16();
-                    let body = if status == 422 {
+                    let body = if matches!(status, 200 | 422) {
                         response.bytes().await.unwrap_or_default().to_vec()
                     } else {
                         Vec::new()
                     };
-                    classify(status, &body)
+                    classify(status, &body, accepted)
                 }
                 Err(err) if err.is_timeout() => {
                     if std::mem::replace(&mut timed_out, true) {
@@ -221,6 +234,7 @@ impl Request<'_> {
             "application/octet-stream",
             bytes,
             self.policy.chunk_timeout,
+            &[],
         )
         .await
     }
@@ -232,6 +246,7 @@ impl Request<'_> {
             "application/json",
             body.as_bytes(),
             self.policy.commit_timeout,
+            &["applied", "already_applied"],
         )
         .await
     }
@@ -245,6 +260,9 @@ pub async fn upload(target: &Target, block: &UploadBlock, line: &str, policy: Po
     let Ok(Ok(gzipped)) = tokio::task::spawn_blocking(move || gzip_bytes(&raw)).await else {
         return Outcome::Fallback;
     };
+    if gzipped.len() > block.max_total_bytes {
+        return Outcome::Fallback;
+    }
     let Ok(client) = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(redirect::Policy::none())
@@ -258,7 +276,13 @@ pub async fn upload(target: &Target, block: &UploadBlock, line: &str, policy: Po
         block,
         policy,
     };
-    let chunks: Vec<&[u8]> = gzipped.chunks(block.max_chunk_bytes).collect();
+    tokio::time::timeout(policy.deadline, deliver(&request, &gzipped))
+        .await
+        .unwrap_or(Outcome::Fallback)
+}
+
+async fn deliver(request: &Request<'_>, gzipped: &[u8]) -> Outcome {
+    let chunks: Vec<&[u8]> = gzipped.chunks(request.block.max_chunk_bytes).collect();
     for (index, bytes) in chunks.iter().enumerate() {
         match request.chunk(index, bytes).await {
             Reply::Done => {}
@@ -378,6 +402,11 @@ mod tests {
                     } else {
                         ""
                     };
+                    let body = if code == 200 && body.is_empty() {
+                        r#"{"status":"applied"}"#.to_owned()
+                    } else {
+                        body
+                    };
                     let response = format!(
                         "HTTP/1.1 {code} X\r\n{location}Content-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -406,6 +435,7 @@ mod tests {
             url: "/manifest_uploads".to_owned(),
             token: TOKEN.to_owned(),
             max_chunk_bytes,
+            max_total_bytes: 64_000_000,
             max_inflated_bytes: 64_000_000,
         }
     }
@@ -415,6 +445,7 @@ mod tests {
             backoff: Duration::from_millis(1),
             chunk_timeout: Duration::from_secs(5),
             commit_timeout: Duration::from_secs(5),
+            deadline: Duration::from_secs(30),
         }
     }
 
@@ -495,6 +526,7 @@ mod tests {
                 url: "/manifest_uploads".to_owned(),
                 token: "t".to_owned(),
                 max_chunk_bytes: 8_000_000,
+                max_total_bytes: 64_000_000,
                 max_inflated_bytes: 64_000_000,
             })
         );
@@ -515,7 +547,7 @@ mod tests {
 
     #[test]
     fn an_unusable_block_is_stripped_and_ignored() {
-        let usable = json!({"url":"/m","token":"t","max_chunk_bytes":5,"max_inflated_bytes":9});
+        let usable = json!({"url":"/m","token":"t","max_chunk_bytes":5,"max_total_bytes":7,"max_inflated_bytes":9});
         assert!(UploadBlock::parse(&usable).is_some());
         for (key, value) in [
             ("url", json!("//evil.test/m")),
@@ -525,6 +557,8 @@ mod tests {
             ("token", json!(null)),
             ("max_chunk_bytes", json!(0)),
             ("max_chunk_bytes", json!(-1)),
+            ("max_total_bytes", json!(0)),
+            ("max_total_bytes", json!(null)),
             ("max_inflated_bytes", json!("9")),
         ] {
             let mut block = usable.clone();
@@ -853,6 +887,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_gzip_over_the_total_limit_never_touches_the_network() {
+        let line = manifest_line(500);
+        let compressed = gzip_bytes(line.trim_end().as_bytes()).unwrap().len();
+        let mut limited = block(1_000_000);
+        limited.max_total_bytes = compressed - 1;
+        let (target, log) = serve(always(200)).await;
+        assert_eq!(
+            upload(&target, &limited, &line, fast()).await,
+            Outcome::Fallback
+        );
+        assert_eq!(requests(&log), 0);
+        limited.max_total_bytes = compressed;
+        assert_eq!(
+            upload(&target, &limited, &line, fast()).await,
+            Outcome::Delivered
+        );
+        assert_eq!(requests(&log), 2);
+    }
+
+    #[tokio::test]
+    async fn a_commit_is_delivered_only_when_the_body_says_applied() {
+        for (body, want) in [
+            (r#"{"status":"applied"}"#, Outcome::Delivered),
+            (r#"{"status":"already_applied"}"#, Outcome::Delivered),
+            (r#"{"status":"queued"}"#, Outcome::Fallback),
+            ("<html>maintenance</html>", Outcome::Fallback),
+            (r#"{"error":"applied"}"#, Outcome::Fallback),
+            (r#"{"status":7}"#, Outcome::Fallback),
+        ] {
+            let script: Script = Arc::new(move |seen, _| {
+                if seen.path.ends_with("/commit") {
+                    (200, body.to_owned(), 0)
+                } else {
+                    status(200)
+                }
+            });
+            let (target, log) = serve(script).await;
+            let outcome = upload(&target, &block(1_000_000), &manifest_line(50), fast()).await;
+            assert_eq!(outcome, want, "{body}");
+            assert_eq!(requests(&log), 2, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chunk_200_needs_no_particular_body() {
+        let script: Script = Arc::new(|seen, _| {
+            if seen.path.contains("/chunks/") {
+                (200, "ok".to_owned(), 0)
+            } else {
+                status(200)
+            }
+        });
+        let (target, _log) = serve(script).await;
+        let outcome = upload(&target, &block(1_000_000), &manifest_line(50), fast()).await;
+        assert_eq!(outcome, Outcome::Delivered);
+    }
+
+    #[tokio::test]
+    async fn the_whole_upload_falls_back_at_its_deadline() {
+        let deadline = Duration::from_millis(400);
+        let policy = Policy { deadline, ..fast() };
+        let (target, _log) = serve(Arc::new(|_, _| (200, String::new(), 5000))).await;
+        let started = Instant::now();
+        let outcome = upload(&target, &block(1_000_000), &manifest_line(50), policy).await;
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, Outcome::Fallback);
+        assert!(elapsed >= deadline, "{elapsed:?}");
+        assert!(
+            elapsed < deadline + Duration::from_millis(400),
+            "{elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_that_each_succeed_still_stop_at_the_deadline() {
+        let slow: Script = Arc::new(|_, _| (200, String::new(), 150));
+        let line = manifest_line(3000);
+        let (target, log) = serve(Arc::clone(&slow)).await;
+        let tight = Policy {
+            deadline: Duration::from_millis(400),
+            ..fast()
+        };
+        assert_eq!(
+            upload(&target, &block(500), &line, tight).await,
+            Outcome::Fallback
+        );
+        assert!(requests(&log) < 6, "{}", requests(&log));
+        let (target, _log) = serve(slow).await;
+        assert_eq!(
+            upload(&target, &block(500), &line, fast()).await,
+            Outcome::Delivered
+        );
+    }
+
+    #[tokio::test]
     async fn a_commit_that_stalls_past_its_timeout_is_retried() {
         let commits = Arc::new(Mutex::new(0));
         let counter = Arc::clone(&commits);
@@ -899,6 +1028,7 @@ mod tests {
             backoff: Duration::from_millis(20),
             chunk_timeout: Duration::from_millis(80),
             commit_timeout: Duration::from_millis(120),
+            deadline: Duration::from_secs(30),
         }
     }
 
@@ -974,6 +1104,7 @@ mod tests {
         let worst = |timeout: Duration| timeout * 2 + policy.backoff * 7;
         assert_eq!(policy.chunk_timeout, Duration::from_secs(60));
         assert_eq!(policy.commit_timeout, Duration::from_secs(75));
+        assert_eq!(policy.deadline, Duration::from_secs(180));
         assert_eq!(worst(policy.chunk_timeout), Duration::from_secs(127));
         assert_eq!(worst(policy.commit_timeout), Duration::from_secs(157));
     }
