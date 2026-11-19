@@ -17,13 +17,14 @@ usage:
   transport-conformance run [--scenario NAME]
                             [--via direct|stdio|both|all]
                             [--client COMMAND] [--fixture-ids FILE]
-                            [--transport PATH]
+                            [--transport PATH] [--require-features LIST]
   transport-conformance client [--via-stdio]
 
 The transport binary is --transport, else SELECTIVE_TRANSPORT, else the
 transport next to this binary. A --client command gets it as
 SELECTIVE_TRANSPORT. With --client, --via is ignored and the client runs as
-a direct client.
+a direct client. --require-features takes a comma list of transport
+features: a scenario that needs one and never passes is a failure.
 ";
 
 fn main() {
@@ -62,6 +63,7 @@ fn run_main(args: &[String]) -> Result<i32, Error> {
     let mut client = env_value("SELECTIVE_CONFORMANCE_CLIENT");
     let mut fixture_file = env_value("SELECTIVE_CONFORMANCE_FIXTURE_IDS");
     let mut transport = None;
+    let mut require_features = env_value("SELECTIVE_CONFORMANCE_REQUIRE_FEATURES");
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -80,6 +82,7 @@ fn run_main(args: &[String]) -> Result<i32, Error> {
             "--client" => client = Some(value()?.to_owned()),
             "--fixture-ids" => fixture_file = Some(value()?.to_owned()),
             "--transport" => transport = Some(PathBuf::from(value()?)),
+            "--require-features" => require_features = Some(value()?.to_owned()),
             other => return Err(Error::new(format!("unknown run argument {other}\n{USAGE}"))),
         }
         index += 2;
@@ -90,6 +93,11 @@ fn run_main(args: &[String]) -> Result<i32, Error> {
         None => FixtureIds::default(),
     };
     let transport = transport.or_else(default_transport);
+    let require_features: Vec<String> = require_features
+        .iter()
+        .flat_map(|list| list.split(','))
+        .map(str::to_owned)
+        .collect();
     let run = ConformanceRun {
         filter: scenario.as_deref(),
         via,
@@ -97,6 +105,7 @@ fn run_main(args: &[String]) -> Result<i32, Error> {
         fixtures,
         fixture_file: fixture_path.as_deref(),
         transport: transport.as_deref(),
+        require_features: &require_features,
     };
     block_on(run_suite_with(&std::env::current_exe()?, run))?;
     Ok(0)

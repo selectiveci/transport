@@ -1,0 +1,91 @@
+{
+  "name": "manifest_http_stop",
+  "requires_transport_features": [
+    "manifest_http"
+  ],
+  "steps": [
+    {
+      "op": "reply_uploads",
+      "replies": [
+        {
+          "status": 410,
+          "body": {
+            "error": "not_asked"
+          },
+          "delay_ms": 900
+        }
+      ]
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "connected"
+      }
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "test_manifest",
+        "upload": {
+          "url": "/manifest_uploads",
+          "token": "conformance-token-1",
+          "max_chunk_bytes": 100,
+          "max_total_bytes": 64000000,
+          "max_inflated_bytes": 64000000
+        }
+      }
+    },
+    {
+      "op": "expect_upload_requests",
+      "count": 1
+    },
+    {
+      "op": "expect_no_frame",
+      "ms": 500
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "test_manifest",
+        "upload": {
+          "url": "/manifest_uploads",
+          "token": "conformance-token-2",
+          "max_chunk_bytes": 100,
+          "max_total_bytes": 64000000,
+          "max_inflated_bytes": 64000000
+        }
+      }
+    },
+    {
+      "op": "expect_manifest_upload",
+      "tree": false,
+      "token": "conformance-token-2",
+      "max_chunk_bytes": 100
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "run_test_cases",
+        "test_case_ids": [
+          "case-pass"
+        ]
+      }
+    },
+    {
+      "op": "expect_result",
+      "id": "case-pass",
+      "status": "passed"
+    },
+    {
+      "op": "send",
+      "message": {
+        "command": "close",
+        "exit_status": 0
+      }
+    },
+    {
+      "op": "expect_exit",
+      "code": 0
+    }
+  ]
+}
