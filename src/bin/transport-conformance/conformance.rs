@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
@@ -192,6 +192,7 @@ pub struct ConformanceRun<'a> {
     pub fixtures: FixtureIds,
     pub fixture_file: Option<&'a Path>,
     pub transport: Option<&'a Path>,
+    pub require_features: &'a [String],
 }
 
 pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), Error> {
@@ -202,6 +203,8 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
         .or(run.client.is_none().then_some(BUILTIN_BEFORE_ALL_SECONDS));
     let mut failures = Vec::new();
     let mut trials = 0usize;
+    let mut passed = HashSet::new();
+    let mut unexercised = Vec::new();
     for scenario in scenarios()? {
         if run.filter.is_some_and(|name| name != scenario.name) {
             continue;
@@ -242,9 +245,17 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
             match run_one(&trial).await {
                 Ok(Played::Passed) => {
                     trials += 1;
+                    passed.insert(scenario.name.clone());
                     eprintln!("ok {} {label}", scenario.name);
                 }
                 Ok(Played::NotApplicable(why)) => {
+                    if scenario
+                        .requires_transport_features
+                        .iter()
+                        .any(|feature| run.require_features.contains(feature))
+                    {
+                        unexercised.push((scenario.name.clone(), why.clone()));
+                    }
                     eprintln!("n/a {} {label}: {why}", scenario.name);
                 }
                 Err(err) => {
@@ -261,6 +272,13 @@ pub async fn run_suite_with(bin: &Path, run: ConformanceRun<'_>) -> Result<(), E
             )),
             None => Error::new("no conformance scenarios ran"),
         });
+    }
+    for (name, why) in unexercised {
+        if !passed.contains(&name) {
+            failures.push(format!(
+                "{name}: required transport feature never exercised ({why})"
+            ));
+        }
     }
     if failures.is_empty() {
         Ok(())
@@ -1205,9 +1223,11 @@ async fn classify(mut stream: TcpStream, gate: &Arc<Gate>) -> Result<Incoming, E
                 .lock()
                 .expect("upload replies")
                 .pop_front()
-                .unwrap_or(UploadReply {
+                .unwrap_or_else(|| UploadReply {
                     status: 200,
-                    body: Value::Null,
+                    body: serde_json::json!({
+                        "status": if is_commit(&request) { "applied" } else { "stored" }
+                    }),
                     delay_ms: 0,
                 });
             tokio::time::sleep(Duration::from_millis(reply.delay_ms)).await;
@@ -2024,6 +2044,7 @@ mod tests {
             fixtures: FixtureIds::default(),
             fixture_file: None,
             transport: None,
+            require_features: &[],
         };
         let err = run_suite_with(Path::new("transport-conformance"), run)
             .await
