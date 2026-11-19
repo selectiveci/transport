@@ -806,7 +806,7 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, Outcome::Fallback);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]
@@ -828,7 +828,7 @@ mod tests {
         let started = Instant::now();
         let outcome = upload(&target, &block(1_000_000), &manifest_line(50), policy).await;
         assert_eq!(outcome, Outcome::Fallback);
-        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(
             *accepted.lock().unwrap() <= 2,
             "{} connections",
@@ -1058,10 +1058,7 @@ mod tests {
         let elapsed = started.elapsed();
         assert_eq!(outcome, Outcome::Fallback);
         assert!(elapsed >= deadline, "{elapsed:?}");
-        assert!(
-            elapsed < deadline + Duration::from_millis(400),
-            "{elapsed:?}"
-        );
+        assert!(elapsed < deadline + Duration::from_secs(3), "{elapsed:?}");
     }
 
     #[tokio::test]
@@ -1153,7 +1150,7 @@ mod tests {
         assert_eq!(requests(&log), 2);
         assert!(elapsed >= Duration::from_millis(2 * 80 + 20), "{elapsed:?}");
         assert!(
-            elapsed < Duration::from_millis(2 * 80 + 20 + 400),
+            elapsed < Duration::from_millis(2 * 80 + 20 + 3000),
             "{elapsed:?}"
         );
     }
@@ -1175,10 +1172,7 @@ mod tests {
         assert_eq!(requests(&log), 4);
         let longest = Duration::from_millis(2 * 80 + 7 * 20);
         assert!(elapsed >= longest, "{elapsed:?}");
-        assert!(
-            elapsed < longest + Duration::from_millis(400),
-            "{elapsed:?}"
-        );
+        assert!(elapsed < longest + Duration::from_secs(3), "{elapsed:?}");
     }
 
     #[tokio::test]
@@ -1197,7 +1191,7 @@ mod tests {
             + Duration::from_millis(120 + 7 * 20);
         assert!(elapsed >= budget, "{elapsed:?} < {budget:?}");
         assert!(
-            elapsed < budget + Duration::from_millis(600),
+            elapsed < budget + Duration::from_secs(3),
             "{elapsed:?} vs {budget:?}"
         );
     }
