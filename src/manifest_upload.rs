@@ -1,3 +1,4 @@
+use std::fmt;
 use std::time::Duration;
 
 use reqwest::redirect;
@@ -9,16 +10,26 @@ use crate::upload::gzip_bytes;
 
 const RETRIES: u32 = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const BODY_CAP: usize = 65_536;
 const MANIFEST_COMMAND: &str = "test_manifest";
 const UPLOAD_KEY: &str = "upload";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UploadBlock {
     pub url: String,
     pub token: String,
     pub max_chunk_bytes: usize,
     pub max_total_bytes: usize,
     pub max_inflated_bytes: usize,
+}
+
+impl fmt::Debug for UploadBlock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UploadBlock")
+            .field("url", &self.url)
+            .field("max_chunk_bytes", &self.max_chunk_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl UploadBlock {
@@ -63,10 +74,18 @@ pub fn is_manifest_line(line: &str) -> bool {
     serde_json::from_str::<Kind>(line).is_ok_and(|kind| kind.kind == MANIFEST_COMMAND)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Target {
     pub origin: String,
     pub api_key: String,
+}
+
+impl fmt::Debug for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Target")
+            .field("origin", &self.origin)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Target {
@@ -148,6 +167,17 @@ fn classify(status: u16, body: &[u8], accepted: &[&str]) -> Reply {
     }
 }
 
+async fn drain(mut response: reqwest::Response) -> Vec<u8> {
+    let mut body = Vec::new();
+    while body.len() < BODY_CAP {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    body
+}
+
 fn has_status(body: &[u8], accepted: &[&str]) -> bool {
     serde_json::from_slice::<Value>(body).ok().and_then(|body| {
         body.get("status")?
@@ -201,12 +231,7 @@ impl Request<'_> {
             let reply = match sent {
                 Ok(response) => {
                     let status = response.status().as_u16();
-                    let body = if matches!(status, 200 | 422) {
-                        response.bytes().await.unwrap_or_default().to_vec()
-                    } else {
-                        Vec::new()
-                    };
-                    classify(status, &body, accepted)
+                    classify(status, &drain(response).await, accepted)
                 }
                 Err(err) if err.is_timeout() => {
                     if std::mem::replace(&mut timed_out, true) {
@@ -372,6 +397,43 @@ mod tests {
             body,
             at: Instant::now(),
         })
+    }
+
+    async fn serve_keep_alive(script: Script) -> (Target, Log, Arc<Mutex<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = target_for(listener.local_addr().unwrap().port());
+        let log: Log = Arc::default();
+        let connections = Arc::new(Mutex::new(0));
+        let (seen_log, counted) = (Arc::clone(&log), Arc::clone(&connections));
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                *counted.lock().unwrap() += 1;
+                let (script, log) = (Arc::clone(&script), Arc::clone(&seen_log));
+                tokio::spawn(async move {
+                    while let Some(seen) = read_request(&mut stream).await {
+                        let index = {
+                            let mut log = log.lock().unwrap();
+                            log.push(seen.clone());
+                            log.len() - 1
+                        };
+                        let (code, body, _) = script(&seen, index);
+                        let body = if code == 200 && body.is_empty() {
+                            r#"{"status":"applied"}"#.to_owned()
+                        } else {
+                            body
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {code} X\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (target, log, connections)
     }
 
     async fn serve(script: Script) -> (Target, Log) {
@@ -884,6 +946,48 @@ mod tests {
             Outcome::Delivered
         );
         assert_eq!(requests(&log), 2);
+    }
+
+    #[test]
+    fn debug_output_never_carries_the_token_or_the_api_key() {
+        let printed = format!("{:?} {:?}", block(5), target_for(1));
+        assert!(!printed.contains(TOKEN), "{printed}");
+        assert!(!printed.contains(KEY), "{printed}");
+    }
+
+    #[test]
+    fn a_reply_line_with_trailing_whitespace_is_still_a_manifest_line() {
+        for tail in ["\n", "\r\n", " ", "\r"] {
+            let line = format!(r#"{{"type":"test_manifest","data":{{}}}}{tail}"#);
+            assert!(is_manifest_line(&line), "{tail:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_line_ending_in_crlf_uploads_the_line_without_its_terminator() {
+        for tail in ["\r\n", "\n"] {
+            let line = format!("{}{tail}", manifest_line(50).trim_end());
+            let (target, log) = serve(always(200)).await;
+            assert_eq!(
+                upload(&target, &block(1_000_000), &line, fast()).await,
+                Outcome::Delivered
+            );
+            assert_eq!(gunzip(&log.lock().unwrap()[0].body), line.trim_end());
+        }
+    }
+
+    #[tokio::test]
+    async fn every_response_body_is_drained_so_the_connection_is_reused() {
+        let script: Script = Arc::new(|_, index| match index {
+            0 => (503, "x".repeat(40_000), 0),
+            _ => status(200),
+        });
+        let (target, log, connections) = serve_keep_alive(script).await;
+        let line = manifest_line(3000);
+        let outcome = upload(&target, &block(500), &line, fast()).await;
+        assert_eq!(outcome, Outcome::Delivered);
+        assert!(requests(&log) > 4, "{}", requests(&log));
+        assert_eq!(*connections.lock().unwrap(), 1);
     }
 
     #[tokio::test]
