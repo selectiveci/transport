@@ -103,8 +103,8 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             backoff: Duration::from_secs(1),
-            chunk_timeout: Duration::from_secs(120),
-            commit_timeout: Duration::from_secs(120),
+            chunk_timeout: Duration::from_secs(60),
+            commit_timeout: Duration::from_secs(75),
         }
     }
 }
@@ -173,6 +173,7 @@ impl Request<'_> {
     ) -> Reply {
         let url = format!("{}{}{path}", self.target.origin, self.block.url);
         let mut backoff = self.policy.backoff;
+        let mut timed_out = false;
         for attempt in 0..=RETRIES {
             let sent = self
                 .client
@@ -194,7 +195,13 @@ impl Request<'_> {
                     };
                     classify(status, &body)
                 }
-                Err(err) if err.is_timeout() => Reply::Retry,
+                Err(err) if err.is_timeout() => {
+                    if std::mem::replace(&mut timed_out, true) {
+                        Reply::Fallback
+                    } else {
+                        Reply::Retry
+                    }
+                }
                 Err(_) => Reply::Fallback,
             };
             if !matches!(reply, Reply::Retry) {
@@ -869,6 +876,106 @@ mod tests {
         assert_eq!(outcome, Outcome::Delivered);
         assert_eq!(*commits.lock().unwrap(), 2);
         assert_eq!(requests(&log), 3);
+    }
+
+    fn stall_script(stalls: Arc<Mutex<HashMap<String, usize>>>, pattern: &'static [u16]) -> Script {
+        Arc::new(move |seen, _| {
+            let attempt = {
+                let mut stalls = stalls.lock().unwrap();
+                let count = stalls.entry(seen.path.clone()).or_insert(0);
+                *count += 1;
+                *count - 1
+            };
+            match pattern.get(attempt) {
+                Some(0) => (200, String::new(), 2000),
+                Some(code) => (*code, String::new(), 0),
+                None => (200, String::new(), 0),
+            }
+        })
+    }
+
+    fn timing_policy() -> Policy {
+        Policy {
+            backoff: Duration::from_millis(20),
+            chunk_timeout: Duration::from_millis(80),
+            commit_timeout: Duration::from_millis(120),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_that_times_out_twice_falls_back_after_two_attempts() {
+        let script = stall_script(Arc::default(), &[0, 0, 0, 0]);
+        let (target, log) = serve(script).await;
+        let started = Instant::now();
+        let outcome = upload(
+            &target,
+            &block(1_000_000),
+            &manifest_line(50),
+            timing_policy(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, Outcome::Fallback);
+        assert_eq!(requests(&log), 2);
+        assert!(elapsed >= Duration::from_millis(2 * 80 + 20), "{elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(2 * 80 + 20 + 400),
+            "{elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timeout_and_status_retries_share_four_attempts_and_the_longest_wait() {
+        let script = stall_script(Arc::default(), &[0, 503, 503, 0]);
+        let (target, log) = serve(script).await;
+        let started = Instant::now();
+        let outcome = upload(
+            &target,
+            &block(1_000_000),
+            &manifest_line(50),
+            timing_policy(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, Outcome::Fallback);
+        assert_eq!(requests(&log), 4);
+        let longest = Duration::from_millis(2 * 80 + 7 * 20);
+        assert!(elapsed >= longest, "{elapsed:?}");
+        assert!(
+            elapsed < longest + Duration::from_millis(400),
+            "{elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_whose_every_request_degrades_then_succeeds_stays_inside_its_budget() {
+        let script = stall_script(Arc::default(), &[0, 503, 503]);
+        let (target, log) = serve(script).await;
+        let line = manifest_line(3000);
+        let started = Instant::now();
+        let outcome = upload(&target, &block(100), &line, timing_policy()).await;
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, Outcome::Delivered);
+        let chunks = chunk_paths(&log).len() / 4;
+        assert!(chunks > 2, "{chunks} chunks");
+        assert_eq!(requests(&log), 4 * (chunks + 1));
+        let budget = u32::try_from(chunks).unwrap() * Duration::from_millis(80 + 7 * 20)
+            + Duration::from_millis(120 + 7 * 20);
+        assert!(elapsed >= budget, "{elapsed:?} < {budget:?}");
+        assert!(
+            elapsed < budget + Duration::from_millis(600),
+            "{elapsed:?} vs {budget:?}"
+        );
+    }
+
+    #[test]
+    fn the_default_budget_is_pinned() {
+        let policy = Policy::default();
+        let worst = |timeout: Duration| timeout * 2 + policy.backoff * 7;
+        assert_eq!(policy.chunk_timeout, Duration::from_secs(60));
+        assert_eq!(policy.commit_timeout, Duration::from_secs(75));
+        assert_eq!(worst(policy.chunk_timeout), Duration::from_secs(127));
+        assert_eq!(worst(policy.commit_timeout), Duration::from_secs(157));
     }
 
     #[test]
